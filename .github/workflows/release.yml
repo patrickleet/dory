@@ -30,7 +30,9 @@ permissions:
 
 jobs:
   release:
-    runs-on: macos-15
+    # Builds on a recent macOS image (macOS 26 Tahoe or newer). Override the runner by setting the
+    # repo variable RELEASE_RUNNER (e.g. macos-26 or a self-hosted label) — Settings → Variables.
+    runs-on: ${{ vars.RELEASE_RUNNER || 'macos-latest' }}
     outputs:
       version: ${{ steps.ver.outputs.version }}
       sha256: ${{ steps.build.outputs.sha256 }}
