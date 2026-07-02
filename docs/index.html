@@ -1,0 +1,911 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dory — Docker &amp; Linux containers, native to your Mac</title>
+<meta name="description" content="Dory is a free, open-source alternative to Docker Desktop and OrbStack. One native app, one shared VM for every container, a real Docker socket, *.dory.local HTTPS domains, one-click Kubernetes, and full Linux machines.">
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta property="og:title" content="Dory — Docker &amp; Linux containers, native to your Mac">
+<meta property="og:description" content="Free, open source, one shared VM for all your containers. ~4.7× less idle memory than per-container VMs.">
+<meta property="og:image" content="https://augani.github.io/dory/screenshot.png">
+<meta property="og:url" content="https://augani.github.io/dory/">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://augani.github.io/dory/screenshot.png">
+<style>
+  :root{
+    --bg:#070D18; --bg-2:#0B1526; --surface:rgba(16,26,44,.72); --surface-2:#142136;
+    --elevated:#18273f; --border:rgba(140,180,255,.10); --border-strong:rgba(140,180,255,.18);
+    --text:#EAF1FB; --text-2:#A9BAD3; --text-3:#6D7F9B;
+    --accent:#2E9BF5; --accent-2:#3D7BF4; --green:#34D058; --amber:#FFB020; --navy:#0D1B3D; --tile:#EAF1FE;
+    --font:-apple-system,BlinkMacSystemFont,"SF Pro Text","Inter",Segoe UI,Roboto,sans-serif;
+    --mono:"SF Mono",ui-monospace,"JetBrains Mono",Menlo,monospace;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{font-family:var(--font);background:var(--bg);color:var(--text);line-height:1.6;
+    -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;overflow-x:hidden}
+  a{color:inherit;text-decoration:none}
+  ::selection{background:rgba(46,155,245,.35)}
+
+  /* ---------- ocean layers ---------- */
+  #ocean{position:fixed;inset:0;z-index:-3;width:100%;height:100%;display:block;
+    background:linear-gradient(180deg,#0a1a30 0%,#070D18 55%,#05090f 100%)}
+  #depth{position:fixed;inset:0;z-index:-2;pointer-events:none;background:#02050a;opacity:0;transition:opacity .3s linear}
+  .bubbles{position:fixed;inset:0;z-index:-1;pointer-events:none;overflow:hidden}
+  .bubble{position:absolute;bottom:-4vh;border-radius:50%;
+    background:radial-gradient(circle at 32% 30%,rgba(190,220,255,.5),rgba(120,170,240,.08) 62%,transparent 70%);
+    animation:rise linear infinite}
+  @keyframes rise{0%{transform:translateY(0);opacity:0}8%{opacity:.7}92%{opacity:.5}
+    100%{transform:translateY(-112vh) translateX(var(--sway,24px));opacity:0}}
+
+  .wrap{max-width:1120px;margin:0 auto;padding:0 24px}
+
+  /* ---------- nav ---------- */
+  header{position:sticky;top:0;z-index:100;background:rgba(7,13,24,.6);
+    backdrop-filter:saturate(150%) blur(16px);-webkit-backdrop-filter:saturate(150%) blur(16px);
+    border-bottom:1px solid var(--border)}
+  .nav{display:flex;align-items:center;justify-content:space-between;height:62px}
+  .brand{display:flex;align-items:center;gap:11px;font-weight:800;font-size:17.5px;letter-spacing:-.01em}
+  .brand .tile{width:32px;height:32px;border-radius:9px;background:var(--tile);display:grid;place-items:center;
+    box-shadow:0 2px 10px rgba(46,155,245,.35)}
+  .brand .tile svg{width:27px;height:27px}
+  .nav-links{display:flex;align-items:center;gap:26px}
+  .nav-links a{color:var(--text-2);font-size:14px;font-weight:500;transition:color .18s}
+  .nav-links a:hover{color:var(--text)}
+  .btn{display:inline-flex;align-items:center;gap:8px;font-size:14px;font-weight:600;
+    padding:9px 16px;border-radius:10px;border:1px solid transparent;cursor:pointer;transition:all .18s}
+  .btn-primary{background:var(--accent);color:#fff;box-shadow:0 8px 26px -10px rgba(46,155,245,.8)}
+  .btn-primary:hover{background:#3aa6fb;transform:translateY(-1px)}
+  .btn-ghost{background:var(--surface-2);color:var(--text);border-color:var(--border-strong)}
+  .btn-ghost:hover{background:var(--elevated)}
+  .btn-big{font-size:15px;padding:13px 22px;border-radius:12px}
+
+  /* ---------- hero ---------- */
+  .hero{position:relative;padding:56px 0 40px;text-align:center}
+  .fish-stage{height:190px;display:grid;place-items:center;margin-bottom:8px}
+  #fish{width:210px;height:190px;filter:drop-shadow(0 14px 30px rgba(46,155,245,.35));
+    transition:transform .8s cubic-bezier(.22,1,.36,1);cursor:pointer;will-change:transform}
+  #fish .tail{transform-origin:405px 205px;animation:wag 1.5s ease-in-out infinite}
+  #fish .topfin{transform-origin:340px 145px;animation:finflick 3.4s ease-in-out infinite}
+  #fish .fishbody{animation:bob 3.2s ease-in-out infinite}
+  @keyframes wag{0%,100%{transform:rotate(-7deg)}50%{transform:rotate(9deg)}}
+  @keyframes finflick{0%,86%,100%{transform:rotate(0)}92%{transform:rotate(-6deg)}}
+  @keyframes bob{0%,100%{transform:translateY(-5px) rotate(-1.6deg)}50%{transform:translateY(6px) rotate(1.6deg)}}
+  .pill{display:inline-flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600;color:#8fc4ff;
+    background:rgba(46,155,245,.10);border:1px solid rgba(46,155,245,.28);
+    padding:6px 14px;border-radius:999px;margin-bottom:24px}
+  .pill .dot{width:6px;height:6px;border-radius:50%;background:var(--green);box-shadow:0 0 10px var(--green)}
+  h1{font-size:clamp(36px,6vw,62px);line-height:1.04;letter-spacing:-.03em;font-weight:800;max-width:17ch;margin:0 auto}
+  h1 .grad{background:linear-gradient(120deg,#6CB8FF,#2E9BF5 55%,#34D058);
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  .sub{margin:22px auto 0;max-width:60ch;font-size:clamp(15px,2vw,18px);color:var(--text-2)}
+  .cta-row{display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-top:34px}
+  .brew{display:flex;align-items:center;gap:12px;margin:22px auto 0;max-width:460px;
+    background:rgba(9,15,27,.85);border:1px solid var(--border-strong);border-radius:12px;padding:12px 16px}
+  .brew code{font-family:var(--mono);font-size:13px;color:#9fd0ff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .brew button{margin-left:auto;flex:none;background:var(--surface-2);color:var(--text-2);border:1px solid var(--border-strong);
+    font-size:12px;font-weight:600;border-radius:8px;padding:6px 12px;cursor:pointer;transition:all .15s}
+  .brew button:hover{color:var(--text);background:var(--elevated)}
+  .meta-row{display:flex;gap:18px;justify-content:center;flex-wrap:wrap;margin-top:22px;color:var(--text-3);font-size:12.5px}
+  .meta-row b{color:var(--text-2);font-weight:600}
+
+  /* ---------- sections ---------- */
+  section{position:relative;padding:88px 0}
+  .kicker{display:block;text-align:center;font-size:12.5px;font-weight:700;letter-spacing:.14em;
+    text-transform:uppercase;color:var(--accent);margin-bottom:14px}
+  h2{font-size:clamp(26px,4vw,40px);letter-spacing:-.02em;font-weight:800;text-align:center;line-height:1.15}
+  .lead{max-width:62ch;margin:16px auto 0;text-align:center;color:var(--text-2);font-size:16px}
+
+  /* ---------- 3D memory model ---------- */
+  .model-wrap{position:relative;max-width:1060px;margin:46px auto 0;border:1px solid var(--border-strong);
+    border-radius:20px;overflow:hidden;background:rgba(6,11,22,.55)}
+  #model-canvas{display:block;width:100%;height:520px}
+  .hud{position:absolute;inset:0;pointer-events:none;display:flex;flex-direction:column;justify-content:space-between}
+  .hud-top{display:flex;justify-content:space-between;padding:20px 26px}
+  .hud-side{width:46%;text-align:center}
+  .hud-side .t{font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--text-3)}
+  .hud-side .mb{font-family:var(--mono);font-size:clamp(22px,3.4vw,34px);font-weight:700;margin-top:4px}
+  .hud-side.dory .mb{color:var(--green)}
+  .hud-side.other .mb{color:#8fa2c0}
+  .hud-side .per{font-size:11.5px;color:var(--text-3);margin-top:2px}
+  .hud-bottom{display:flex;justify-content:center;gap:10px;padding:0 0 20px}
+  .hud-bottom .btn{pointer-events:auto}
+  .model-note{max-width:1060px;margin:12px auto 0;text-align:center;font-size:12px;color:var(--text-3)}
+  .model-fallback{display:none;padding:40px 30px;text-align:center}
+  .model-fallback img,.model-fallback svg{max-width:100%;height:auto}
+  .model-wrap.no3d #model-canvas,.model-wrap.no3d .hud{display:none}
+  .model-wrap.no3d .model-fallback{display:block}
+
+  /* ---------- under the hood ---------- */
+  .hood{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-top:52px}
+  .hood-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:24px;
+    backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);display:flex;flex-direction:column;min-width:0}
+  .hood-card h3{font-size:15.5px;font-weight:700;margin-bottom:8px}
+  .hood-card p{font-size:13px;color:var(--text-2);margin-bottom:16px}
+  .term{margin-top:auto;background:#060b15;border:1px solid var(--border);border-radius:10px;
+    font-family:var(--mono);font-size:11.8px;line-height:1.75;padding:14px 16px;overflow-x:auto;white-space:pre;color:#c6d8f2;
+    scrollbar-width:thin;scrollbar-color:rgba(140,180,255,.2) transparent}
+  .term::-webkit-scrollbar{height:6px}
+  .term::-webkit-scrollbar-thumb{background:rgba(140,180,255,.18);border-radius:3px}
+  .term::-webkit-scrollbar-track{background:transparent}
+  .term .p{color:#5b7396}
+  .term .g{color:var(--green)}
+  .term .b{color:#7fbdff}
+  .term .a{color:var(--amber)}
+
+  /* ---------- feature rows ---------- */
+  .frow{display:grid;grid-template-columns:1.05fr 1fr;gap:44px;align-items:center;margin-top:74px}
+  .frow:first-of-type{margin-top:56px}
+  .frow.flip .shot{order:2}
+  .frow .shot{border-radius:14px;overflow:hidden;border:1px solid var(--border-strong);
+    box-shadow:0 30px 70px -28px rgba(0,0,0,.7),0 0 0 1px rgba(46,155,245,.05)}
+  .frow .shot img{display:block;width:100%;height:auto}
+  .frow h3{font-size:22px;font-weight:800;letter-spacing:-.01em;margin-bottom:10px}
+  .frow .tag{display:inline-block;font-size:11.5px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
+    color:var(--accent);margin-bottom:10px}
+  .frow ul{list-style:none;margin-top:6px}
+  .frow li{position:relative;padding-left:22px;font-size:13.8px;color:var(--text-2);margin-bottom:9px}
+  .frow li::before{content:"";position:absolute;left:0;top:7px;width:10px;height:10px;border-radius:3px;
+    background:linear-gradient(135deg,var(--accent),var(--green))}
+  .frow li code,.frow p code{font-family:var(--mono);font-size:12px;color:#9fd0ff;background:rgba(46,155,245,.08);
+    padding:1px 5px;border-radius:5px}
+
+  /* memory bars */
+  .mem-card{max-width:760px;margin:48px auto 0;background:var(--surface);border:1px solid var(--border-strong);
+    border-radius:18px;padding:34px 36px;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
+  .mem-row{margin-bottom:26px}
+  .mem-row .label{display:flex;justify-content:space-between;font-size:13.5px;margin-bottom:9px;color:var(--text-2)}
+  .mem-row .label b{color:var(--text)}
+  .track{height:14px;border-radius:8px;background:rgba(255,255,255,.05);overflow:hidden}
+  .fill{height:100%;border-radius:8px;width:0;transition:width 1.4s cubic-bezier(.22,1,.36,1)}
+  .fill.dory{background:linear-gradient(90deg,#34D058,#2E9BF5)}
+  .fill.other{background:linear-gradient(90deg,#5a6a85,#3d4a61)}
+  .mem-big{display:flex;align-items:baseline;gap:12px;margin-top:8px}
+  .mem-big .x{font-size:46px;font-weight:800;color:var(--green);letter-spacing:-.02em}
+  .mem-big span{color:var(--text-2);font-size:14px}
+  .mem-note{margin-top:14px;font-size:12px;color:var(--text-3)}
+
+  /* compare */
+  .compare{max-width:900px;margin:52px auto 0;border:1px solid var(--border-strong);border-radius:18px;overflow:hidden}
+  .compare table{width:100%;border-collapse:collapse;font-size:13.5px}
+  .compare th,.compare td{padding:15px 18px;text-align:left;border-bottom:1px solid var(--border)}
+  .compare th{background:var(--surface-2);font-size:12.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--text-3)}
+  .compare td:first-child{color:var(--text-2)}
+  .compare tr:last-child td{border-bottom:none}
+  .yes{color:var(--green);font-weight:700}
+  .no{color:var(--text-3)}
+  .warn{color:var(--amber)}
+  .compare-note{max-width:900px;margin:14px auto 0;font-size:12px;color:var(--text-3);text-align:center}
+
+  /* install */
+  .install-card{max-width:640px;margin:48px auto 0;text-align:center;background:var(--surface);
+    border:1px solid var(--border-strong);border-radius:20px;padding:44px 40px}
+  .install-card .brew{margin-top:26px}
+  .req{margin-top:18px;font-size:12.5px;color:var(--text-3)}
+  .oss{display:flex;align-items:center;justify-content:center;gap:14px;flex-wrap:wrap;margin-top:34px}
+
+  footer{border-top:1px solid var(--border);padding:34px 0 60px;color:var(--text-3);font-size:13px}
+  .foot{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap}
+  .foot .links{display:flex;gap:22px}
+  .foot a:hover{color:var(--text)}
+  .fine{margin-top:16px;font-size:12px}
+
+  .reveal{opacity:0;transform:translateY(26px);transition:opacity .7s ease,transform .7s cubic-bezier(.22,1,.36,1)}
+  .reveal.in{opacity:1;transform:none}
+
+  @media (max-width:900px){
+    .hood{grid-template-columns:1fr}
+    .frow{grid-template-columns:1fr;gap:22px}
+    .frow.flip .shot{order:0}
+    #model-canvas{height:400px}
+  }
+  @media (max-width:640px){
+    .nav-links a.navlink{display:none}
+    .fish-stage{height:150px}
+    #fish{width:160px;height:150px}
+    section{padding:64px 0}
+    #model-canvas{height:340px}
+    .hud-side .mb{font-size:19px}
+  }
+  @media (prefers-reduced-motion:reduce){
+    *{animation:none!important;transition:none!important}
+    .reveal{opacity:1;transform:none}
+    #fish{cursor:default}
+  }
+</style>
+</head>
+<body>
+
+<canvas id="ocean" aria-hidden="true"></canvas>
+<div id="depth" aria-hidden="true"></div>
+<div class="bubbles" aria-hidden="true" id="bubbles"></div>
+
+<!-- shared fish artwork -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <clipPath id="doryBody"><ellipse cx="330" cy="205" rx="95" ry="85"/></clipPath>
+    <g id="dory-fish">
+      <path class="topfin" d="M298 138 Q 338 88 382 132 L 360 150 L 312 150 Z" fill="#FFB020"/>
+      <path class="tail" d="M405 205 L 472 158 Q 484 205 472 252 Z" fill="#FFB020"/>
+      <g class="fishbody">
+        <ellipse cx="330" cy="205" rx="95" ry="85" fill="#3D7BF4"/>
+        <g clip-path="url(#doryBody)"><path d="M238 122 C 300 82, 402 100, 432 235 C 434 252 424 262 412 256 C 398 192 352 160 302 152 C 272 147 248 138 238 122 Z" fill="#0D1B3D"/></g>
+        <path d="M318 232 Q 342 224 352 244 Q 336 258 318 250 Q 312 240 318 232 Z" fill="#2F62D9"/>
+        <circle cx="284" cy="210" r="16" fill="#FFFFFF"/>
+        <circle class="pupil" cx="281" cy="211" r="8" fill="#0D1B3D"/>
+        <circle class="glint" cx="285" cy="206" r="2.6" fill="#FFFFFF"/>
+        <path d="M243 234 Q 251 241 260 237" fill="none" stroke="#0D1B3D" stroke-width="4" stroke-linecap="round"/>
+      </g>
+    </g>
+  </defs>
+</svg>
+
+<header>
+  <div class="wrap nav">
+    <a class="brand" href="#top" aria-label="Dory home">
+      <span class="tile"><svg viewBox="224 54 270 270" aria-hidden="true"><use href="#dory-fish"/></svg></span>
+      Dory
+    </a>
+    <nav class="nav-links">
+      <a class="navlink" href="#model">How it works</a>
+      <a class="navlink" href="#features">Features</a>
+      <a class="navlink" href="#compare">Compare</a>
+      <a class="navlink" href="#install">Install</a>
+      <a class="btn btn-ghost" href="https://github.com/Augani/dory" target="_blank" rel="noopener" aria-label="Star Dory on GitHub">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+        Star
+      </a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+  <!-- ================= HERO ================= -->
+  <section class="hero" style="padding-top:44px">
+    <div class="wrap">
+      <div class="fish-stage">
+        <svg id="fish" viewBox="224 54 270 270" role="img" aria-label="Dory the fish — click me">
+          <use href="#dory-fish"/>
+        </svg>
+      </div>
+      <div class="pill"><span class="dot"></span> Free &amp; open source · Apple silicon native</div>
+      <h1>Docker &amp; Linux containers, <span class="grad">native to your Mac.</span></h1>
+      <p class="sub">One shared Linux VM for every container. A real Docker socket your CLI already speaks.
+        HTTPS domains, one-click Kubernetes, and full Linux machines — in a ~6&nbsp;MB native app
+        that's free and open source.</p>
+      <div class="cta-row">
+        <a class="btn btn-primary btn-big" href="https://github.com/Augani/dory/releases/latest" target="_blank" rel="noopener">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 12 3 7l1.4-1.4L7 8.2V0h2v8.2l2.6-2.6L13 7l-5 5Zm-6 4v-4h2v2h8v-2h2v4H2Z"/></svg>
+          Download for macOS
+        </a>
+        <a class="btn btn-ghost btn-big" href="#install">Install with Homebrew</a>
+      </div>
+      <div class="brew" role="group" aria-label="Homebrew install command">
+        <code>brew install --cask Augani/dory/dory</code>
+        <button data-copy="brew install --cask Augani/dory/dory">Copy</button>
+      </div>
+      <div class="meta-row">
+        <span><b>~4.7×</b> less idle memory*</span>
+        <span><b>~6 MB</b> app download</span>
+        <span><b>0</b> Electron · <b>0</b> telemetry</span>
+        <span><b>GPL-3.0</b> · yours forever</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 3D MEMORY MODEL ================= -->
+  <section id="model" style="padding-top:36px">
+    <div class="wrap">
+      <span class="kicker reveal">How Dory wins the memory game</span>
+      <h2 class="reveal">Every VM you don't boot is RAM you keep.</h2>
+      <p class="lead reveal">Apple's <code style="font-family:var(--mono);font-size:14px;color:#9fd0ff">container</code> tooling boots a
+        micro-VM — kernel, init, memory ballast — <em>per container</em>. Dory boots <b>one</b> persistent VM,
+        runs <code style="font-family:var(--mono);font-size:14px;color:#9fd0ff">dockerd</code> inside it, and every container shares
+        that single kernel and memory pool. Watch what happens as containers stack up:</p>
+      <div class="model-wrap reveal" id="model-wrap">
+        <canvas id="model-canvas" aria-label="3D visualization: one VM per container versus Dory's single shared VM"></canvas>
+        <div class="hud">
+          <div class="hud-top">
+            <div class="hud-side other">
+              <div class="t">One VM per container</div>
+              <div class="mb" id="mb-other">0 MB</div>
+              <div class="per" id="ct-other">0 containers · 0 kernels</div>
+            </div>
+            <div class="hud-side dory">
+              <div class="t">Dory — one shared VM</div>
+              <div class="mb" id="mb-dory">0 MB</div>
+              <div class="per" id="ct-dory">0 containers · 1 kernel</div>
+            </div>
+          </div>
+          <div class="hud-bottom">
+            <button class="btn btn-primary" id="add-ct">+ Run another container</button>
+            <button class="btn btn-ghost" id="reset-ct">Reset</button>
+          </div>
+        </div>
+        <div class="model-fallback">
+          <svg viewBox="0 0 860 300" role="img" aria-label="Diagram: five per-container VMs each with their own kernel, versus one Dory VM containing five containers">
+            <g font-family="var(--font)" font-size="13">
+              <text x="215" y="28" fill="#8fa2c0" text-anchor="middle" font-weight="700">ONE VM PER CONTAINER</text>
+              <text x="645" y="28" fill="#34D058" text-anchor="middle" font-weight="700">DORY — ONE SHARED VM</text>
+            </g>
+            <g>
+              <rect x="30" y="50" width="70" height="200" rx="10" fill="none" stroke="#5a6a85"/><rect x="40" y="212" width="50" height="28" rx="5" fill="#5a6a85" opacity=".5"/><rect x="47" y="120" width="36" height="36" rx="6" fill="#3D7BF4"/>
+              <rect x="110" y="50" width="70" height="200" rx="10" fill="none" stroke="#5a6a85"/><rect x="120" y="212" width="50" height="28" rx="5" fill="#5a6a85" opacity=".5"/><rect x="127" y="120" width="36" height="36" rx="6" fill="#3D7BF4"/>
+              <rect x="190" y="50" width="70" height="200" rx="10" fill="none" stroke="#5a6a85"/><rect x="200" y="212" width="50" height="28" rx="5" fill="#5a6a85" opacity=".5"/><rect x="207" y="120" width="36" height="36" rx="6" fill="#3D7BF4"/>
+              <rect x="270" y="50" width="70" height="200" rx="10" fill="none" stroke="#5a6a85"/><rect x="280" y="212" width="50" height="28" rx="5" fill="#5a6a85" opacity=".5"/><rect x="287" y="120" width="36" height="36" rx="6" fill="#3D7BF4"/>
+              <rect x="350" y="50" width="70" height="200" rx="10" fill="none" stroke="#5a6a85"/><rect x="360" y="212" width="50" height="28" rx="5" fill="#5a6a85" opacity=".5"/><rect x="367" y="120" width="36" height="36" rx="6" fill="#3D7BF4"/>
+            </g>
+            <g>
+              <rect x="480" y="50" width="330" height="200" rx="14" fill="rgba(46,155,245,.06)" stroke="#2E9BF5"/>
+              <rect x="495" y="212" width="300" height="28" rx="5" fill="#2E9BF5" opacity=".35"/>
+              <rect x="505" y="100" width="44" height="44" rx="7" fill="#3D7BF4"/><rect x="565" y="100" width="44" height="44" rx="7" fill="#3D7BF4"/><rect x="625" y="100" width="44" height="44" rx="7" fill="#3D7BF4"/><rect x="685" y="100" width="44" height="44" rx="7" fill="#3D7BF4"/><rect x="745" y="100" width="44" height="44" rx="7" fill="#3D7BF4"/>
+              <text x="645" y="285" fill="#6D7F9B" font-size="12" text-anchor="middle" font-family="var(--font)">one kernel · one memory pool · shared page cache</text>
+            </g>
+            <text x="215" y="285" fill="#6D7F9B" font-size="12" text-anchor="middle" font-family="var(--font)">five kernels · five memory floors</text>
+          </svg>
+        </div>
+      </div>
+      <p class="model-note reveal">Illustrative animation. Anchored to our measurement: 2 idle containers ≈ <b>122 MB</b> total in Dory's
+        shared VM vs ≈ <b>574 MB</b> as per-container VMs on the same machine
+        (<a href="https://github.com/Augani/dory/blob/main/docs/research/benchmark-methodology.md" style="color:var(--text-2);text-decoration:underline">methodology</a>).</p>
+    </div>
+  </section>
+
+  <!-- ================= UNDER THE HOOD ================= -->
+  <section id="hood" style="padding-top:30px">
+    <div class="wrap">
+      <span class="kicker reveal">Under the hood</span>
+      <h2 class="reveal">Built like a systems tool, not a wrapper.</h2>
+      <p class="lead reveal">Dory's transport, HTTP server, YAML parser, and Docker API layer are hand-rolled Swift —
+        no Electron, no Node sidecars, no frameworks between your CLI and the engine.</p>
+      <div class="hood">
+        <div class="hood-card reveal">
+          <h3>A real Docker socket</h3>
+          <p>Dory serves the Docker Engine API on a unix socket with its own HTTP/1.1 implementation —
+            including connection hijack for <code style="font-family:var(--mono);font-size:12px;color:#9fd0ff">exec</code> and
+            <code style="font-family:var(--mono);font-size:12px;color:#9fd0ff">attach</code> streams — and registers a
+            <code style="font-family:var(--mono);font-size:12px;color:#9fd0ff">dory</code> context so the CLI you already have just points at it.</p>
+          <div class="term"><span class="p">$</span> docker context show
+<span class="g">dory</span>
+<span class="p">$</span> curl --unix-socket ~/.dory/dory.sock \
+    http://localhost/version
+<span class="b">{"Version":"29.5.3", ...}</span></div>
+        </div>
+        <div class="hood-card reveal">
+          <h3>Domains &amp; TLS, locally issued</h3>
+          <p>Every container gets <code style="font-family:var(--mono);font-size:12px;color:#9fd0ff">name.dory.local</code> via a scoped
+            resolver entry. Dory runs its own certificate authority, mints per-host certs on the fly, terminates TLS
+            in-app, and proxies to the container. Consent-gated — nothing touches your system silently.</p>
+          <div class="term"><span class="p">$</span> curl -I https://web-api.dory.local
+<span class="g">HTTP/2 200</span>
+<span class="b">issuer: Dory Local CA</span>
+<span class="p">$</span> docker run -p 3000 --name api node:24
+<span class="b">→ https://api.dory.local</span></div>
+        </div>
+        <div class="hood-card reveal">
+          <h3>One VM, booted in-process</h3>
+          <p>Apple's <code style="font-family:var(--mono);font-size:12px;color:#9fd0ff">containerization</code> framework boots the Linux VM;
+            <code style="font-family:var(--mono);font-size:12px;color:#9fd0ff">dockerd</code> runs inside; virtiofs shares your home
+            directory at the same path, so bind mounts resolve with zero setup. x86 images run via qemu binfmt.</p>
+          <div class="term"><span class="p">$</span> docker run -v ~/proj:/app alpine ls /app
+<span class="b">(your files — no sharing dialogs)</span>
+<span class="p">$</span> docker run --platform linux/amd64 postgres
+<span class="g">✓ emulated on Apple silicon</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= FEATURES ================= -->
+  <section id="features">
+    <div class="wrap">
+      <span class="kicker reveal">What you actually get</span>
+      <h2 class="reveal">The whole workflow, not a demo.</h2>
+
+      <div class="frow reveal">
+        <div class="shot"><img src="shots/stats.png" width="1400" height="911" alt="Dory containers view: live CPU and memory, compose grouping, and a detail pane with stats, domain, ports and restart policy" loading="lazy"></div>
+        <div>
+          <span class="tag">Containers</span>
+          <h3>Everything about a container, one pane away.</h3>
+          <ul>
+            <li>Live CPU &amp; memory with per-container history, sampled from the real stats API.</li>
+            <li>Logs stream in color; an embedded terminal drops you into <code>exec</code> without leaving the app.</li>
+            <li>Compose projects group automatically — stop a whole stack in one click.</li>
+            <li>Every container shows its <code>*.dory.local</code> domain, IP, ports, and restart policy.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="frow flip reveal">
+        <div class="shot"><img src="shots/kubernetes.png" width="1400" height="911" alt="Dory Kubernetes view: cluster health, node and pod counts, and a pod table across namespaces" loading="lazy"></div>
+        <div>
+          <span class="tag">Kubernetes</span>
+          <h3>A cluster you turn on, not one you assemble.</h3>
+          <ul>
+            <li>One-click k3s inside the same shared VM — no second VM tax, no kind/minikube yak-shave.</li>
+            <li>Pick your Kubernetes version; browse pods, deployments, services, config, secrets, ingress.</li>
+            <li>Exec into pods, scale and restart deployments, <code>kubectl apply</code> from the app.</li>
+            <li>Your existing <code>kubectl</code> works — Dory just wires the kubeconfig.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="frow reveal">
+        <div class="shot"><img src="shots/newmachine.png" width="1400" height="911" alt="Dory new machine sheet: use-case cards for Web/Node.js, Python and ML, Go, Rust, Java, DevOps, or a clean Linux, plus a custom composer" loading="lazy"></div>
+        <div>
+          <span class="tag">Linux machines</span>
+          <h3>Machines that arrive ready to work.</h3>
+          <ul>
+            <li>Full Ubuntu, Debian, Fedora, Alpine, or Arch — systemd, SSH, terminal, snapshots.</li>
+            <li>Pick a use-case — Node, Python &amp; ML, Go, Rust, Java, DevOps — and the machine provisions itself.</li>
+            <li>Or compose your own: check off runtimes, tools, and packages before it boots.</li>
+            <li>Each machine gets a <code>name.dory.local</code> address on your Mac.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="frow flip reveal">
+        <div class="shot"><img src="shots/compose.png" width="1400" height="911" alt="Dory compose view: a project with its services and one-click stack control" loading="lazy"></div>
+        <div>
+          <span class="tag">Compose &amp; migration</span>
+          <h3>Your stack, your files, zero rewrites.</h3>
+          <ul>
+            <li>Dory parses <code>compose.yaml</code> natively: <code>.env</code> + variable interpolation,
+              <code>depends_on</code> ordering, and <code>service_healthy</code> waits via real health probes.</li>
+            <li>Migration imports images and containers from Docker Desktop or OrbStack in minutes.</li>
+            <li>First launch is guided end-to-end — including a one-click engine toolchain install.</li>
+            <li>Honest scorecard: every feature's status is tracked publicly in
+              <a href="https://github.com/Augani/dory/blob/main/COMPATIBILITY.md" style="color:#9fd0ff;text-decoration:underline">COMPATIBILITY.md</a>.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= MEMORY ================= -->
+  <section id="memory" style="padding-top:40px">
+    <div class="wrap">
+      <span class="kicker reveal">Measured, not promised</span>
+      <h2 class="reveal">Your RAM belongs to you.</h2>
+      <div class="mem-card reveal" id="memcard">
+        <div class="mem-row">
+          <div class="label"><b>Dory — one shared VM</b><span>~122 MB · 2 idle containers</span></div>
+          <div class="track"><div class="fill dory" data-w="21%"></div></div>
+        </div>
+        <div class="mem-row">
+          <div class="label"><b>One VM per container</b><span>~574 MB · 2 idle containers</span></div>
+          <div class="track"><div class="fill other" data-w="100%"></div></div>
+        </div>
+        <div class="mem-big"><span class="x">~4.7×</span><span>less idle memory — and the gap widens with every container you add</span></div>
+        <div class="mem-note">*Measured by Dory on Apple silicon (<a href="https://github.com/Augani/dory/blob/main/docs/research/benchmark-methodology.md" style="color:var(--text-2);text-decoration:underline">methodology</a>).
+          Treat it as our figure until the public reproducible benchmark lands.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= COMPARE ================= -->
+  <section id="compare">
+    <div class="wrap">
+      <span class="kicker reveal">The part nobody puts on their pricing page</span>
+      <h2 class="reveal">Free means free.</h2>
+      <div class="compare reveal">
+        <table>
+          <thead><tr><th></th><th>Dory</th><th>Docker Desktop</th><th>OrbStack</th></tr></thead>
+          <tbody>
+            <tr><td>Price</td><td class="yes">Free, forever</td><td class="warn">Paid ≥250 employees / $10M rev</td><td class="warn">$8/user/mo commercial</td></tr>
+            <tr><td>Open source</td><td class="yes">GPL-3.0</td><td class="no">Proprietary app</td><td class="no">Proprietary</td></tr>
+            <tr><td>Account required</td><td class="yes">Never</td><td class="warn">For paid terms</td><td class="no">Not for personal</td></tr>
+            <tr><td>Shared-VM engine</td><td class="yes">Yes</td><td class="no">Fixed VM block</td><td class="yes">Yes</td></tr>
+            <tr><td>Kubernetes versions</td><td class="yes">Selectable (k3s)</td><td class="no">Pinned to release</td><td class="no">One, auto-bumped</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="compare-note reveal">Sourced and kept honest — read the full
+        <a href="https://github.com/Augani/dory/blob/main/docs/comparison.md" style="color:var(--text-2);text-decoration:underline">comparison with citations</a>.</p>
+    </div>
+  </section>
+
+  <!-- ================= INSTALL ================= -->
+  <section id="install">
+    <div class="wrap">
+      <span class="kicker reveal">Get started</span>
+      <h2 class="reveal">Up and running in a minute.</h2>
+      <div class="install-card reveal">
+        <p style="color:var(--text-2);font-size:15px">Install with Homebrew, or grab the notarized app from GitHub Releases.
+          First launch walks you through the rest — engine included.</p>
+        <div class="brew" role="group" aria-label="Homebrew install command">
+          <code>brew install --cask Augani/dory/dory</code>
+          <button data-copy="brew install --cask Augani/dory/dory">Copy</button>
+        </div>
+        <div class="cta-row" style="margin-top:24px">
+          <a class="btn btn-primary" href="https://github.com/Augani/dory/releases/latest" target="_blank" rel="noopener">Download the latest release →</a>
+        </div>
+        <p class="req">macOS 26 (Tahoe) on Apple silicon for the standalone engine ·
+          macOS 15+ against an existing Docker-compatible engine</p>
+      </div>
+      <div class="oss reveal">
+        <a class="btn btn-ghost" href="https://github.com/Augani/dory" target="_blank" rel="noopener">⭐ Star Dory on GitHub</a>
+        <a class="btn btn-ghost" href="https://github.com/Augani/dory/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contribute</a>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="foot">
+      <a class="brand" href="#top" style="font-size:15px">
+        <span class="tile" style="width:26px;height:26px;border-radius:7px"><svg viewBox="224 54 270 270" aria-hidden="true" style="width:22px;height:22px"><use href="#dory-fish"/></svg></span>
+        Dory
+      </a>
+      <div class="links">
+        <a href="https://github.com/Augani/dory" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://github.com/Augani/dory/releases" target="_blank" rel="noopener">Releases</a>
+        <a href="https://github.com/Augani/dory/blob/main/COMPATIBILITY.md" target="_blank" rel="noopener">Compatibility</a>
+        <a href="https://github.com/Augani/dory/blob/main/LICENSE" target="_blank" rel="noopener">License</a>
+      </div>
+    </div>
+    <p class="fine">Made for macOS on Apple silicon · GPL-3.0 · © 2026 Dory contributors.
+      Not affiliated with Docker, Inc. or OrbStack.</p>
+  </div>
+</footer>
+
+<script>
+(function(){
+  "use strict";
+  var reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  /* ---------- copy buttons ---------- */
+  document.querySelectorAll("[data-copy]").forEach(function(btn){
+    btn.addEventListener("click", function(){
+      navigator.clipboard.writeText(btn.getAttribute("data-copy")).then(function(){
+        var old = btn.textContent;
+        btn.textContent = "Copied!";
+        setTimeout(function(){ btn.textContent = old; }, 1400);
+      });
+    });
+  });
+
+  /* ---------- reveal on scroll ---------- */
+  var io = new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      if(e.isIntersecting){ e.target.classList.add("in"); io.unobserve(e.target); }
+    });
+  }, {threshold: .12});
+  document.querySelectorAll(".reveal").forEach(function(el){ io.observe(el); });
+
+  /* ---------- memory bars ---------- */
+  var mem = document.getElementById("memcard");
+  if (mem){
+    var mio = new IntersectionObserver(function(entries){
+      entries.forEach(function(e){
+        if(e.isIntersecting){
+          mem.querySelectorAll(".fill").forEach(function(f){ f.style.width = f.getAttribute("data-w"); });
+          mio.disconnect();
+        }
+      });
+    }, {threshold: .4});
+    mio.observe(mem);
+  }
+
+  /* ---------- scroll depth ---------- */
+  var depth = document.getElementById("depth");
+  var ticking = false;
+  addEventListener("scroll", function(){
+    if (ticking) return;
+    ticking = true;
+    requestAnimationFrame(function(){
+      var max = document.documentElement.scrollHeight - innerHeight;
+      var p = max > 0 ? Math.min(1, scrollY / max) : 0;
+      depth.style.opacity = (p * 0.4).toFixed(3);
+      ticking = false;
+    });
+  }, {passive:true});
+
+  /* ---------- bubbles ---------- */
+  if (!reduced){
+    var wrapB = document.getElementById("bubbles");
+    for (var i = 0; i < 16; i++){
+      var b = document.createElement("i");
+      b.className = "bubble";
+      var s = 4 + Math.random() * 14;
+      b.style.width = b.style.height = s.toFixed(1) + "px";
+      b.style.left = (Math.random() * 100).toFixed(2) + "vw";
+      b.style.setProperty("--sway", ((Math.random() * 60 - 30)).toFixed(0) + "px");
+      b.style.animationDuration = (11 + Math.random() * 16).toFixed(1) + "s";
+      b.style.animationDelay = (-Math.random() * 24).toFixed(1) + "s";
+      wrapB.appendChild(b);
+    }
+  }
+
+  /* ---------- Dory the fish ---------- */
+  var fish = document.getElementById("fish");
+  if (fish && !reduced){
+    var pupil = fish.querySelector(".pupil");
+    var glint = fish.querySelector(".glint");
+    addEventListener("pointermove", function(ev){
+      var r = fish.getBoundingClientRect();
+      var cx = r.left + r.width * 0.28, cy = r.top + r.height * 0.55;
+      var dx = ev.clientX - cx, dy = ev.clientY - cy;
+      var d = Math.hypot(dx, dy) || 1;
+      var m = Math.min(5, d / 40);
+      var ox = (dx / d) * m, oy = (dy / d) * m;
+      pupil.setAttribute("transform", "translate(" + ox.toFixed(1) + " " + oy.toFixed(1) + ")");
+      glint.setAttribute("transform", "translate(" + (ox * .5).toFixed(1) + " " + (oy * .5).toFixed(1) + ")");
+      var tilt = Math.max(-6, Math.min(6, dx / 60));
+      fish.style.transform = "rotate(" + tilt.toFixed(1) + "deg)";
+    }, {passive:true});
+    var darting = false;
+    fish.addEventListener("click", function(){
+      if (darting) return;
+      darting = true;
+      fish.style.transition = "transform .55s cubic-bezier(.3,.7,.2,1)";
+      fish.style.transform = "translateX(46vw) rotate(8deg)";
+      setTimeout(function(){
+        fish.style.transition = "none";
+        fish.style.transform = "translateX(-46vw)";
+        requestAnimationFrame(function(){ requestAnimationFrame(function(){
+          fish.style.transition = "transform .7s cubic-bezier(.22,1,.36,1)";
+          fish.style.transform = "none";
+          setTimeout(function(){ darting = false; }, 700);
+        });});
+      }, 580);
+    });
+  }
+
+  /* ---------- WebGL ocean ---------- */
+  var canvas = document.getElementById("ocean");
+  function staticFallback(){ canvas.style.background = "linear-gradient(180deg,#0a1a30 0%,#070D18 55%,#05090f 100%)"; }
+  if (reduced){ staticFallback(); return; }
+  var gl = canvas.getContext("webgl", {antialias:false, alpha:false, powerPreference:"low-power"});
+  if (!gl){ staticFallback(); return; }
+  var VS = "attribute vec2 p;void main(){gl_Position=vec4(p,0.,1.);}";
+  var FS = [
+    "precision mediump float;uniform vec2 r;uniform float t;",
+    "float caust(vec2 p,float tt){float c=0.;float a=1.;",
+    "for(int i=0;i<3;i++){vec2 q=p+vec2(sin(p.y*1.4+tt*.9)*.32,cos(p.x*1.2-tt*.7)*.32);",
+    "c+=a*abs(sin(q.x*2.1+tt)+cos(q.y*2.4-tt*.8));p=p*1.55+vec2(3.1,1.7);a*=.55;}return c;}",
+    "void main(){vec2 uv=gl_FragCoord.xy/r;vec2 p=uv*vec2(r.x/r.y,1.)*2.6;",
+    "float depthFade=smoothstep(1.05,.15,uv.y);",
+    "float c=caust(p,t*.5);",
+    "float glow=pow(smoothstep(2.1,3.2,c),2.2)*.16*(.25+.75*(1.-uv.y));",
+    "vec2 rp=vec2(uv.x-.5,1.06-uv.y);float ang=atan(rp.x,rp.y);",
+    "float rays=(sin(ang*22.-t*.35)*.5+.5)*(sin(ang*9.+t*.22)*.5+.5);",
+    "rays*=pow(max(0.,1.-length(rp)*.95),2.)*.10;",
+    "vec3 top=vec3(.055,.11,.20);vec3 bot=vec3(.016,.032,.058);",
+    "vec3 col=mix(top,bot,pow(uv.y,1.25));",
+    "col+=vec3(.35,.62,.95)*glow*depthFade;col+=vec3(.30,.55,.9)*rays;",
+    "float vig=smoothstep(1.35,.45,length(uv-vec2(.5,.45)));col*=.82+.18*vig;",
+    "gl_FragColor=vec4(col,1.);}"
+  ].join("\n");
+  function mkShader(type, src){
+    var s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    return gl.getShaderParameter(s, gl.COMPILE_STATUS) ? s : null;
+  }
+  var vs = mkShader(gl.VERTEX_SHADER, VS), fs = mkShader(gl.FRAGMENT_SHADER, FS);
+  if (!vs || !fs){ staticFallback(); return; }
+  var prog = gl.createProgram();
+  gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)){ staticFallback(); return; }
+  gl.useProgram(prog);
+  var buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+  var loc = gl.getAttribLocation(prog, "p");
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  var uR = gl.getUniformLocation(prog, "r"), uT = gl.getUniformLocation(prog, "t");
+  var dpr = Math.min(devicePixelRatio || 1, 1.5);
+  function resize(){
+    var w = Math.floor(innerWidth * dpr), h = Math.floor(innerHeight * dpr);
+    if (canvas.width !== w || canvas.height !== h){ canvas.width = w; canvas.height = h; gl.viewport(0, 0, w, h); }
+  }
+  addEventListener("resize", resize, {passive:true});
+  resize();
+  var running = true, start = performance.now();
+  document.addEventListener("visibilitychange", function(){
+    running = !document.hidden;
+    if (running) requestAnimationFrame(frame);
+  });
+  function frame(now){
+    if (!running) return;
+    gl.uniform2f(uR, canvas.width, canvas.height);
+    gl.uniform1f(uT, (now - start) / 1000);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+
+<script type="module">
+/* ---------- Three.js memory-model visualization ---------- */
+const wrap = document.getElementById("model-wrap");
+const canvas = document.getElementById("model-canvas");
+const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+function fallback(){ wrap.classList.add("no3d"); }
+if (reduced){ fallback(); }
+else {
+try {
+  const THREE = await import("./vendor/three.module.min.js");
+
+  const renderer = new THREE.WebGLRenderer({canvas, alpha:true, antialias:true});
+  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 1.5));
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(38, 2, 0.1, 300);
+  camera.position.set(0, 13, 46);
+  camera.lookAt(0, 1, 0);
+
+  scene.add(new THREE.AmbientLight(0x8fb6ff, 1.15));
+  const key = new THREE.DirectionalLight(0xcfe4ff, 1.6);
+  key.position.set(6, 18, 12);
+  scene.add(key);
+  const rim = new THREE.DirectionalLight(0x2E9BF5, 0.7);
+  rim.position.set(-10, 6, -8);
+  scene.add(rim);
+
+  const world = new THREE.Group();
+  scene.add(world);
+
+  const MAT = {
+    container: new THREE.MeshLambertMaterial({color: 0x3D7BF4}),
+    containerTop: new THREE.MeshLambertMaterial({color: 0x6CB8FF}),
+    kernelOther: new THREE.MeshLambertMaterial({color: 0x5a6a85}),
+    kernelDory: new THREE.MeshLambertMaterial({color: 0x2E9BF5, transparent: true, opacity: .8}),
+    shellOther: new THREE.MeshLambertMaterial({color: 0x39496b, transparent: true, opacity: .10, depthWrite: false}),
+    shellDory: new THREE.MeshLambertMaterial({color: 0x2E9BF5, transparent: true, opacity: .07, depthWrite: false}),
+    edgeOther: new THREE.LineBasicMaterial({color: 0x66779c, transparent: true, opacity: .55}),
+    edgeDory: new THREE.LineBasicMaterial({color: 0x2E9BF5, transparent: true, opacity: .8}),
+  };
+
+  function box(w, h, d, mat){ return new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat); }
+  function edges(w, h, d, mat){
+    return new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(w, h, d)), mat);
+  }
+  function containerCube(){
+    const g = new THREE.Group();
+    const c = box(2.2, 2.2, 2.2, MAT.container);
+    const lid = box(2.2, 0.34, 2.2, MAT.containerTop);
+    lid.position.y = 1.28;
+    g.add(c); g.add(lid);
+    return g;
+  }
+
+  // LEFT: one VM shell per container
+  const left = new THREE.Group();
+  left.position.x = -13.5;
+  world.add(left);
+  // RIGHT: Dory's single shared VM
+  const right = new THREE.Group();
+  right.position.x = 13.5;
+  world.add(right);
+
+  const dShellW = 17, dShellH = 9.5, dShellD = 11;
+  right.add(box(dShellW, dShellH, dShellD, MAT.shellDory));
+  right.add(edges(dShellW, dShellH, dShellD, MAT.edgeDory));
+  const dKernel = box(dShellW - 1.6, 1.1, dShellD - 1.6, MAT.kernelDory);
+  dKernel.position.y = -dShellH / 2 + 1.0;
+  right.add(dKernel);
+
+  const spawned = [];   // {side:'L'|'R', group}
+  let count = 0;
+  const MAX = 6;
+
+  const mbOther = document.getElementById("mb-other");
+  const mbDory = document.getElementById("mb-dory");
+  const ctOther = document.getElementById("ct-other");
+  const ctDory = document.getElementById("ct-dory");
+  // anchored to the 2-container measurement: 574/2 per VM; Dory ≈ 100 base + ~11 per container
+  const PER_VM = 287, DORY_BASE = 100, DORY_PER = 11;
+
+  function leftSlot(i){
+    const col = i % 3, row = Math.floor(i / 3);
+    return new THREE.Vector3((col - 1) * 6.4, 0, (row - 0.5) * 6.6);
+  }
+  function rightSlot(i){
+    const col = i % 3, row = Math.floor(i / 3);
+    return new THREE.Vector3((col - 1) * 4.6, -dShellH / 2 + 2.9, (row - 0.5) * 4.4);
+  }
+
+  function updateHUD(){
+    mbOther.textContent = (count * PER_VM) + " MB";
+    mbDory.textContent = (count ? DORY_BASE + count * DORY_PER : 0) + " MB";
+    ctOther.textContent = count + " container" + (count === 1 ? "" : "s") + " · " + count + " kernel" + (count === 1 ? "" : "s");
+    ctDory.textContent = count + " container" + (count === 1 ? "" : "s") + " · 1 kernel";
+  }
+
+  function addContainer(){
+    if (count >= MAX) return;
+    const i = count;
+    count++;
+    // left: a whole new VM shell + kernel + cube
+    const vm = new THREE.Group();
+    const p = leftSlot(i);
+    vm.position.copy(p);
+    vm.add(box(5.4, 7.2, 5.4, MAT.shellOther));
+    vm.add(edges(5.4, 7.2, 5.4, MAT.edgeOther));
+    const k = box(4.4, 1.0, 4.4, MAT.kernelOther);
+    k.position.y = -2.6;
+    vm.add(k);
+    const cubeL = containerCube();
+    cubeL.position.y = 0.4;
+    vm.add(cubeL);
+    vm.scale.setScalar(0.01);
+    left.add(vm);
+    spawned.push({group: vm, born: performance.now()});
+    // right: just one more cube in the shared shell
+    const cubeR = containerCube();
+    cubeR.position.copy(rightSlot(i));
+    cubeR.scale.setScalar(0.01);
+    right.add(cubeR);
+    spawned.push({group: cubeR, born: performance.now()});
+    updateHUD();
+  }
+
+  function reset(){
+    for (const s of spawned) s.group.parent && s.group.parent.remove(s.group);
+    spawned.length = 0;
+    count = 0;
+    updateHUD();
+  }
+
+  let userDrove = false;
+  document.getElementById("add-ct").addEventListener("click", () => { userDrove = true; addContainer(); });
+  document.getElementById("reset-ct").addEventListener("click", () => { userDrove = true; reset(); });
+
+  // pointer parallax
+  let targetRX = -0.12, targetRY = 0;
+  wrap.addEventListener("pointermove", (ev) => {
+    const r = wrap.getBoundingClientRect();
+    const nx = (ev.clientX - r.left) / r.width - 0.5;
+    const ny = (ev.clientY - r.top) / r.height - 0.5;
+    targetRY = nx * 0.35;
+    targetRX = -0.12 - ny * 0.18;
+  }, {passive: true});
+
+  function resize(){
+    const w = wrap.clientWidth, h = canvas.clientHeight || 520;
+    if (w < 10 || h < 10) return;
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+  }
+  new ResizeObserver(resize).observe(wrap);
+  resize();
+
+  // auto-demo until the user interacts
+  let lastAuto = 0;
+  let visible = false;
+  const vio = new IntersectionObserver((es) => { es.forEach(e => { visible = e.isIntersecting; }); }, {threshold: 0.2});
+  vio.observe(wrap);
+
+  updateHUD();
+  renderer.setAnimationLoop((now) => {
+    if (!visible) return;
+    if (!userDrove && now - lastAuto > 2100){
+      lastAuto = now;
+      if (count >= MAX) reset(); else addContainer();
+    }
+    // spawn scale-in
+    for (const s of spawned){
+      const a = Math.min(1, (now - s.born) / 480);
+      const e = 1 - Math.pow(1 - a, 3);
+      s.group.scale.setScalar(Math.max(0.01, e));
+    }
+    world.rotation.y += (targetRY - world.rotation.y) * 0.05;
+    world.rotation.x += (targetRX - world.rotation.x) * 0.05;
+    renderer.render(scene, camera);
+  });
+} catch (err) {
+  fallback();
+}
+}
+</script>
+</body>
+</html>
