@@ -96,7 +96,9 @@ Dory selects a backend automatically; `DORY_RUNTIME` overrides it. All share one
 
 ## Requirements
 
-- macOS 15 or later for the app and Docker-compatible host-engine mode
+- macOS 15 or later, **Intel or Apple silicon** — the app ships as a universal binary. On Intel
+  (or older macOS), Dory pairs with any Docker-compatible engine: Colima, Docker Desktop,
+  Rancher Desktop, Podman, or OrbStack.
 - macOS 26 (Tahoe) or later on Apple silicon for Dory's standalone Shared VM / Apple `container` backends
 - Xcode 27 or later (to build from source)
 

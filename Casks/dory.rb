@@ -9,8 +9,9 @@ cask "dory" do
   desc "Lightweight native macOS app for Docker and Linux containers on Apple silicon"
   homepage "https://github.com/Augani/dory"
 
-  depends_on macos: :tahoe
-  depends_on arch: :arm64
+  # Universal binary (arm64 + x86_64), minimum macOS 15. Dory's standalone shared-VM engine needs
+  # Apple silicon + macOS 26; Intel and older Macs run against any Docker-compatible engine.
+  depends_on macos: ">= :sequoia"
 
   app "Dory.app"
 
