@@ -1,12 +1,12 @@
 name: Deploy Pages
 
-# Publishes the landing page in docs/ to GitHub Pages on every push to main.
-# One-time setup: repo Settings → Pages → Source → "GitHub Actions".
+# Builds website/ (React + Vite) into docs/ and publishes it to GitHub Pages on every
+# push to main. One-time setup: repo Settings → Pages → Source → "GitHub Actions".
 
 on:
   push:
     branches: [main]
-    paths: ['docs/**', '.github/workflows/pages.yml']
+    paths: ['docs/**', 'website/**', '.github/workflows/pages.yml']
   workflow_dispatch:
 
 permissions:
@@ -26,6 +26,15 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - run: npm ci
+        working-directory: website
+      - run: npm run build
+        working-directory: website
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

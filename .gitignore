@@ -62,3 +62,6 @@ cloud/
 # Claude Code session artifacts
 .claude-tasks.md
 .claude/
+
+# Website build output (source lives in website/; built into docs/ via `npm run build`)
+docs-build/
