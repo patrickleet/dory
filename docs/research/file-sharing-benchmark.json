@@ -1,0 +1,28 @@
+{
+  "date": "2026-07-04",
+  "host": "Apple Silicon macOS 27.0",
+  "workload": {
+    "fio": "randread bs=4k size=128m iodepth=16 numjobs=1 runtime=15s time_based",
+    "dd": "128 MiB sequential write (bs=1M count=128)",
+    "gitStatus": "git status --porcelain on a 4067-file repo"
+  },
+  "note": "Dory measured via a real dory-hv guest (kernel 6.12.30-dory) mounting a virtio-fs --share of a macOS dir and running fio/dd/git on it. OrbStack measured via a container bind mount of the same macOS dir. Docker Desktop not installed on this host.",
+  "results": [
+    {
+      "engine": "dory-virtiofs",
+      "mount": "virtiofs (plain, no DAX)",
+      "fio4kRandreadIOPS": 19764,
+      "fio4kRandreadMBps": 77.2,
+      "ddWriteSeconds": 0.19,
+      "gitStatusSeconds": 0.01
+    },
+    {
+      "engine": "orbstack",
+      "mount": "container bind mount",
+      "fio4kRandreadIOPS": 111820,
+      "fio4kRandreadMBps": 436.8,
+      "ddWriteSeconds": 0.20,
+      "gitStatusSeconds": 0.4
+    }
+  ]
+}
