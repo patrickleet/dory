@@ -13,6 +13,7 @@ struct Options {
     var memoryMB: UInt64 = 2048
     var cpus: Int = 1
     var commandLine = "console=ttyAMA0 earlycon=pl011,mmio32,0x0c000000 panic=0"
+    var disks: [String] = []
 }
 
 func parseOptions(_ arguments: ArraySlice<String>) -> Options {
@@ -24,6 +25,7 @@ func parseOptions(_ arguments: ArraySlice<String>) -> Options {
         case "--mem-mb": options.memoryMB = iterator.next().flatMap(UInt64.init) ?? options.memoryMB
         case "--cpus": options.cpus = iterator.next().flatMap(Int.init) ?? options.cpus
         case "--cmdline": options.commandLine = iterator.next() ?? options.commandLine
+        case "--disk": if let disk = iterator.next() { options.disks.append(disk) }
         default: fail("unknown option \(argument)")
         }
     }
@@ -54,11 +56,26 @@ case "boot":
             cpuCount: options.cpus
         )
         let machine = try Machine(configuration: configuration)
-        FileHandle.standardError.write(Data("dory-hv: gicd size 0x\(String(try Machine.gicDistributorSize(), radix: 16)), gicr region 0x\(String(try Machine.gicRedistributorRegionSize(), radix: 16))\n".utf8))
         let console = FileHandle.standardOutput
         machine.attachConsole(PL011(baseAddress: GuestLayout.uartBase) { byte in
             console.write(Data([byte]))
         })
+        var backends: [VirtioDeviceBackend] = []
+        for (slot, diskPath) in options.disks.enumerated() {
+            backends.append(try VirtioBlk(path: diskPath, identity: "dory-blk\(slot)"))
+        }
+        backends.append(VirtioRng())
+        for (slot, backend) in backends.enumerated() {
+            let spi = GuestLayout.virtioFirstIRQ + UInt32(slot)
+            let transport = VirtioMMIOTransport(
+                baseAddress: GuestLayout.virtioBase + UInt64(slot) * GuestLayout.virtioSlotSize,
+                backend: backend,
+                memory: machine.memory
+            ) { [weak machine] in
+                machine?.raiseSPI(spi)
+            }
+            machine.attachVirtioSlot(transport)
+        }
         try machine.loadBootPayload()
         let stop = try machine.runBootCPU()
         print("\ndory-hv: guest stopped: \(stop)")
