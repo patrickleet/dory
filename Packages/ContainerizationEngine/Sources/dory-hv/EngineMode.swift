@@ -170,6 +170,16 @@ enum EngineMode {
         let shutdownSocket = state + "/shutdown.sock"
         publishForward(local: shutdownSocket, guestPort: 2377, apiSocket: apiSocket, label: "shutdown channel")
         installGracefulShutdown(shutdownSocket: shutdownSocket)
+
+        // Keep gvproxy's forwards in sync with the ports containers publish, so `docker run -p` is
+        // reachable from the host across the userspace network.
+        let portForwarder = PortForwarder(
+            engineSocket: configuration.engineSocket,
+            apiSocket: apiSocket,
+            guestIP: "192.168.127.2",
+            log: { note($0) }
+        )
+        portForwarder.start()
         note("engine starting: \(configuration.memoryMB)MiB ceiling, \(configuration.cpus) cpus, socket \(configuration.engineSocket)")
 
         let memory = machine.memory

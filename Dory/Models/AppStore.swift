@@ -449,17 +449,17 @@ final class AppStore {
         let forwarder = self.portForwarder
         let table = self.domainTable
         let suffix = self.domainSuffix
+        // Dory's engine publishes container ports to the host through gvproxy, so published ports
+        // are already reachable at 127.0.0.1. The app never binds them itself (that would race
+        // gvproxy); it only points *.dory.local domains at those localhost ports.
+        forwarder.updateTarget("127.0.0.1")
         portForwardingTask = Task { [weak self] in
             while !Task.isCancelled {
-                if let ip = await SharedVMProvisioner.engineIP(), ip != "127.0.0.1" {
-                    forwarder.updateTarget(ip)
-                    let endpoints = await Self.containerEndpoints(runtime, suffix: suffix)
-                    forwarder.sync(ports: await Self.allPublishedPorts(runtime))
-                    table.replaceContainers(endpoints)
-                    if FileManager.default.fileExists(atPath: KubernetesProvisioner.kubeconfigPath) {
-                        self?.ensureKubeProxy()
-                        table.replaceKube(await KubeServiceProxy.backends(suffix: suffix))
-                    }
+                let endpoints = await Self.containerEndpoints(runtime, suffix: suffix)
+                table.replaceContainers(endpoints)
+                if FileManager.default.fileExists(atPath: KubernetesProvisioner.kubeconfigPath) {
+                    self?.ensureKubeProxy()
+                    table.replaceKube(await KubeServiceProxy.backends(suffix: suffix))
                 }
                 try? await Task.sleep(for: .seconds(3))
             }
