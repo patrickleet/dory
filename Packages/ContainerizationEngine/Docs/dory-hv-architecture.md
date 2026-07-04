@@ -33,7 +33,13 @@ real AMFI trust chain — and runs the whole stack.
   free list, where reporting reclaims it) plus a gentle `drop_caches` only when cache bloats.
 - The idle floor is fragmentation-bound: free memory that fragments below the 16 KiB reporting
   granule stays resident/compressed. A fresh engine lands ~470 MB; after varied workloads the
-  floor is ~700 MB. Both beat OrbStack's 849 MB.
+  floor is ~700 MB. Both beat OrbStack's 849 MB. The remaining gap is guest page cache plus
+  sub-granule free-memory fragmentation; the future lever to close it is a custom virtio-balloon
+  reporting device that reclaims at 4 KiB granularity instead of relying on the guest's 16 KiB
+  order-2 reports, but that is not needed to beat OrbStack.
+- Reclaim health after the fix: restore churn is ~4–5% of released bytes (77 MiB restored per
+  1697 MiB released, measured on the signed app running postgres + a Linux machine), down from
+  ~58% with the old compaction loop.
 
 Note on RSS vs footprint: OrbStack reclaims via macOS compression (footprint counts the compressed
 bytes; RSS drops only under pressure); dory-hv reclaims via `MADV_FREE_REUSABLE` (pages leave the

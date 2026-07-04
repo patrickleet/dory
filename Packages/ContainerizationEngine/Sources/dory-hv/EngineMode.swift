@@ -240,9 +240,10 @@ enum EngineMode {
             "( while true; do nc -l -p 2377 >/dev/null 2>&1; echo shutdown requested; sync; umount /var/lib/docker 2>/dev/null; sync; poweroff -f; done ) & true",
             // Cache cap only. NO compaction (it migrates pages and re-faults the ones free page
             // reporting already handed back to the host — pure churn) and NO root memory.reclaim
-            // (write-rejected on the root cgroup). A gentle pagecache drop fires only when the
-            // cache genuinely bloats past ~384 MiB, so active workloads keep their working set.
-            "( while true; do sleep 30; c=$(grep Cached: /proc/meminfo | head -1 | tr -s \\  | cut -d\\  -f2); [ ${c:-0} -gt 393216 ] && echo 1 > /proc/sys/vm/drop_caches 2>/dev/null; done ) & true",
+            // (write-rejected on the root cgroup). A gentle pagecache-only drop fires when the
+            // cache passes ~320 MiB, capping the idle footprint while leaving a healthy working
+            // set for active containers.
+            "( while true; do sleep 30; c=$(grep Cached: /proc/meminfo | head -1 | tr -s \\  | cut -d\\  -f2); [ ${c:-0} -gt 327680 ] && echo 1 > /proc/sys/vm/drop_caches 2>/dev/null; done ) & true",
             // Hand PID 1 to tini (docker-init, shipped in docker:dind) as a reaping init. exec
             // replaces the boot shell in place, so tini keeps PID 1 while dockerd and the loops
             // above continue as its children. Container shims double-fork and orphan their exited
