@@ -35,9 +35,18 @@ enum EngineMode {
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .global())
             source.setEventHandler {
                 note("shutdown requested, asking the guest to power off…")
-                touchUnixSocket(shutdownSocket)
-                DispatchQueue.global().asyncAfter(deadline: .now() + 10) {
-                    note("guest did not stop in 10s, forcing exit")
+                // Retry the poweroff touch: SIGTERM can arrive during guest boot, before the
+                // gvproxy forward is registered or the guest's listener is up. The run loop returns
+                // once the guest powers off (and the process exits cleanly); the watchdog only
+                // fires if the guest never stops.
+                DispatchQueue.global().async {
+                    for _ in 0..<40 {
+                        if touchUnixSocket(shutdownSocket) { return }
+                        usleep(250_000)
+                    }
+                }
+                DispatchQueue.global().asyncAfter(deadline: .now() + 12) {
+                    note("guest did not stop in 12s, forcing exit")
                     if sidecarPID > 0 { kill(sidecarPID, SIGTERM) }
                     exit(1)
                 }
@@ -47,11 +56,13 @@ enum EngineMode {
         }
     }
 
-    /// Opens and closes a connection to a unix socket; the guest's listener treats any
-    /// connection as the power-off request.
-    private static func touchUnixSocket(_ path: String) {
+    /// Opens and closes a connection to a unix socket; the guest's listener treats any connection
+    /// as the power-off request. Returns whether the connection was actually established, so the
+    /// caller can retry until the forward and the guest listener both exist.
+    @discardableResult
+    private static func touchUnixSocket(_ path: String) -> Bool {
         let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard descriptor >= 0 else { return }
+        guard descriptor >= 0 else { return false }
         defer { close(descriptor) }
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
@@ -59,11 +70,12 @@ enum EngineMode {
             let bytes = [UInt8](path.utf8.prefix(destination.count - 1))
             destination.copyBytes(from: bytes)
         }
-        _ = withUnsafePointer(to: &address) { pointer in
+        let result = withUnsafePointer(to: &address) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { raw in
                 connect(descriptor, raw, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
+        return result == 0
     }
 
     static func run(_ configuration: Configuration) async throws {
@@ -74,21 +86,32 @@ enum EngineMode {
         let bootRootfs = state + "/rootfs-boot.ext4"
         let dataDisk = state + "/docker-data.ext4"
 
+        // Both one-time artifacts are built at a temp path and atomically renamed into place, so an
+        // interrupted first run leaves no half-written file that the fileExists guard would then
+        // treat as complete forever.
         if !FileManager.default.fileExists(atPath: pristineRootfs) {
             note("first run: preparing engine rootfs (one-time)…")
-            try await prepareEngineDisk(at: pristineRootfs, stateDirectory: state)
+            let temporary = pristineRootfs + ".partial"
+            try? FileManager.default.removeItem(atPath: temporary)
+            try await prepareEngineDisk(at: temporary, stateDirectory: state)
+            try fsyncFile(temporary)
+            try FileManager.default.moveItem(atPath: temporary, toPath: pristineRootfs)
         }
         try? FileManager.default.removeItem(atPath: bootRootfs)
         try FileManager.default.copyItem(atPath: pristineRootfs, toPath: bootRootfs)
 
         if !FileManager.default.fileExists(atPath: dataDisk) {
             note("first run: creating journaled docker data disk…")
+            let temporary = dataDisk + ".partial"
+            try? FileManager.default.removeItem(atPath: temporary)
             let formatter = try EXT4.Formatter(
-                FilePath(dataDisk),
+                FilePath(temporary),
                 minDiskSize: 16 * 1024 * 1024 * 1024,
                 journal: EXT4.JournalConfig.default
             )
             try formatter.close()
+            try fsyncFile(temporary)
+            try FileManager.default.moveItem(atPath: temporary, toPath: dataDisk)
         }
 
         let machine = try Machine(configuration: MachineConfiguration(
@@ -164,6 +187,20 @@ enum EngineMode {
         note("engine stopped: \(stop)")
     }
 
+    /// Flushes a freshly written file to stable storage before it is renamed into place, so a
+    /// crash right after the rename can never expose a file whose contents are still in the page
+    /// cache (EXT4.Formatter.close does not fsync).
+    private static func fsyncFile(_ path: String) throws {
+        let descriptor = open(path, O_RDONLY)
+        guard descriptor >= 0 else {
+            throw VMError.invalidConfiguration("cannot open \(path) to fsync: errno \(errno)")
+        }
+        defer { close(descriptor) }
+        guard fcntl(descriptor, F_FULLFSYNC) == 0 || fsync(descriptor) == 0 else {
+            throw VMError.invalidConfiguration("cannot fsync \(path): errno \(errno)")
+        }
+    }
+
     private static func prepareEngineDisk(at path: String, stateDirectory: String) async throws {
         let store = try ImageStore(path: URL(fileURLWithPath: stateDirectory + "/content"))
         let image = try await store.get(reference: "docker.io/library/docker:dind", pull: true)
@@ -187,15 +224,26 @@ enum EngineMode {
             "mkdir -p /dev/pts",
             "mount -t devpts devpts /dev/pts",
             "mkdir -p /var/lib/docker",
-            "mount -t ext4 /dev/vdb /var/lib/docker || echo DATA-DISK-MOUNT-FAILED",
+            // Fail hard if the persistent data disk will not mount: never let dockerd write to the
+            // throwaway rootfs, which the next boot destroys (silent total data loss). Powering off
+            // surfaces the failure to the host, which falls back to another engine.
+            "mount -t ext4 /dev/vdb /var/lib/docker || { echo DATA-DISK-MOUNT-FAILED; sync; poweroff -f; }",
             "ip link set lo up",
             "ip link set eth0 up",
             "udhcpc -i eth0 -q >/dev/null 2>&1",
             "echo 2 > /sys/module/page_reporting/parameters/page_reporting_order 2>/dev/null",
             "echo 200 > /proc/sys/vm/vfs_cache_pressure 2>/dev/null",
             "dockerd -H unix:///var/run/docker.sock -H tcp://0.0.0.0:2375 --tls=false >/var/log/dockerd.log 2>&1 & true",
-            "while true; do nc -l -p 2377 >/dev/null 2>&1; echo shutdown requested; sync; umount /var/lib/docker 2>/dev/null; sync; poweroff -f; done & true",
-            "while true; do sleep 15; c=$(grep Cached: /proc/meminfo | head -1 | tr -s \\  | cut -d\\  -f2); [ ${c:-0} -gt 131072 ] && echo $((c/2))K > /sys/fs/cgroup/memory.reclaim 2>/dev/null; echo 1 > /proc/sys/vm/compact_memory 2>/dev/null; done",
+            "( while true; do nc -l -p 2377 >/dev/null 2>&1; echo shutdown requested; sync; umount /var/lib/docker 2>/dev/null; sync; poweroff -f; done ) & true",
+            "( while true; do sleep 15; c=$(grep Cached: /proc/meminfo | head -1 | tr -s \\  | cut -d\\  -f2); [ ${c:-0} -gt 131072 ] && echo $((c/2))K > /sys/fs/cgroup/memory.reclaim 2>/dev/null; echo 1 > /proc/sys/vm/compact_memory 2>/dev/null; done ) & true",
+            // Hand PID 1 to tini (docker-init, shipped in docker:dind) as a reaping init. exec
+            // replaces the boot shell in place, so tini keeps PID 1 while dockerd and the loops
+            // above continue as its children. Container shims double-fork and orphan their exited
+            // children onto PID 1; tini reaps them, so they never pile up as zombies until PID
+            // exhaustion. If tini is ever missing, fall back to an idle shell (accepting zombies
+            // over a failed boot).
+            "[ -x /usr/local/bin/docker-init ] && exec /usr/local/bin/docker-init -s -- sleep 2147483647",
+            "while true; do sleep 2147483647; done",
         ].joined(separator: "; ")
         return "console=ttyAMA0 root=/dev/vda rw panic=0 init=/bin/sh -- -c \"\(script)\""
     }
