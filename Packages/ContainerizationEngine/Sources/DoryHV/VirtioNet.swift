@@ -99,12 +99,16 @@ public final class VirtioNet: VirtioDeviceBackend {
         while true {
             let received = recv(socketFD, &frame, frame.count, MSG_DONTWAIT)
             guard received > 0 else { break }
-            guard let chain = (try? virtqueue.pop()) ?? nil else { continue }  // no buffer: drop
-            var packet = [UInt8](repeating: 0, count: Self.headerLength)
-            packet[10] = 1  // num_buffers = 1
-            packet.append(contentsOf: frame[0..<received])
-            let written = chain.writeBytes(packet)
-            let wants = (try? virtqueue.push(chain, written: written)) ?? false
+            // Serialize the pop/copy/push against any vCPU thread reconfiguring or resetting this
+            // queue via MMIO; without this, a concurrent reset (size -> 0) traps the VMM.
+            let wants = transport.withQueueLock { () -> Bool in
+                guard let chain = (try? virtqueue.pop()) ?? nil else { return false }  // no buffer: drop
+                var packet = [UInt8](repeating: 0, count: Self.headerLength)
+                packet[10] = 1  // num_buffers = 1
+                packet.append(contentsOf: frame[0..<received])
+                let written = chain.writeBytes(packet)
+                return (try? virtqueue.push(chain, written: written)) ?? false
+            }
             interrupt = interrupt || wants
         }
         if interrupt {

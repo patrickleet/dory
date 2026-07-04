@@ -35,6 +35,7 @@ public final class VirtioMMIOTransport: MMIODevice {
     private var status: UInt32 = 0
     private var interruptStatus: UInt32 = 0
     private let interruptLock = NSLock()  // device backends may complete buffers off the vCPU thread
+    private let registerLock = NSRecursiveLock()  // SMP: register access and kicks arrive from any vCPU thread
     private var pendingQueueLayout: [(descriptor: UInt64, avail: UInt64, used: UInt64, count: UInt16)]
 
     private static let magic: UInt64 = 0x7472_6976  // "virt"
@@ -63,7 +64,18 @@ public final class VirtioMMIOTransport: MMIODevice {
         interrupt()
     }
 
+    /// Runs `body` holding the register lock, so a device backend draining a queue off the vCPU
+    /// thread (virtio-net RX) is serialized against guest MMIO that reconfigures or resets the same
+    /// queue. Recursive: safe to call from inside handleKick, which already holds the lock.
+    public func withQueueLock<T>(_ body: () -> T) -> T {
+        registerLock.lock()
+        defer { registerLock.unlock() }
+        return body()
+    }
+
     public func read(offset: UInt64, width: Int) -> UInt64 {
+        registerLock.lock()
+        defer { registerLock.unlock() }
         switch offset {
         case 0x000: return Self.magic
         case 0x004: return 2
@@ -90,6 +102,8 @@ public final class VirtioMMIOTransport: MMIODevice {
     }
 
     public func write(offset: UInt64, value: UInt64, width: Int) {
+        registerLock.lock()
+        defer { registerLock.unlock() }
         switch offset {
         case 0x014: deviceFeatureSelect = UInt32(truncatingIfNeeded: value)
         case 0x020:

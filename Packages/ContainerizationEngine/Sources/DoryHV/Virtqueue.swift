@@ -156,6 +156,7 @@ public final class Virtqueue {
     /// Returns whether the guest asked for an interrupt for this completion.
     @discardableResult
     public func push(_ chain: VirtqueueChain, written: Int) throws -> Bool {
+        guard ready, size > 0 else { return false }
         let slot = UInt64(usedIndex % size)
         try memory.write(UInt32(chain.head), at: usedRing + 4 + slot * 8)
         try memory.write(UInt32(written), at: usedRing + 8 + slot * 8)
