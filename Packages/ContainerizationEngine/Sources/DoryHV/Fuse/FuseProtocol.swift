@@ -168,7 +168,7 @@ public struct FuseInitFlag: OptionSet, Sendable {
 }
 
 public struct FuseSetupMappingIn: Equatable, Sendable {
-    public static let byteCount = 48
+    public static let byteCount = 40  // fuse_setupmapping_in: fh, foffset, len, flags, moffset (5x u64)
 
     public var fileHandle: UInt64
     public var fileOffset: UInt64
@@ -346,7 +346,6 @@ public enum FuseProtocol {
         data.appendLE(value.length)
         data.appendLE(value.flags)
         data.appendLE(value.memoryOffset)
-        data.appendLE(UInt64(0))
         return data
     }
 

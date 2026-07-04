@@ -287,9 +287,21 @@ public final class FuseServer: @unchecked Sendable {
             return errorResponse(unique: header.unique, errno: ENOSYS)
         }
         let request = try FuseProtocol.decodeSetupMappingIn(payload)
-        guard let fd = load(handle: request.fileHandle) else {
+        // virtio-fs sends fh = -1 for inode-based DAX mappings; resolve the file from the node id.
+        // The backend mmaps read-write (Apple's hv_vm_map rejects a read-only host region), so the
+        // fd must be writable; a read-only file therefore falls back to plain FUSE reads via the
+        // thrown error. The backend keeps its own mmap, so a temporary open is closed after setup.
+        let fd: Int32
+        var temporaryFD: Int32?
+        if request.fileHandle == UInt64.max {
+            fd = try hostFS.openReadWrite(nodeID: header.nodeID)
+            temporaryFD = fd
+        } else if let open = load(handle: request.fileHandle) {
+            fd = open
+        } else {
             return errorResponse(unique: header.unique, errno: EBADF)
         }
+        defer { if let temporaryFD { hostFS.close(handle: temporaryFD) } }
         _ = try daxWindow.setup(request, fileDescriptor: fd)
         return successResponse(unique: header.unique, payload: [])
     }

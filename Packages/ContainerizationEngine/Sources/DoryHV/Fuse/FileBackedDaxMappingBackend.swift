@@ -25,7 +25,7 @@ public final class FileBackedDaxMappingBackend: DaxMappingBackend, @unchecked Se
         let result = hv_vm_map(hostAddress, guestAddress, length, hvFlags)
         guard result == HV_SUCCESS else {
             munmap(hostAddress, length)
-            throw DaxWindowError.mappingFailed("hv_vm_map failed: \(result)")
+            throw DaxWindowError.mappingFailed("hv_vm_map(host=\(hostAddress) gpa=0x\(String(guestAddress, radix: 16)) len=0x\(String(length, radix: 16)) flags=0x\(String(hvFlags, radix: 16))) -> 0x\(String(UInt32(bitPattern: result), radix: 16))")
         }
 
         lock.withLock {
@@ -53,11 +53,11 @@ public final class FileBackedDaxMappingBackend: DaxMappingBackend, @unchecked Se
     }
 
     private func protections(for flags: UInt64) -> Int32 {
-        var protections = PROT_READ
-        if flags & FuseSetupMappingFlag.write.rawValue != 0 {
-            protections |= PROT_WRITE
-        }
-        return protections
+        // Map the host region read+write regardless of the guest's requested access. Apple's
+        // hv_vm_map rejects a host region that is not writable (HV_ERROR); the guest's stage-2
+        // protection below still restricts the guest to what it asked for, so a read-only DAX
+        // mapping cannot be used by the guest to modify the host file.
+        return PROT_READ | PROT_WRITE
     }
 
     private func hvFlags(for flags: UInt64) -> UInt32 {
