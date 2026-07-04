@@ -94,6 +94,39 @@ else
   echo "    WARNING: no gvproxy found — the dory-hv engine needs it. Set DORY_GVPROXY or 'brew install podman'."
 fi
 
+echo "==> Bundling the host kubectl + docker CLIs (so k8s and the docker CLI need no separate install)…"
+# Host-side CLIs Dory shells out to: kubectl (Kubernetes browser/apply/scale/exec) and docker (the
+# optional `docker` context). Bundling them means a fresh download needs nothing installed. Prefer a
+# local copy on the build machine, else fetch the darwin/arm64 binary. HostTools resolves the
+# bundled copy first at runtime.
+ARCH="$(uname -m)"; [ "$ARCH" = "x86_64" ] && KARCH="amd64" || KARCH="arm64"
+[ "$ARCH" = "x86_64" ] && DARCH="x86_64" || DARCH="aarch64"
+
+bundle_cli() {  # name  local-fallback-path  download-url
+  local name="$1" local_src="$2" url="$3" tmp="/tmp/dory-cli-$1"
+  if [ -x "$local_src" ]; then cp "$local_src" "$HELPERS/$name"
+  elif command -v "$name" >/dev/null 2>&1; then cp "$(command -v "$name")" "$HELPERS/$name"
+  elif [ -n "$url" ]; then curl -fsSL "$url" -o "$tmp" 2>/dev/null && install -m0755 "$tmp" "$HELPERS/$name" && rm -f "$tmp"; fi
+  if [ -x "$HELPERS/$name" ]; then
+    codesign --force --options runtime --timestamp -s "${DORY_SIGN_ID:-Developer ID Application}" "$HELPERS/$name" 2>/dev/null \
+      || codesign --force -s - "$HELPERS/$name"
+    echo "    bundled Helpers/$name"
+  else
+    echo "    WARNING: could not bundle $name — the feature will need a system install."
+  fi
+}
+
+KVER="$(curl -fsSL https://dl.k8s.io/release/stable.txt 2>/dev/null || echo v1.31.0)"
+bundle_cli kubectl "" "https://dl.k8s.io/release/${KVER}/bin/darwin/${KARCH}/kubectl"
+# The static docker CLI tarball contains a single `docker` binary.
+if [ ! -x "$HELPERS/docker" ]; then
+  DOCKER_TGZ="/tmp/dory-docker.tgz"
+  if curl -fsSL "https://download.docker.com/mac/static/stable/${DARCH}/docker-27.5.1.tgz" -o "$DOCKER_TGZ" 2>/dev/null; then
+    tar -xzf "$DOCKER_TGZ" -C /tmp docker/docker 2>/dev/null && install -m0755 /tmp/docker/docker "$HELPERS/docker" && rm -rf "$DOCKER_TGZ" /tmp/docker
+  fi
+fi
+bundle_cli docker "" ""
+
 echo "==> Bundling zstd (decompresses the engine assets on first launch)…"
 ZSTD_BIN="$(command -v zstd)"
 cp "$ZSTD_BIN" "$HELPERS/zstd"
