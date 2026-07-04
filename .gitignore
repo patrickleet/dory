@@ -45,6 +45,9 @@ ExportOptions.plist
 # Release pipeline output
 release-build/
 
+# Guest build artifacts (kernel Image, compiled agent) — rebuilt via guest/kernel/build.sh + guest/agent/build.sh
+guest/out/
+
 # Dory runtime data
 .dory/
 
