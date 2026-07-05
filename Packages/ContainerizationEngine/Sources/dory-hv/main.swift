@@ -321,8 +321,44 @@ case "usb":
         } catch {
             fail("usb list failed: \(error)")
         }
+    case "probe":
+        // Claim a real host device and drive one GET_DESCRIPTOR control transfer through the exact
+        // usbip submit path the guest would use — a host-side smoke test with no guest/VM required.
+        let args = Array(arguments.dropFirst(2))
+        guard let busID = args.first else { fail("usage: dory-hv usb probe <busid> [userAuthorized|seize|capture]") }
+        let mode: HostUsbOpenMode
+        switch args.dropFirst().first {
+        case "seize": mode = .seize
+        case "capture", nil: mode = .capture
+        case "userAuthorized", "user": mode = .userAuthorized
+        case let other?: fail("unknown mode \(other)")
+        }
+        do {
+            FileHandle.standardError.write(Data("dory-hv: claiming \(busID) mode=\(mode)…\n".utf8))
+            let device = try HostUsbDeviceFactory.open(busID: busID, mode: mode)
+            let command = UsbipSubmitCommand(
+                header: UsbipHeaderBasic(command: .cmdSubmit, sequenceNumber: 1, deviceID: 0, direction: .in, endpoint: 0),
+                transferFlags: 0,
+                transferBufferLength: 18,
+                startFrame: 0,
+                numberOfPackets: 0,
+                interval: 0,
+                setup: [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00],  // GET_DESCRIPTOR(device, 18)
+                transferBuffer: []
+            )
+            let reply = try device.submit(command)
+            let bytes = reply.transferBuffer
+            print("CLAIM OK. GET_DESCRIPTOR status=\(reply.status) actualLength=\(reply.actualLength) bytes=\(bytes.count)")
+            if bytes.count >= 12 {
+                let vid = UInt16(bytes[8]) | (UInt16(bytes[9]) << 8)
+                let pid = UInt16(bytes[10]) | (UInt16(bytes[11]) << 8)
+                print(String(format: "device descriptor: bLength=%d bDescriptorType=%d idVendor=0x%04x idProduct=0x%04x", bytes[0], bytes[1], vid, pid))
+            }
+        } catch {
+            fail("usb probe failed: \(error)")
+        }
     default:
-        fail("usage: dory-hv usb list")
+        fail("usage: dory-hv usb <list|probe>")
     }
 case "engine":
     var engineSocket = "\(NSHomeDirectory())/.dory/engine.sock"
