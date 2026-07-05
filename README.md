@@ -126,7 +126,7 @@ silently:
 
 ```sh
 scripts/enable-networking.sh    # *.dory.local domains + trust the local CA
-scripts/enable-kubernetes.sh    # bootstrap k3s in the shared VM
+scripts/dory k8s enable         # bootstrap k3s in the shared VM
 ```
 
 ## Architecture
