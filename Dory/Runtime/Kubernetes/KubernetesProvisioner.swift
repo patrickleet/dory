@@ -61,7 +61,7 @@ enum KubernetesProvisioner {
         var proto: String
 
         static func parse(_ line: String) -> PortPublish? {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { return nil }
             let portsAndProto = trimmed.split(separator: "/", maxSplits: 1)
             let proto = portsAndProto.count == 2 ? String(portsAndProto[1]) : "tcp"
@@ -83,7 +83,8 @@ enum KubernetesProvisioner {
                 progress("Kubernetes is running")
                 return
             }
-            progress("Port publishing changed — recreating the cluster…")
+            progress("ports config changed; disable and re-enable Kubernetes to apply")
+            return
         }
 
         progress("Pulling Kubernetes (k3s)…")
@@ -200,13 +201,26 @@ enum KubernetesProvisioner {
     /// registries.yaml bind when one is configured, so an enable with unchanged config can reuse it
     /// instead of recreating (both are fixed at create).
     private static func publishedPortsCurrent(_ runtime: any ContainerRuntime, extraPorts: [PortPublish]) async -> Bool {
-        guard !extraPorts.isEmpty || registriesBindSource() != nil else { return true }
+        let registriesBind = registriesBindSource()
+        guard !extraPorts.isEmpty || registriesBind != nil else { return true }
         let encodedName = DockerImageOps.pathComponent(containerName)
         guard let response = await runtime.proxyRequest(method: "GET", path: "/containers/\(encodedName)/json", headers: [], body: Data()),
               response.isSuccess, let json = String(data: response.body, encoding: .utf8) else { return false }
-        if registriesBindSource() != nil && !json.contains("registries.yaml") { return false }
-        return extraPorts.allSatisfy {
-            json.contains("\"\($0.container)/\($0.proto)\"") && json.contains("\"HostPort\":\"\($0.host)\"")
+        return inspectJSONCoversConfig(json, extraPorts: extraPorts, registriesBind: registriesBind)
+    }
+
+    static func inspectJSONCoversConfig(_ json: String, extraPorts: [PortPublish], registriesBind: String?) -> Bool {
+        guard let data = json.data(using: .utf8),
+              let inspect = try? JSONDecoder().decode(ContainerInspect.self, from: data) else { return false }
+        let hostConfig = inspect.HostConfig
+        if let registriesBind {
+            let expected = "\(registriesBind):/etc/rancher/k3s/registries.yaml:ro"
+            guard hostConfig?.Binds?.contains(expected) == true else { return false }
+        }
+        let bindings = hostConfig?.PortBindings ?? [:]
+        return extraPorts.allSatisfy { port in
+            let key = "\(port.container)/\(port.proto)"
+            return bindings[key]?.contains { $0.HostPort == "\(port.host)" } == true
         }
     }
 
@@ -271,5 +285,18 @@ enum KubernetesProvisioner {
     private static func decodeId(_ data: Data) -> String? {
         struct Out: Decodable { let Id: String }
         return (try? JSONDecoder().decode(Out.self, from: data))?.Id
+    }
+
+    private struct ContainerInspect: Decodable {
+        let HostConfig: HostConfig?
+
+        struct HostConfig: Decodable {
+            let Binds: [String]?
+            let PortBindings: [String: [PortBinding]]?
+        }
+
+        struct PortBinding: Decodable {
+            let HostPort: String?
+        }
     }
 }

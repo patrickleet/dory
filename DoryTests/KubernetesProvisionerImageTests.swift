@@ -49,6 +49,8 @@ struct KubernetesProvisionerImageTests {
     @Test func portPublishParsesLinesAndSkipsCommentsAndGarbage() {
         #expect(KubernetesProvisioner.PortPublish.parse("30500:30500")
             == KubernetesProvisioner.PortPublish(host: 30500, container: 30500, proto: "tcp"))
+        #expect(KubernetesProvisioner.PortPublish.parse("30500:30500\r")
+            == KubernetesProvisioner.PortPublish(host: 30500, container: 30500, proto: "tcp"))
         #expect(KubernetesProvisioner.PortPublish.parse("  8080:80/udp ")
             == KubernetesProvisioner.PortPublish(host: 8080, container: 80, proto: "udp"))
         #expect(KubernetesProvisioner.PortPublish.parse("# comment") == nil)
@@ -57,6 +59,41 @@ struct KubernetesProvisionerImageTests {
         #expect(KubernetesProvisioner.PortPublish.parse("a:b") == nil)
         #expect(KubernetesProvisioner.PortPublish.parse("0:70000") == nil)
         #expect(KubernetesProvisioner.PortPublish.parse("80:80/sctp") == nil)
+    }
+
+    @Test func inspectJSONMatchesHostPortOnTheRequestedContainerPort() {
+        let desired = [KubernetesProvisioner.PortPublish(host: 30500, container: 30500, proto: "tcp")]
+        let crossed = """
+        {"HostConfig":{"PortBindings":{
+          "30500/tcp":[{"HostPort":"30501"}],
+          "30501/tcp":[{"HostPort":"30500"}]
+        }}}
+        """
+        let matching = """
+        {"HostConfig":{"PortBindings":{
+          "30500/tcp":[{"HostPort":"30500"}]
+        }}}
+        """
+
+        #expect(!KubernetesProvisioner.inspectJSONCoversConfig(crossed, extraPorts: desired, registriesBind: nil))
+        #expect(KubernetesProvisioner.inspectJSONCoversConfig(matching, extraPorts: desired, registriesBind: nil))
+    }
+
+    @Test func inspectJSONRequiresExactRegistriesBindSource() {
+        let expected = "/Users/me/.dory/k8s/registries.yaml"
+        let wrong = """
+        {"HostConfig":{"Binds":[
+          "/Users/me/.dory/k8s/registries.yaml.bak:/etc/rancher/k3s/registries.yaml:ro"
+        ],"PortBindings":{}}}
+        """
+        let matching = """
+        {"HostConfig":{"Binds":[
+          "/Users/me/.dory/k8s/registries.yaml:/etc/rancher/k3s/registries.yaml:ro"
+        ],"PortBindings":{}}}
+        """
+
+        #expect(!KubernetesProvisioner.inspectJSONCoversConfig(wrong, extraPorts: [], registriesBind: expected))
+        #expect(KubernetesProvisioner.inspectJSONCoversConfig(matching, extraPorts: [], registriesBind: expected))
     }
 
     @Test func renameContextRewritesAllDefaultNames() {
