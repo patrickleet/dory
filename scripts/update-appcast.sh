@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-V="$1"; BUILD="$2"; URL="$3"; SIG="$4"; LEN="$5"; MINOS="${6:-26.0}"
+V="$1"; BUILD="$2"; URL="$3"; SIG="$4"; LEN="$5"; MINOS="${6:-14.0}"
 
 if grep -q "<sparkle:shortVersionString>$V</sparkle:shortVersionString>" docs/appcast.xml; then
   echo "appcast already has $V — nothing to do"; exit 0
