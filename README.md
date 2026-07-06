@@ -55,9 +55,11 @@
 - Cluster browser: pods, deployments, services, config maps, secrets, ingresses, all with live
   health, pod exec, scale / restart / rollout controls, and `kubectl apply` from the app.
 - Headless too: `dory k8s enable | disable | status` scripts the same cluster, and
-  `dory k8s <kubectl args…>` runs kubectl against it. The kubeconfig is written to
-  `~/.kube/dory-config` with a named `dory` context, so it sits cleanly next to your
-  other clusters.
+  `dory k8s <kubectl args…>` runs kubectl against it. A `dory` context is merged into
+  `~/.kube/config` (kubectl itself does the merge; your other entries and current
+  context are untouched, and disable removes it again), so `kubectl --context dory`
+  just works — like docker-desktop or orbstack. No kubectl on the host? The kubeconfig
+  also lives at `~/.kube/dory-config` for `export KUBECONFIG` use.
 - Extensible without the GUI: `~/.dory/k8s/ports` publishes extra ports on the cluster
   container (one `HOST:CONTAINER[/proto]` per line — NodePorts become host-reachable), and
   `~/.dory/k8s/registries.yaml` is k3s' native registry mirror/trust config. Both live on the
@@ -145,7 +147,6 @@ drift (destroys cluster state; without it, drift is reported and the cluster is 
 untouched). Once enabled:
 
 ```sh
-export KUBECONFIG=~/.kube/dory-config
 kubectl --context dory get pods -A
 ```
 
