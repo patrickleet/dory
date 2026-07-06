@@ -33,6 +33,9 @@ enum KubernetesProvisioner {
         case notReady
         case kubeconfigFailed
         case invalidPortConfig(path: String, line: Int, value: String)
+        /// The container exists but its create-time config (ports/binds) no longer matches the
+        /// requested config; only disable + enable can apply the change.
+        case configDrift
     }
 
     /// An extra `HOST:CONTAINER[/tcp|udp]` publishing on the cluster container.
@@ -89,16 +92,14 @@ enum KubernetesProvisioner {
                 progress("Kubernetes is running")
                 return
             }
-            progress("Kubernetes create-time config changed; disable and re-enable Kubernetes to apply")
-            return
+            throw K8sError.configDrift
         case .stopped:
             if await publishedPortsCurrent(runtime, extraPorts: extraPorts) {
                 try await runtime.start(containerID: containerName)
                 try await waitUntilReady(runtime: runtime, progress: progress)
                 return
             }
-            progress("Kubernetes create-time config changed; disable and re-enable Kubernetes to apply")
-            return
+            throw K8sError.configDrift
         case .absent:
             break
         }
@@ -218,7 +219,11 @@ enum KubernetesProvisioner {
             let suffix = "\(key): default"
             guard body.hasSuffix(suffix) else { continue }
             let prefix = body.dropLast(suffix.count)
-            guard prefix.allSatisfy({ $0 == " " || $0 == "\t" }) else { continue }
+            // k3s' users list nests the key in a sequence item ("- name: default"),
+            // so allow one trailing sequence marker on top of the indent.
+            var indent = prefix
+            if indent.hasSuffix("- ") { indent = indent.dropLast(2) }
+            guard indent.allSatisfy({ $0 == " " || $0 == "\t" }) else { continue }
             let renamed = "\(prefix)\(key): \(contextName)"
             return hasCarriageReturn ? "\(renamed)\r" : renamed
         }
