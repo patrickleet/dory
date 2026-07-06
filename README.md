@@ -54,6 +54,16 @@
 - k3s inside the shared VM with selectable Kubernetes versions.
 - Cluster browser: pods, deployments, services, config maps, secrets, ingresses, all with live
   health, pod exec, scale / restart / rollout controls, and `kubectl apply` from the app.
+- Headless too: `dory k8s enable | disable | status` scripts the same cluster, and
+  `dory k8s <kubectl args…>` runs kubectl against it. The kubeconfig is written to
+  `~/.kube/dory-config` with a named `dory` context, so it sits cleanly next to your
+  other clusters.
+- Extensible without the GUI: `~/.dory/k8s/ports` publishes extra ports on the cluster
+  container (one `HOST:CONTAINER[/proto]` per line — NodePorts become host-reachable), and
+  `~/.dory/k8s/registries.yaml` is k3s' native registry mirror/trust config. Both live on the
+  host, so they survive the cluster being recreated. Ports and binds are fixed when the
+  container is created; changing them is reported as drift and never applied destructively —
+  re-run with `--recreate` (CLI) or disable/re-enable Kubernetes (app) to apply.
 
 **Linux machines**
 - Full Ubuntu / Debian / Fedora / Alpine / Arch VMs with snapshots, terminal access, and
@@ -127,6 +137,16 @@ silently:
 ```sh
 scripts/enable-networking.sh    # *.dory.local domains + trust the local CA
 scripts/dory k8s enable         # bootstrap k3s in the shared VM
+```
+
+`dory k8s enable` also takes `--publish HOST:CONTAINER[/proto]` (repeatable) for extra port
+publishings, `--image` to pin the k3s image, and `--recreate` to apply create-time config
+drift (destroys cluster state; without it, drift is reported and the cluster is left
+untouched). Once enabled:
+
+```sh
+export KUBECONFIG=~/.kube/dory-config
+kubectl --context dory get pods -A
 ```
 
 ## Architecture
