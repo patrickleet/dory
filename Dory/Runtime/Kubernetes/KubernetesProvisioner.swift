@@ -24,6 +24,9 @@ enum KubernetesProvisioner {
     /// `default` so tools can target the cluster with `--context dory`.
     static let contextName = "dory"
     static var kubeconfigPath: String { "\(NSHomeDirectory())/.kube/dory-config" }
+    /// The standard kubeconfig the `dory` context is merged into (via kubectl) so
+    /// `kubectl --context dory` works with no KUBECONFIG setup, like docker-desktop/orbstack/colima.
+    static var defaultKubeconfigPath: String { "\(NSHomeDirectory())/.kube/config" }
     static var configDirectory: String { "\(NSHomeDirectory())/.dory/k8s" }
     static var extraPortsConfigPath: String { "\(configDirectory)/ports" }
     static var registriesConfigPath: String { "\(configDirectory)/registries.yaml" }
@@ -182,6 +185,7 @@ enum KubernetesProvisioner {
 
     static func disable(runtime: any ContainerRuntime) async {
         await deleteExisting(runtime)
+        removeFromDefaultKubeconfig()
         try? FileManager.default.removeItem(atPath: kubeconfigPath)
     }
 
@@ -282,6 +286,80 @@ enum KubernetesProvisioner {
         let directory = (kubeconfigPath as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
         try renameContext(result.output).write(toFile: kubeconfigPath, atomically: true, encoding: .utf8)
+        mergeIntoDefaultKubeconfig()
+    }
+
+    static func hostKubectl() -> String? {
+        Shell.find("kubectl", candidates: ["/opt/homebrew/bin/kubectl", "/usr/local/bin/kubectl", "/usr/bin/kubectl"])
+    }
+
+    /// Fold the side-file context into `~/.kube/config` via kubectl itself — dory hand-rolls its
+    /// YAML and must never rewrite the file holding the user's other cluster credentials. Stale
+    /// `dory` entries are deleted before the merge because KUBECONFIG precedence favors the first
+    /// file: after a cluster recreate (fresh certs) the old entries would otherwise win. The main
+    /// config leads the chain so the user's `current-context` is preserved when set. No kubectl on
+    /// the host, or a merge failure, leaves the main config untouched — the side file remains the
+    /// documented fallback.
+    private static func mergeIntoDefaultKubeconfig() {
+        guard let kubectl = hostKubectl() else { return }
+        let main = defaultKubeconfigPath
+        deleteDoryEntries(kubectl: kubectl, from: main)
+        let merged = runKubectl(kubectl, ["config", "view", "--flatten", "--raw"],
+                                kubeconfigChain: "\(main):\(kubeconfigPath)")
+        guard merged.ok, merged.stdout.contains("server:") else { return }
+        let tmp = "\(main).dory.tmp"
+        do {
+            try merged.stdout.write(toFile: tmp, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmp)
+            if FileManager.default.fileExists(atPath: main) {
+                _ = try FileManager.default.replaceItemAt(URL(fileURLWithPath: main), withItemAt: URL(fileURLWithPath: tmp))
+            } else {
+                try FileManager.default.moveItem(atPath: tmp, toPath: main)
+            }
+        } catch {
+            try? FileManager.default.removeItem(atPath: tmp)
+        }
+    }
+
+    /// Undo the merge on disable: drop the `dory` entries and, when the user had switched to it,
+    /// the now-dangling `current-context`.
+    private static func removeFromDefaultKubeconfig() {
+        let main = defaultKubeconfigPath
+        guard let kubectl = hostKubectl(), FileManager.default.fileExists(atPath: main) else { return }
+        let current = runKubectl(kubectl, ["--kubeconfig", main, "config", "current-context"])
+        if current.ok, current.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == contextName {
+            _ = runKubectl(kubectl, ["--kubeconfig", main, "config", "unset", "current-context"])
+        }
+        deleteDoryEntries(kubectl: kubectl, from: main)
+    }
+
+    private static func deleteDoryEntries(kubectl: String, from main: String) {
+        for subcommand in ["delete-context", "delete-cluster", "delete-user"] {
+            _ = runKubectl(kubectl, ["--kubeconfig", main, "config", subcommand, contextName])
+        }
+    }
+
+    /// kubectl runner with stdout kept clean (Shell's helpers fold stderr in, which would corrupt
+    /// the flattened YAML) and optional KUBECONFIG override (the only way to hand kubectl a
+    /// multi-file chain).
+    private static func runKubectl(_ kubectl: String, _ arguments: [String], kubeconfigChain: String? = nil) -> (stdout: String, ok: Bool) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: kubectl)
+        process.arguments = arguments
+        if let kubeconfigChain {
+            var environment = ProcessInfo.processInfo.environment
+            environment["KUBECONFIG"] = kubeconfigChain
+            process.environment = environment
+        }
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+        do { try process.run() } catch { return ("", false) }
+        let data = stdout.fileHandleForReading.readDataToEndOfFile()
+        _ = stderr.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (String(data: data, encoding: .utf8) ?? "", process.terminationStatus == 0)
     }
 
     private static func containerState(_ runtime: any ContainerRuntime) async -> ExistingContainerState {

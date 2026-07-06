@@ -194,8 +194,10 @@ The native browser covers:
 - namespace filtering, YAML apply, rollout status, and kubeconfig copy.
 
 The bundled `kubectl` and `dory k8s <kubectl args...>` target the same cluster. Use
-`dory k8s enable|disable|status` to manage the cluster from scripts or CI. The kubeconfig is written
-to `~/.kube/dory-config` with a named `dory` context so it can sit next to your other clusters.
+`dory k8s enable|disable|status` to manage the cluster from scripts or CI. Kubectl merges a named
+`dory` context into `~/.kube/config` without changing other entries or the current context, and
+disable removes it again. If kubectl is unavailable or the merge fails, the kubeconfig remains at
+`~/.kube/dory-config` for use through `KUBECONFIG`.
 
 Two optional host-side files extend the cluster without the GUI:
 
@@ -209,7 +211,6 @@ changing them is reported as drift and is never applied destructively. Run `dory
 accepts repeatable `--publish HOST:CONTAINER[/proto]` options and `--image` to pin the k3s image.
 
 ```sh
-export KUBECONFIG=~/.kube/dory-config
 kubectl --context dory get pods -A
 ```
 
