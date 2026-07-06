@@ -193,9 +193,28 @@ The native browser covers:
 - services, ConfigMaps, Secrets, and Ingresses;
 - namespace filtering, YAML apply, rollout status, and kubeconfig copy.
 
-The bundled `kubectl` and `dory k8s <kubectl args...>` target the same cluster. k3s has its own image
-store, so push a built image to a registry or import it into the cluster before using it in a Pod.
-Use `dory k8s enable|disable|status` to manage the cluster from scripts or CI.
+The bundled `kubectl` and `dory k8s <kubectl args...>` target the same cluster. Use
+`dory k8s enable|disable|status` to manage the cluster from scripts or CI. The kubeconfig is written
+to `~/.kube/dory-config` with a named `dory` context so it can sit next to your other clusters.
+
+Two optional host-side files extend the cluster without the GUI:
+
+- `~/.dory/k8s/ports` publishes extra ports on the cluster container, one
+  `HOST:CONTAINER[/proto]` per line, so NodePorts can become host-reachable.
+- `~/.dory/k8s/registries.yaml` supplies k3s' native registry mirror and trust configuration.
+
+Both files survive cluster recreation. Ports and binds are fixed when the container is created;
+changing them is reported as drift and is never applied destructively. Run `dory k8s enable` with
+`--recreate` or disable and re-enable Kubernetes in the app to apply the change. The command also
+accepts repeatable `--publish HOST:CONTAINER[/proto]` options and `--image` to pin the k3s image.
+
+```sh
+export KUBECONFIG=~/.kube/dory-config
+kubectl --context dory get pods -A
+```
+
+k3s has its own image store, so push a built image to a registry or import it into the cluster before
+using it in a Pod.
 
 ## Dory Linux machines
 
