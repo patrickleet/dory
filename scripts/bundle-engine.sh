@@ -553,14 +553,17 @@ bundle_cli docker-compose "" ""
 # The `dory` CLI + its Python helpers, so the in-app Health panel and `dory doctor`/`dory compat`/
 # `dory idle` work on a clean Mac with nothing installed. They must sit together in Helpers so the
 # bash wrapper resolves dory-doctor/dory-idle-proxy beside itself (stdlib-only Python; needs the
-# system python3). These are scripts, not Mach-O, so they are sealed by the app signature, not
-# signed individually.
+# system python3). Files under Contents/Helpers are treated as nested code, so codesign must sign
+# each one individually (its CMS signature rides in an xattr) or the non-deep app re-sign fails with
+# "code object is not signed at all".
 echo "==> Bundling the dory CLI helpers (Health panel + doctor/compat/idle)…"
 DORY_SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
 for script in dory dory-doctor dory-idle-proxy; do
   if [ -f "$DORY_SCRIPTS/$script" ]; then
     install -m0755 "$DORY_SCRIPTS/$script" "$HELPERS/$script"
-    echo "    bundled Helpers/$script"
+    codesign --force --timestamp -s "${DORY_SIGN_ID:-Developer ID Application}" "$HELPERS/$script" 2>/dev/null \
+      || codesign --force -s - "$HELPERS/$script"
+    echo "    bundled + signed Helpers/$script"
   else
     echo "    WARNING: $DORY_SCRIPTS/$script missing — the Health panel will need a system dory install."
   fi
