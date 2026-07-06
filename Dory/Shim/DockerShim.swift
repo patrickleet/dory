@@ -253,8 +253,15 @@ struct DockerShim: Sendable {
     private func pullImage(_ request: ParsedRequest) async -> ShimResponse {
         let from = request.query["fromImage"] ?? ""
         guard !from.isEmpty else { return errorResponse(400, "fromImage is required") }
-        let reference = PullReference.resolve(fromImage: from, tagQuery: request.query["tag"])
         let runtime = self.runtime
+        if runtime.supportsRawProxy {
+            // Raw passthrough so the pull keeps every query parameter (`platform` above all — a
+            // re-synthesized pull silently fetched the native-arch variant, so
+            // `docker run --platform linux/amd64` then refused the image) and streams dockerd's real
+            // layer-by-layer progress instead of synthesized lines.
+            return ShimResponse.hijacked { fd, initial in runtime.proxyHijack(requestData: initial, clientFD: fd) }
+        }
+        let reference = PullReference.resolve(fromImage: from, tagQuery: request.query["tag"])
         let clientAuth = request.headers["x-registry-auth"]
         return ShimResponse.streaming(contentType: "application/json") { writer in
             let initial = PullProgress.lines(repository: reference.repository, tag: reference.tag, reference: reference.reference).first ?? Data()
@@ -740,15 +747,12 @@ struct DockerShim: Sendable {
 
     private func waitContainer(id: String, request: ParsedRequest) async -> ShimResponse {
         if runtime.supportsRawProxy {
-            if let response = await runtime.proxyRequest(
-                method: request.method.uppercased(),
-                path: request.target,
-                headers: Self.proxyRequestHeaders(request),
-                body: request.body
-            ) {
-                return ShimResponse(status: response.statusCode, headers: Self.proxyHeaders(response), body: response.body)
-            }
-            return errorResponse(502, "docker engine unavailable")
+            // Raw passthrough, NOT a buffered proxyRequest: /wait is a long-poll whose response
+            // headers dockerd flushes immediately so the client knows the wait is registered before
+            // it sends /start. Buffering holds those headers until the container exits — but for
+            // `docker run --rm` the CLI will not start the container until it sees them, a deadlock
+            // that left every foreground run stuck with no output.
+            return ShimResponse.hijacked { fd, initial in runtime.proxyHijack(requestData: initial, clientFD: fd) }
         }
         while !Task.isCancelled {
             let snapshot: RuntimeSnapshot
