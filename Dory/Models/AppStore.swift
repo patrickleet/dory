@@ -138,6 +138,9 @@ final class AppStore {
             if let v = UserDefaults.standard.object(forKey: Self.httpsProxyPortKey) as? Int, let p = UInt16(exactly: v), p > 0 { httpsProxyPort = p }
             if let v = UserDefaults.standard.object(forKey: Self.domainsEnabledKey) as? Bool { domainsEnabled = v }
             if let v = UserDefaults.standard.object(forKey: SharedVMProvisioner.Config.rosettaX86Key) as? Bool { rosettaX86Enabled = v }
+            if let raw = UserDefaults.standard.string(forKey: Self.enginePreferenceKey),
+               let saved = EnginePreference(rawValue: raw) { enginePreference = saved }
+            if let socket = UserDefaults.standard.string(forKey: Self.customEngineSocketKey) { customEngineSocket = socket }
             if let v = UserDefaults.standard.object(forKey: SharedVMProvisioner.Config.gpuVenusKey) as? Bool { gpuVenusEnabled = v }
             dockerHostCleaned = DockerHostConflict.hasCleaned
             dockerHostConflictDismissed = UserDefaults.standard.bool(forKey: Self.dockerHostDismissedKey)
@@ -348,6 +351,13 @@ final class AppStore {
     var gpuVenusEnabled = false
     let gpuRuntimeAvailable = SharedVMProvisioner.venusRuntimeAvailable()
 
+    /// Which backend the app connects to: Dory's bundled engine (default), an auto-detected existing
+    /// engine (Colima, Docker Desktop, …), or a custom socket. Persisted; connectBackend honors it.
+    var enginePreference: EnginePreference = .dory
+    var customEngineSocket = ""
+    static let enginePreferenceKey = "dory.enginePreference"
+    static let customEngineSocketKey = "dory.customEngineSocket"
+
     @ObservationIgnored private(set) var backendStartRequested = false
     @ObservationIgnored var windowOpenRequested = false
 
@@ -361,6 +371,80 @@ final class AppStore {
         runtime = shared
         sharedVMStatus = "Running on Dory's engine"
         await reload()
+    }
+
+    /// Connects according to the persisted engine preference — Colima-style: Dory's bundled engine,
+    /// an auto-detected existing engine, or a custom socket.
+    private func connectPreferredBackend() async {
+        switch enginePreference {
+        case .external:
+            if let docker = await DockerEngineRuntime.detect() {
+                runtime = docker
+                sharedVMStatus = "Using \(Self.externalEngineLabel(docker.socketPath))"
+                await reload()
+            } else {
+                sharedVMStatus = "No running Docker-compatible engine found. Start it, or switch back to Dory's engine."
+                loadState = .engineOff
+            }
+        case .custom:
+            let path = customEngineSocket.trimmingCharacters(in: .whitespaces)
+            guard !path.isEmpty else {
+                sharedVMStatus = "Set a socket path to use a custom engine."
+                loadState = .engineOff
+                return
+            }
+            if let docker = await DockerEngineRuntime.detect(candidates: [path]) {
+                runtime = docker
+                sharedVMStatus = "Using custom engine at \(path)"
+                await reload()
+            } else {
+                sharedVMStatus = "No Docker engine answered at \(path)."
+                loadState = .engineOff
+            }
+        case .dory:
+            // Dory's own engine is the default: a standalone, OrbStack-style daemon that ships
+            // everything it needs. If the built-in engine cannot run on this host or install,
+            // fall back to fronting an existing Docker-compatible socket.
+            let support = refreshSharedVMSupport()
+            if support.isSupported {
+                sharedVMStatus = "Starting Dory's engine…"
+                if let shared = await SharedVMProvisioner.runtime() {
+                    await adoptSharedRuntime(shared)
+                    return
+                }
+                sharedVMStatus = Self.engineFailureStatus()
+            } else {
+                sharedVMStatus = Self.sharedVMUnavailableStatus(support)
+            }
+            if let docker = await DockerEngineRuntime.detect() {
+                runtime = docker; await reload()
+            } else {
+                loadState = .engineOff
+            }
+        }
+    }
+
+    nonisolated static func externalEngineLabel(_ socketPath: String) -> String {
+        DockerEngineSocketDiscovery.engineLabel(for: socketPath, home: NSHomeDirectory())
+    }
+
+    /// Switches the backend (Dory / existing / custom socket), persists the choice, and reconnects.
+    /// Leaving Dory's engine stops the VM so its memory returns to macOS.
+    func setEnginePreference(_ preference: EnginePreference, customSocket: String? = nil) async {
+        if let customSocket {
+            customEngineSocket = customSocket
+            UserDefaults.standard.set(customSocket, forKey: Self.customEngineSocketKey)
+        }
+        let changed = preference != enginePreference
+        enginePreference = preference
+        UserDefaults.standard.set(preference.rawValue, forKey: Self.enginePreferenceKey)
+        guard changed || preference == .custom, !isConnecting else { return }
+        if preference != .dory {
+            SharedVMProvisioner.stopEngineDetached()
+            runtime = DisconnectedRuntime()
+        }
+        sharedVMStatus = "Switching engine…"
+        await connectBackend()
     }
 
     func connectBackend() async {
@@ -392,25 +476,7 @@ final class AppStore {
                 loadState = .engineOff
             }
         default:
-            // Dory's own engine is the default: a standalone, OrbStack-style daemon that ships
-            // everything it needs. If the built-in engine cannot run on this host or install,
-            // fall back to fronting an existing Docker-compatible socket.
-            let support = refreshSharedVMSupport()
-            if support.isSupported {
-                sharedVMStatus = "Starting Dory's engine…"
-                if let shared = await SharedVMProvisioner.runtime() {
-                    await adoptSharedRuntime(shared)
-                    break
-                }
-                sharedVMStatus = Self.engineFailureStatus()
-            } else {
-                sharedVMStatus = Self.sharedVMUnavailableStatus(support)
-            }
-            if let docker = await DockerEngineRuntime.detect() {
-                runtime = docker; await reload()
-            } else {
-                loadState = .engineOff
-            }
+            await connectPreferredBackend()
         }
         // With no live engine there is nothing to proxy: don't stand up the shim or, worse, redirect
         // the user's `docker` CLI at a dead socket. Injected fixture runtimes still wire the shim so
@@ -493,6 +559,8 @@ final class AppStore {
             sharedVMStatus = Self.sharedVMUnavailableStatus(support)
             return
         }
+        enginePreference = .dory
+        UserDefaults.standard.set(EnginePreference.dory.rawValue, forKey: Self.enginePreferenceKey)
         sharedVMStatus = "Starting Dory's engine…"
         guard let shared = await SharedVMProvisioner.runtime() else {
             sharedVMStatus = "Dory's engine could not start — see ~/.dory/engine.log"

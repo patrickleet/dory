@@ -7,6 +7,7 @@ struct SettingsView: View {
     @State private var dnsPortDraft = ""
     @State private var httpPortDraft = ""
     @State private var httpsPortDraft = ""
+    @State private var customSocketDraft = ""
 
     var body: some View {
         HStack(spacing: 0) {
@@ -408,6 +409,10 @@ struct SettingsView: View {
             .background(p.bgElevated, in: RoundedRectangle(cornerRadius: 11))
             .overlay(RoundedRectangle(cornerRadius: 11).strokeBorder(p.border))
 
+            groupLabel("ENGINE BACKEND")
+            engineBackendCard
+                .padding(.bottom, 22)
+
             groupLabel("DORY SHARED VM")
             VStack(alignment: .leading, spacing: 12) {
                 Text("Run every container in one shared Linux VM — like OrbStack — on Dory's own engine. The app bundles the engine, kernel, networking, Docker CLI, Compose, and kubectl, so it needs no Docker, OrbStack, Colima, Homebrew, or Apple container toolchain on the user's Mac. Memory is returned to macOS as workloads idle. Metal-backed AI services on the Mac are reachable from containers at host.dory.internal on ports 11434, 1234, and 18190. Requires macOS 15 or later on Apple silicon or Intel; installs without bundled engine assets can use a Docker-compatible local engine.")
@@ -502,6 +507,70 @@ struct SettingsView: View {
             } else if !store.gpuRuntimeAvailable {
                 Text("Install or bundle the Venus runtime (virglrenderer plus MoltenVK) to enable this. Until then, run a Metal-backed host service such as Ollama, LM Studio, or MLX and reach it from containers at host.dory.internal on ports 11434, 1234, and 18190.")
                     .font(.system(size: 11.5)).foregroundStyle(p.text3).lineSpacing(3).padding(.top, 8)
+            }
+        }
+    }
+
+    /// Colima-style backend picker: Dory's bundled engine, an auto-detected existing engine, or a
+    /// custom Docker-compatible socket. Detected engines are listed so the choice is informed.
+    private var engineBackendCard: some View {
+        let detected = DockerEngineSocketDiscovery.availableSources()
+        return VStack(spacing: 0) {
+            ForEach(EnginePreference.allCases) { preference in
+                engineChoiceRow(preference, detected: detected)
+                if preference != EnginePreference.allCases.last {
+                    Rectangle().fill(p.border).frame(height: 1)
+                }
+            }
+        }
+        .background(p.bgElevated, in: RoundedRectangle(cornerRadius: 11))
+        .overlay(RoundedRectangle(cornerRadius: 11).strokeBorder(p.border))
+    }
+
+    @ViewBuilder private func engineChoiceRow(_ preference: EnginePreference, detected: [DockerSourceEngine]) -> some View {
+        let selected = store.enginePreference == preference
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                Task { await store.setEnginePreference(preference) }
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: selected ? "largecircle.fill.circle" : "circle")
+                        .font(.system(size: 15))
+                        .foregroundStyle(selected ? p.accent : p.text3)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(preference.label).font(.system(size: 13, weight: .semibold)).foregroundStyle(p.text)
+                        Text(preference == .external && !detected.isEmpty
+                            ? "Found: \(detected.map(\.label).joined(separator: ", "))"
+                            : preference.summary)
+                            .font(.system(size: 11.5)).foregroundStyle(p.text3).lineLimit(2)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 15).padding(.vertical, 12)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("engine-backend-\(preference.rawValue)")
+
+            if preference == .custom, selected {
+                HStack(spacing: 8) {
+                    TextField("/path/to/docker.sock", text: $customSocketDraft)
+                        .textFieldStyle(.plain)
+                        .font(.mono(12))
+                        .padding(.horizontal, 10).padding(.vertical, 7)
+                        .background(p.bgInput, in: RoundedRectangle(cornerRadius: 7))
+                        .onAppear { if customSocketDraft.isEmpty { customSocketDraft = store.customEngineSocket } }
+                    Button {
+                        Task { await store.setEnginePreference(.custom, customSocket: customSocketDraft) }
+                    } label: {
+                        Text("Connect").font(.system(size: 12, weight: .semibold)).foregroundStyle(.white)
+                            .padding(.horizontal, 13).padding(.vertical, 7)
+                            .background(p.accent, in: RoundedRectangle(cornerRadius: 7))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(customSocketDraft.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+                .padding(.horizontal, 15).padding(.bottom, 12)
             }
         }
     }

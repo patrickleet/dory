@@ -390,6 +390,35 @@ enum ContainerScope: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+/// Which engine backend the app connects to — Colima-style choice between Dory's own bundled
+/// engine and any Docker-compatible engine already on the Mac.
+enum EnginePreference: String, CaseIterable, Identifiable, Sendable {
+    /// Dory's bundled dory-hv engine (the default, full-feature backend).
+    case dory
+    /// Auto-detect an existing engine: Colima, Docker Desktop, OrbStack, Rancher Desktop, Podman.
+    case external
+    /// A user-supplied Docker-compatible unix socket path.
+    case custom
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .dory: "Dory engine"
+        case .external: "Existing engine"
+        case .custom: "Custom socket"
+        }
+    }
+
+    var summary: String {
+        switch self {
+        case .dory: "Dory's bundled engine — memory reclaim, GPU, x86, Kubernetes, machines"
+        case .external: "Use a Docker engine already on this Mac (Colima, Docker Desktop, OrbStack, Rancher, Podman)"
+        case .custom: "Point Dory at any Docker-compatible unix socket"
+        }
+    }
+}
+
 enum SettingsTab: String, CaseIterable, Identifiable, Sendable {
     case general, engine, resources, network, usb, migrate, about
     var id: String { rawValue }
