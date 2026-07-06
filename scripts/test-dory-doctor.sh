@@ -234,8 +234,9 @@ compat_rc=$?
 set -e
 [ "$compat_rc" = "2" ] || { echo "unknown compat recipe should exit 2, got $compat_rc"; exit 1; }
 
-# Log rotation/caps (Track 5 P0): rotate keeps the recent tail under the cap; cap truncates a live
-# over-cap log in place; and the doctor disk check flags an uncapped log.
+# Log caps (Track 5 P0): the always-on proxy caps live O_APPEND logs in place (truncate), which is
+# the only safe operation on a file another process is appending to; keep-tail rotation is the
+# writers' job (they run when the log is closed), verified via the doctor disk check below.
 python3 - <<'PY'
 import importlib.machinery, importlib.util, tempfile
 from pathlib import Path
@@ -243,19 +244,15 @@ loader = importlib.machinery.SourceFileLoader("dip", "scripts/dory-idle-proxy")
 dip = importlib.util.module_from_spec(importlib.util.spec_from_loader("dip", loader))
 loader.exec_module(dip)
 d = Path(tempfile.mkdtemp())
-big = d / "engine.log"
-big.write_bytes(b"".join(b"line-%06d\n" % i for i in range(100000)))
-assert dip.rotate_log_tail(big, 4096) is True, "rotate should fire over cap"
-assert big.stat().st_size <= 4096 + 64, "rotated file exceeds cap"
-tail = big.read_bytes()
-assert b"line-099999" in tail, "rotate dropped the recent tail"
-assert b"line-000000" not in tail, "rotate kept stale lines"
-assert dip.rotate_log_tail(big, 10_000_000) is False, "rotate must no-op under cap"
-live = d / "idle-proxy.log"
+live = d / "engine.log"
 live.write_bytes(b"x" * 5000)
-assert dip.cap_log_inplace(live, 1000) is True, "cap should truncate over hard cap"
+assert dip.cap_log_inplace(live, 1000) is True, "cap should truncate a live over-cap log"
 assert live.stat().st_size == 0, "cap did not truncate in place"
-assert dip.cap_log_inplace(live, 1000) is False, "cap must no-op under hard cap"
+assert dip.cap_log_inplace(live, 1000) is False, "cap must no-op under the hard cap"
+# cap_dory_logs globs *.log / *.err.log in the state dir and caps each over the hard cap.
+(d / "engine.log").write_bytes(b"a" * 5000)
+(d / "idle-proxy.err.log").write_bytes(b"b" * 5000)
+assert dip.cap_dory_logs(d, 1000) == 2, "cap_dory_logs should cap both oversized logs"
 PY
 
 mkdir -p "$TMP_HOME/.dory"
@@ -314,6 +311,27 @@ assert "socket" in (inc[0].get("detail") or ""), inc[0]
 '
 inc_perm="$(stat -f "%Lp" "$INC_LOG")"
 [ "$inc_perm" = "600" ] || { echo "incidents perms=$inc_perm (want 600)"; exit 1; }
+
+# Concurrent record_incident calls must all land as whole, valid JSON lines (flock + O_APPEND),
+# never interleaved or lost.
+python3 - <<'PY'
+import importlib.machinery, importlib.util, json, os, sys, tempfile, threading
+loader = importlib.machinery.SourceFileLoader("dd", "scripts/dory-doctor")
+dd = importlib.util.module_from_spec(importlib.util.spec_from_loader("dd", loader))
+sys.modules["dd"] = dd
+loader.exec_module(dd)
+path = os.path.join(tempfile.mkdtemp(), "incidents.jsonl")
+os.environ["DORY_INCIDENTS"] = path
+threads = [threading.Thread(target=dd.record_incident, args=("test", f"line-{i}")) for i in range(40)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+lines = [line for line in open(path, encoding="utf-8").read().splitlines() if line.strip()]
+assert len(lines) == 40, f"expected 40 incident lines, got {len(lines)}"
+for line in lines:
+    json.loads(line)
+PY
 
 # Memory inspector + guest disk (Track 5 P1): footprint breaks host RSS into engine/app roles;
 # the guest disk probe is active-only and must skip cleanly in the default passive run.

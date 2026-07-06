@@ -31,7 +31,9 @@ rotate_log() {
   [ -f "$file" ] || return 0
   size="$(stat -f%z "$file" 2>/dev/null || echo 0)"
   if [ "$size" -gt "$max" ]; then
-    if tail -c "$max" "$file" > "$file.rot" 2>/dev/null; then
+    # `tail -c` cuts on a byte boundary, so drop the partial first line (tail -n +2) and prepend a
+    # marker — matching the Python/Swift rotators so the leading log entry is never garbled.
+    if { printf '[log rotated to cap size; older lines dropped]\n'; tail -c "$max" "$file" | tail -n +2; } > "$file.rot" 2>/dev/null; then
       mv "$file.rot" "$file"
     else
       rm -f "$file.rot"

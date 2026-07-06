@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fcntl
 import fnmatch
 import http.client
 import json
@@ -78,10 +79,21 @@ def record_incident(kind: str, detail: str, **extra: Any) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps({"at": now_iso(), "type": kind, "detail": detail, **extra}, sort_keys=True) + "\n"
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        with os.fdopen(fd, "a", encoding="utf-8") as handle:
-            handle.write(line)
-        _trim_incidents(path, 500)
+        # Serialize append+trim against the Swift writer and other CLI processes via an exclusive
+        # flock on a stable sibling lock file (the JSONL inode is swapped by the trim, so we cannot
+        # lock the data file itself). O_APPEND keeps each write atomic even under the lock.
+        lock_fd = os.open(str(path) + ".lock", os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                os.write(fd, line.encode("utf-8"))
+            finally:
+                os.close(fd)
+            _trim_incidents(path, 500)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
     except OSError:
         pass
 
@@ -107,6 +119,8 @@ def _trim_incidents(path: Path, max_lines: int) -> None:
 
 
 def read_incidents(limit: int = 50) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
     path = incidents_path()
     if not path.exists():
         return []
@@ -1780,9 +1794,18 @@ def merge_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, An
 def save_config(config: dict[str, Any]) -> None:
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    # Per-process temp name: two concurrent writers (a `dory mode` and a `dory idle set`) must not
+    # share one `.tmp` and truncate each other's in-flight write before the atomic replace.
+    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def format_bytes(value: int | float | None) -> str:
@@ -2435,8 +2458,9 @@ def cmd_repair(args: argparse.Namespace) -> int:
             if probe.get("status") in {"pass", "skip"}:
                 actions.append(probe)
                 continue
-        actions.append(handler(args.apply))
-        if args.apply:
+        result = handler(args.apply)
+        actions.append(result)
+        if args.apply and result.get("status") != "fail":
             applied_targets.append(target)
     if applied_targets:
         record_incident(

@@ -40,9 +40,10 @@ nonisolated enum SharedVMProvisioner {
         try? out.write(to: url, options: .atomic)
     }
 
-    /// Backstop for a LIVE, O_APPEND log: an in-place truncate is safe because the writer seeks to
-    /// EOF each write and resumes at 0. Fires only at a generous hard cap so a very long-running
-    /// engine session cannot grow the log without bound between restarts.
+    /// Backstop for the live engine log, which we open O_APPEND (see openAppendLog): an in-place
+    /// truncate is only correct because an O_APPEND writer seeks to EOF on every write, so after the
+    /// truncate its next line lands at offset 0 instead of re-inflating the file as a sparse hole.
+    /// Fires only at a generous hard cap so a long-running engine session stays bounded.
     nonisolated static func capLogInPlace(_ path: String, hardBytes: Int = logHardMaxBytes) {
         guard let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size]) as? Int, size > hardBytes else { return }
         if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) {
@@ -55,23 +56,40 @@ nonisolated enum SharedVMProvisioner {
         capLogInPlace(helperLogPath)
     }
 
+    /// Opens a log for append with O_APPEND so an external truncate-to-0 (capLogInPlace) resets the
+    /// write position, and so a child that inherits this fd always writes at the true end.
+    private nonisolated static func openAppendLog(_ path: String) -> FileHandle? {
+        let fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0o600)
+        guard fd >= 0 else { return nil }
+        return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+    }
+
     nonisolated static var incidentsPath: String { "\(NSHomeDirectory())/.dory/incidents.jsonl" }
 
     /// Appends one JSON line to the shared incident timeline (~/.dory/incidents.jsonl), the same file
-    /// `dory incidents` reads. Best-effort and never throws into the caller.
+    /// `dory incidents` reads and trims. Uses an O_APPEND write under an exclusive flock on a stable
+    /// sibling lock file, so it never interleaves with, or is clobbered by, the Python writer's
+    /// append+trim (which takes the same lock). Best-effort; never throws into the caller.
     nonisolated static func recordIncident(_ type: String, _ detail: String) {
         let record: [String: Any] = ["at": iso8601Now(), "type": type, "detail": detail]
         guard var data = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]) else { return }
         data.append(0x0A)
         let directory = (incidentsPath as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
-        if !FileManager.default.fileExists(atPath: incidentsPath) {
-            FileManager.default.createFile(atPath: incidentsPath, contents: nil, attributes: [.posixPermissions: 0o600])
+        let lockFD = open(incidentsPath + ".lock", O_WRONLY | O_CREAT, 0o600)
+        if lockFD >= 0 { flock(lockFD, LOCK_EX) }
+        defer {
+            if lockFD >= 0 {
+                flock(lockFD, LOCK_UN)
+                close(lockFD)
+            }
         }
-        guard let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: incidentsPath)) else { return }
-        defer { try? handle.close() }
-        _ = try? handle.seekToEnd()
-        try? handle.write(contentsOf: data)
+        let fd = open(incidentsPath, O_WRONLY | O_APPEND | O_CREAT, 0o600)
+        guard fd >= 0 else { return }
+        data.withUnsafeBytes { buffer in
+            _ = write(fd, buffer.baseAddress, buffer.count)
+        }
+        close(fd)
     }
 
     private nonisolated static func iso8601Now() -> String {
@@ -80,10 +98,13 @@ nonisolated enum SharedVMProvisioner {
         return formatter.string(from: Date())
     }
 
-    /// Wake handler: resync the guest clock (drift breaks TLS/DBs/tests), then verify the engine
-    /// socket and record a wake-recovery incident so the timeline explains post-sleep behavior.
+    /// Wake handler: only meaningful when an engine was started this session. Resync the guest clock
+    /// (drift breaks TLS/DBs/tests), verify the engine socket, and record a wake-recovery incident so
+    /// the timeline explains post-sleep behavior. No-op in manual mode with no engine, so a laptop
+    /// lid-open does not flood the timeline.
     nonisolated static func recoverAfterWake() {
-        let clockResynced = resyncClockAfterWake()
+        guard let pid = helperPID(), pid > 0 else { return }
+        let clockResynced = resyncClockAfterWake(pid: pid)
         Task.detached {
             let reachable = await isReachable()
             recordIncident(
@@ -308,11 +329,7 @@ nonisolated enum SharedVMProvisioner {
         process.environment = environment
 
         rotateLog(helperLogPath)
-        if !FileManager.default.fileExists(atPath: helperLogPath) {
-            FileManager.default.createFile(atPath: helperLogPath, contents: nil)
-        }
-        let log = try? FileHandle(forWritingTo: URL(fileURLWithPath: helperLogPath))
-        _ = try? log?.seekToEnd()
+        let log = openAppendLog(helperLogPath)
         let label = rosetta ? "VZ+Rosetta" : "VZ"
         log?.write(Data("\n--- starting \(label) engine \(Date()) mem=\(environment["DORY_ENGINE_MEM_MB"] ?? config.memory) ---\n".utf8))
         process.standardOutput = log ?? FileHandle.nullDevice
@@ -369,11 +386,7 @@ nonisolated enum SharedVMProvisioner {
         process.arguments = arguments
 
         rotateLog(helperLogPath)
-        if !FileManager.default.fileExists(atPath: helperLogPath) {
-            FileManager.default.createFile(atPath: helperLogPath, contents: nil)
-        }
-        let log = try? FileHandle(forWritingTo: URL(fileURLWithPath: helperLogPath))
-        _ = try? log?.seekToEnd()
+        let log = openAppendLog(helperLogPath)
         log?.write(Data("\n--- starting dory-hv engine \(Date()) mem=\(config.memoryMB)MiB ---\n".utf8))
         process.standardOutput = log ?? FileHandle.nullDevice
         process.standardError = log ?? FileHandle.nullDevice

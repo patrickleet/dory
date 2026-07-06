@@ -1122,7 +1122,7 @@ final class AppStore {
         guard runtimeKind == .sharedVM else { return }
         guard Date().timeIntervalSince(lastLogCap) > 60 else { return }
         lastLogCap = Date()
-        SharedVMProvisioner.capEngineLog()
+        Task.detached { SharedVMProvisioner.capEngineLog() }
     }
 
     var selectedContainer: Container? {
@@ -1240,7 +1240,7 @@ final class AppStore {
     }
 
     func restartEngineForHealth() async {
-        guard canRestartEngineForHealth else { return }
+        guard canRestartEngineForHealth, !healthActionInFlight else { return }
         healthActionInFlight = true
         healthActionError = nil
         await restartEngine()
