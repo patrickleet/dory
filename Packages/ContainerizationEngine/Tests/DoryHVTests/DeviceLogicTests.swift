@@ -243,6 +243,153 @@ import Testing
     }
 }
 
+@Suite struct VirtioGPUTests {
+    private let base: UInt64 = 0x8000_0000
+    private let descTable: UInt64 = 0x8000_1000
+    private let availRing: UInt64 = 0x8000_2000
+    private let usedRing: UInt64 = 0x8000_3000
+    private let requestBuffer: UInt64 = 0x8000_4000
+    private let responseBuffer: UInt64 = 0x8000_5000
+
+    @Test func exposesBootstrapIdentityConfigAndHostMemoryWindow() {
+        let gpu = VirtioGPU(hostMemoryBase: 0x1_0000_0000, hostMemorySize: 0x2000_0000)
+
+        #expect(gpu.deviceID == 16)
+        #expect(gpu.queueCount == 2)
+        #expect(gpu.deviceFeatures == 0)
+        #expect(gpu.configSpace.count == 16)
+        #expect(gpu.sharedMemoryRegions == [
+            VirtioSharedMemoryRegion(id: 1, guestBase: 0x1_0000_0000, length: 0x2000_0000)
+        ])
+    }
+
+    @Test func venusModeAdvertisesRendererFeaturesAndCapsets() throws {
+        let renderer = FakeVirtioGPURenderer(capsets: [
+            VirtioGPUCapset(id: 4, maxVersion: 2, data: [0x56, 0x45, 0x4e, 0x55, 0x53])
+        ])
+        let gpu = VirtioGPU(hostMemoryBase: 0x1_0000_0000, renderer: renderer)
+
+        #expect(gpu.deviceFeatures & (1 << 0) != 0)  // VIRGL command family
+        #expect(gpu.deviceFeatures & (1 << 3) != 0)  // resource blobs
+        #expect(gpu.deviceFeatures & (1 << 4) != 0)  // context init
+        #expect(leUInt32(gpu.configSpace, at: 12) == 1)
+
+        var infoRequest = gpuRequest(type: 0x0108, fenceID: 42, contextID: 0, ringIndex: 0)
+        infoRequest.appendLE(UInt32(0))  // capset_index
+        infoRequest.appendLE(UInt32(0))
+        let info = try gpuResponse(gpu: gpu, request: infoRequest)
+        #expect(leUInt32(info, at: 0) == 0x1102)
+        #expect(leUInt32(info, at: 24) == 4)
+        #expect(leUInt32(info, at: 28) == 2)
+        #expect(leUInt32(info, at: 32) == 5)
+
+        var dataRequest = gpuRequest(type: 0x0109, fenceID: 43, contextID: 0, ringIndex: 0)
+        dataRequest.appendLE(UInt32(4))  // Venus capset
+        dataRequest.appendLE(UInt32(2))
+        let data = try gpuResponse(gpu: gpu, request: dataRequest)
+        #expect(leUInt32(data, at: 0) == 0x1103)
+        #expect(Array(data[24..<29]) == [0x56, 0x45, 0x4e, 0x55, 0x53])
+    }
+
+    @Test func respondsToDisplayInfoOnControlQueue() throws {
+        let memory = try GuestMemory(guestBase: base, size: 64 * HostPage.size)
+        let gpu = VirtioGPU(hostMemoryBase: 0x1_0000_0000)
+        let transport = VirtioMMIOTransport(baseAddress: GuestLayout.virtioBase, backend: gpu, memory: memory) {}
+        transport.queues[0].configure(size: 8, descriptorTable: descTable, availRing: availRing, usedRing: usedRing)
+        transport.queues[0].setReady(true)
+
+        try writeDescriptor(memory, index: 0, addr: requestBuffer, len: 24, flags: 0x1, next: 1)
+        try writeDescriptor(memory, index: 1, addr: responseBuffer, len: 512, flags: 0x2, next: 0)
+        try memory.write(gpuRequest(type: 0x0100, fenceID: 42, contextID: 7, ringIndex: 3), at: requestBuffer)
+        try memory.write(UInt16(0), at: availRing)
+        try memory.write(UInt16(0), at: availRing + 4)
+        try memory.write(UInt16(1), at: availRing + 2)
+
+        gpu.handleKick(queue: 0, transport: transport)
+
+        #expect(try memory.read(UInt32.self, at: responseBuffer) == 0x1101)
+        #expect(try memory.read(UInt64.self, at: responseBuffer + 8) == 42)
+        #expect(try memory.read(UInt32.self, at: responseBuffer + 16) == 7)
+        #expect(try memory.readBytes(at: responseBuffer + 20, count: 1) == [3])
+        #expect(try memory.read(UInt32.self, at: usedRing + 8) == 408)
+    }
+
+    private func writeDescriptor(_ memory: GuestMemory, index: UInt64, addr: UInt64, len: UInt32, flags: UInt16, next: UInt16) throws {
+        let descriptor = descTable + index * 16
+        try memory.write(addr, at: descriptor)
+        try memory.write(len, at: descriptor + 8)
+        try memory.write(flags, at: descriptor + 12)
+        try memory.write(next, at: descriptor + 14)
+    }
+
+    private func gpuRequest(type: UInt32, fenceID: UInt64, contextID: UInt32, ringIndex: UInt8) -> [UInt8] {
+        var data = [UInt8]()
+        data.appendLE(type)
+        data.appendLE(UInt32(0))
+        data.appendLE(fenceID)
+        data.appendLE(contextID)
+        data.append(ringIndex)
+        data.append(contentsOf: [0, 0, 0])
+        return data
+    }
+
+    private func gpuResponse(gpu: VirtioGPU, request: [UInt8]) throws -> [UInt8] {
+        let memory = try GuestMemory(guestBase: base, size: 64 * HostPage.size)
+        let transport = VirtioMMIOTransport(baseAddress: GuestLayout.virtioBase, backend: gpu, memory: memory) {}
+        transport.queues[0].configure(size: 8, descriptorTable: descTable, availRing: availRing, usedRing: usedRing)
+        transport.queues[0].setReady(true)
+        try writeDescriptor(memory, index: 0, addr: requestBuffer, len: UInt32(request.count), flags: 0x1, next: 1)
+        try writeDescriptor(memory, index: 1, addr: responseBuffer, len: 512, flags: 0x2, next: 0)
+        try memory.write(request, at: requestBuffer)
+        try memory.write(UInt16(0), at: availRing)
+        try memory.write(UInt16(0), at: availRing + 4)
+        try memory.write(UInt16(1), at: availRing + 2)
+        gpu.handleKick(queue: 0, transport: transport)
+        return try memory.readBytes(at: responseBuffer, count: Int(try memory.read(UInt32.self, at: usedRing + 8)))
+    }
+
+    private func leUInt32(_ bytes: [UInt8], at offset: Int) -> UInt32 {
+        guard offset + 3 < bytes.count else { return 0 }
+        return UInt32(bytes[offset])
+            | UInt32(bytes[offset + 1]) << 8
+            | UInt32(bytes[offset + 2]) << 16
+            | UInt32(bytes[offset + 3]) << 24
+    }
+}
+
+private final class FakeVirtioGPURenderer: VirtioGPURenderer {
+    let capsets: [VirtioGPUCapset]
+
+    init(capsets: [VirtioGPUCapset]) {
+        self.capsets = capsets
+    }
+
+    func createContext(id: UInt32, flags: UInt32, name: String) throws {}
+    func destroyContext(id: UInt32) throws {}
+    func attachResource(contextID: UInt32, resourceID: UInt32) throws {}
+    func detachResource(contextID: UInt32, resourceID: UInt32) throws {}
+    func submit3D(contextID: UInt32, command: [UInt8]) throws {}
+    func createResource3D(_ resource: VirtioGPUResourceCreate3D, entries: [VirtioGPUMemoryEntry]) throws {}
+    func createBlob(
+        resourceID: UInt32,
+        contextID: UInt32,
+        blobMemory: UInt32,
+        blobFlags: UInt32,
+        blobID: UInt64,
+        size: UInt64,
+        entries: [VirtioGPUMemoryEntry]
+    ) throws {}
+    func attachBacking(resourceID: UInt32, entries: [VirtioGPUMemoryEntry]) throws {}
+    func detachBacking(resourceID: UInt32) throws {}
+    func unrefResource(resourceID: UInt32) throws {}
+    func mapBlob(resourceID: UInt32) throws -> VirtioGPUBlobMapping {
+        VirtioGPUBlobMapping(hostPointer: UnsafeMutableRawPointer(bitPattern: 0x1000)!, size: 4096, mapInfo: 2)
+    }
+    func unmapBlob(resourceID: UInt32) throws {}
+    func transferToHost3D(_ transfer: VirtioGPUTransfer3D, entries: [VirtioGPUMemoryEntry]) throws {}
+    func transferFromHost3D(_ transfer: VirtioGPUTransfer3D, entries: [VirtioGPUMemoryEntry]) throws {}
+}
+
 @Suite struct PL011Tests {
     @Test func transmitsToSinkAndReportsReadyFlags() {
         var out = [UInt8]()
@@ -253,5 +400,15 @@ import Testing
         #expect(uart.read(offset: 0x18, width: 2) == 0x90)   // FR: TX empty | RX empty
         #expect(uart.read(offset: 0xFE0, width: 4) == 0x11)  // PeriphID0
         #expect(uart.read(offset: 0xFF0, width: 4) == 0x0D)  // PCellID0
+    }
+}
+
+private extension Array where Element == UInt8 {
+    mutating func appendLE(_ value: UInt32) {
+        Swift.withUnsafeBytes(of: value.littleEndian) { append(contentsOf: $0) }
+    }
+
+    mutating func appendLE(_ value: UInt64) {
+        Swift.withUnsafeBytes(of: value.littleEndian) { append(contentsOf: $0) }
     }
 }

@@ -25,6 +25,15 @@ enum EngineMode {
         var bundledRootfs: String?
         var shares: [VirtioFSShareConfiguration] = []
         var directIP: DirectIPBridgeConfiguration?
+        var gpuMode: GPUAccelerationMode = .off
+        /// Register a qemu binfmt handler in the guest so `--platform linux/amd64` images run on the
+        /// arm64 engine. Opt-in (Settings → Rosetta x86) to keep the default guest lean.
+        var amd64Emulation: Bool = false
+    }
+
+    enum GPUAccelerationMode: String {
+        case off
+        case venus
     }
 
     /// gvproxy pid for the teardown path: stopping the helper must not orphan the sidecar.
@@ -156,7 +165,11 @@ enum EngineMode {
         }
 
         let bootScriptDisk = state + "/boot-script.ext4"
-        try makeBootScriptDisk(at: bootScriptDisk, script: guestBootScript(shares: configuration.shares))
+        try makeBootScriptDisk(at: bootScriptDisk, script: guestBootScript(
+            shares: configuration.shares,
+            gpuMode: configuration.gpuMode,
+            amd64Emulation: configuration.amd64Emulation
+        ))
 
         let machine = try Machine(configuration: MachineConfiguration(
             kernelPath: configuration.kernelPath,
@@ -172,9 +185,26 @@ enum EngineMode {
         backends.append(try VirtioBlk(path: bootScriptDisk, identity: "dory-bootscript"))
         backends.append(VirtioRng())
         backends.append(VirtioBalloon(memory: machine.memory) { note($0) })
+        var daxSlot: UInt64 = 0
+        if configuration.gpuMode == .venus {
+            do {
+                let renderer = try VirglRenderer.discover()
+                let hostMemoryBase = GuestLayout.daxWindowBase + daxSlot * DaxWindow.defaultSize
+                let hostVisibleMemory = try VirtioGPUHostVisibleMemory(guestBase: hostMemoryBase)
+                daxSlot += 1
+                backends.append(VirtioGPU(
+                    hostMemoryBase: hostMemoryBase,
+                    renderer: renderer,
+                    hostVisibleMemory: hostVisibleMemory
+                ))
+                note("experimental gpu=venus: attached virtio-gpu with virglrenderer \(renderer.libraryPath) and MoltenVK ICD \(renderer.moltenVKICDPath)")
+            } catch {
+                note("experimental gpu=venus unavailable, continuing headless: \(error)")
+            }
+        }
         let vsock = VirtioVsock(guestCID: 3)
         backends.append(vsock)
-        var daxSlot: UInt64 = 0
+        HostAIBridge(log: { note($0) }).attach(to: vsock)
         for share in configuration.shares {
             let daxBase = share.dax ? GuestLayout.daxWindowBase + daxSlot * DaxWindow.defaultSize : nil
             if share.dax { daxSlot += 1 }
@@ -357,7 +387,11 @@ enum EngineMode {
     /// connection triggers sync + poweroff, giving the host a clean-unmount path), and a light
     /// page-cache cap so free page reporting (which handles free pages automatically at 16 KiB
     /// granularity) has cold pages to hand back when the cache bloats.
-    private static func guestBootScript(shares: [VirtioFSShareConfiguration] = []) -> String {
+    private static func guestBootScript(
+        shares: [VirtioFSShareConfiguration] = [],
+        gpuMode: GPUAccelerationMode = .off,
+        amd64Emulation: Bool = false
+    ) -> String {
         var script = [
             "export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin",
             "mount -t proc proc /proc",
@@ -381,7 +415,16 @@ enum EngineMode {
             "echo 200 > /proc/sys/vm/vfs_cache_pressure 2>/dev/null",
             "echo 262144 > /proc/sys/vm/min_free_kbytes 2>/dev/null",
         ]
-        script += BinfmtRegistration.bootCommands()
+        if gpuMode == .venus {
+            script += [
+                "export DORY_GPU=venus",
+                "for n in $(seq 1 80); do [ -d /dev/dri ] && break; sleep 0.1; done",
+                "[ -d /dev/dri ] && chmod a+rw /dev/dri/renderD* /dev/dri/card* 2>/dev/null || echo DORY-GPU-NO-DRI",
+            ]
+        }
+        if amd64Emulation {
+            script += BinfmtRegistration.bootCommands()
+        }
         for share in shares {
             let tag = shellQuote(share.tag)
             let mountPoint = shellQuote(share.guestMountPoint ?? "/mnt/dory/\(share.tag)")
@@ -391,9 +434,9 @@ enum EngineMode {
             script.append("mount -t virtiofs -o \(options) \(tag) \(mountPoint) || echo VIRTIOFS-MOUNT-FAILED-\(share.tag)")
         }
         script += [
-            "[ -x /usr/bin/dory-agent ] && ! pgrep -x dory-agent >/dev/null 2>&1 && /usr/bin/dory-agent >/var/log/dory-agent.log 2>&1 & true",
+            guestAgentStartCommand(shares: shares),
             "dockerd -H unix:///var/run/docker.sock -H tcp://0.0.0.0:2375 --tls=false >/var/log/dockerd.log 2>&1 & true",
-            BinfmtRegistration.dockerFallbackCommand(),
+            amd64Emulation ? BinfmtRegistration.dockerFallbackCommand() : "true",
             "( while true; do nc -l -p 2377 >/dev/null 2>&1; echo shutdown requested; sync; umount /var/lib/docker 2>/dev/null; sync; poweroff -f; done ) & true",
             // Cache cap only. NO compaction (it migrates pages and re-faults the ones free page
             // reporting already handed back to the host — pure churn) and NO root memory.reclaim
@@ -411,6 +454,18 @@ enum EngineMode {
             "while true; do sleep 2147483647; done",
         ]
         return script.joined(separator: "\n") + "\n"
+    }
+
+    private static func guestAgentStartCommand(shares: [VirtioFSShareConfiguration]) -> String {
+        var paths = ["/usr/bin/dory-agent"]
+        for share in shares {
+            let root = share.guestMountPoint ?? "/mnt/dory/\(share.tag)"
+            paths.append("\(root)/.dory/bin/dory-agent-linux-\(hostLinuxArch())")
+            paths.append("\(root)/.dory/bin/dory-agent")
+        }
+        let quotedPaths = paths.map(shellQuote).joined(separator: " ")
+        let ports = HostAIBridge.defaultPorts.map(String.init).joined(separator: ",")
+        return "for p in \(quotedPaths); do if [ -r \"$p\" ] && ! pgrep -x dory-agent >/dev/null 2>&1; then cp \"$p\" /run/dory-agent && chmod 0755 /run/dory-agent && DORY_HOST_AI_BRIDGE_PORTS=\(shellQuote(ports)) /run/dory-agent >/var/log/dory-agent.log 2>&1 & break; fi; done; true"
     }
 
     /// The full boot script lives on a dedicated ext4 disk (vdc), so the kernel command line stays

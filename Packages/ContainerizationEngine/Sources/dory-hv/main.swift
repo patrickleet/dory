@@ -425,6 +425,8 @@ case "engine":
     var shares: [VirtioFSShareConfiguration] = []
     var directIPSubnet: String?
     var directIPGateway = "192.168.127.2"
+    var gpuMode = EngineMode.GPUAccelerationMode.off
+    var amd64Emulation = false
     var iterator = arguments.dropFirst().makeIterator()
     while let argument = iterator.next() {
         switch argument {
@@ -437,6 +439,12 @@ case "engine":
         case "--direct-ip": directIPSubnet = directIPSubnet ?? "192.168.215.0/24"
         case "--container-subnet": directIPSubnet = iterator.next()
         case "--guest-gateway": directIPGateway = iterator.next() ?? directIPGateway
+        case "--gpu":
+            gpuMode = parseGPUMode(iterator.next() ?? "")
+        case let value where value.hasPrefix("--gpu="):
+            gpuMode = parseGPUMode(String(value.dropFirst("--gpu=".count)))
+        case "--amd64":
+            amd64Emulation = true
         case "--share":
             guard let value = iterator.next() else { fail("--share requires tag=/host/path[:ro|:rw][:dax]") }
             do {
@@ -466,7 +474,9 @@ case "engine":
                 localSocketPath: "\(NSHomeDirectory())/.dory/hv/direct-ip.sock",
                 interfaceNamePath: "\(NSHomeDirectory())/.dory/hv/direct-ip.interface"
             )
-        }
+        },
+        gpuMode: gpuMode,
+        amd64Emulation: amd64Emulation
     )
     // Top-level code is implicitly MainActor; a plain Task would inherit it and deadlock behind
     // the semaphore below. Detach so the engine runs on the concurrent pool.
@@ -483,4 +493,11 @@ case "engine":
     semaphore.wait()
 default:
     fail("unknown command \(command)")
+}
+
+private func parseGPUMode(_ value: String) -> EngineMode.GPUAccelerationMode {
+    guard let mode = EngineMode.GPUAccelerationMode(rawValue: value) else {
+        fail("unknown gpu mode \(value); expected off or venus")
+    }
+    return mode
 }

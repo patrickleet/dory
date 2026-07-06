@@ -81,6 +81,10 @@ public final class VirtioMMIOTransport: MMIODevice {
         interrupt()
     }
 
+    public func hostPointer(at guestAddress: UInt64, count: UInt64) throws -> UnsafeMutableRawPointer {
+        try memory.hostPointer(at: guestAddress, count: count)
+    }
+
     /// Runs `body` holding the register lock, so a device backend draining a queue off the vCPU
     /// thread (virtio-net RX) is serialized against guest MMIO that reconfigures or resets the same
     /// queue. Recursive: safe to call from inside handleKick, which already holds the lock.
