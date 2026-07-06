@@ -840,6 +840,7 @@ class Doctor:
             state_action,
             **state,
         )
+        self.check_guest_disk()
         largest_log = state.get("largest_log") or {}
         largest_bytes = int(largest_log.get("bytes", 0) or 0)
         if largest_bytes > LOG_HARD_MAX_BYTES:
@@ -862,16 +863,92 @@ class Doctor:
                 largest_log=largest_log,
             )
 
+    def check_guest_disk(self) -> None:
+        if not self.active:
+            self.add(
+                "disk.guest",
+                "skip",
+                "disk.active_probe_skipped",
+                "Guest disk probe skipped",
+                "Run `dory doctor --active` to measure free space inside the engine VM.",
+            )
+            return
+        if not self.engine_available():
+            self.add("disk.guest", "skip", "socket.unreachable", "Guest disk probe skipped", "Docker API is not reachable.")
+            return
+        try:
+            run = self.docker(["run", "--rm", "--pull=missing", "--label", self.label, DOCKER_IMAGE, "df", "-Pk", "/"], timeout=90)
+        except Exception as exc:
+            self.add("disk.guest", "warn", "disk.guest_probe_failed", "Guest disk probe failed", str(exc))
+            return
+        if run.returncode != 0:
+            self.add("disk.guest", "warn", "disk.guest_probe_failed", "Guest disk probe failed", compact(run.stderr or run.stdout))
+            return
+        rows = [line for line in run.stdout.splitlines() if line.strip()]
+        fields = rows[1].split() if len(rows) >= 2 else []
+        try:
+            total_bytes = int(fields[1]) * 1024
+            free_bytes = int(fields[3]) * 1024
+            pct_used = int(fields[4].rstrip("%"))
+        except (IndexError, ValueError):
+            self.add("disk.guest", "warn", "disk.guest_parse_failed", "Guest disk output unreadable", compact(run.stdout))
+            return
+        if pct_used >= 95:
+            status, code, action = "fail", "disk.guest_critical", "Free guest disk space now (prune images/build cache) before pulls or builds fail."
+        elif pct_used >= 85:
+            status, code, action = "warn", "disk.guest_low", "Guest disk is filling up; prune images/build cache before it blocks builds."
+        else:
+            status, code, action = "pass", "disk.guest_ok", ""
+        self.add(
+            "disk.guest",
+            status,
+            code,
+            "Guest disk space",
+            f"{format_bytes(free_bytes)} free of {format_bytes(total_bytes)} ({pct_used}% used)",
+            action,
+            free_bytes=free_bytes,
+            total_bytes=total_bytes,
+            percent_used=pct_used,
+        )
+
     def check_memory(self) -> None:
         report = memory_report()
+        report.update(self.guest_memory())
+        engine = int(report.get("engine_rss_bytes", 0) or 0)
+        app = int(report.get("app_rss_bytes", 0) or 0)
+        guest_total = int(report.get("guest_total_bytes", 0) or 0)
+        detail = (
+            f"host RSS {format_bytes(report.get('rss_bytes', 0))} "
+            f"(engine {format_bytes(engine)}, app {format_bytes(app)})"
+        )
+        if guest_total:
+            detail += f"; guest RAM ceiling {format_bytes(guest_total)}"
+            if engine:
+                reclaimed = max(0, guest_total - engine)
+                report["reclaimed_bytes"] = reclaimed
+                report["reclaim_ratio"] = round(reclaimed / guest_total, 3)
+                detail += f", ~{format_bytes(reclaimed)} reclaimed to macOS"
         self.add(
-            "memory.processes",
+            "memory.footprint",
             "pass",
-            "memory.processes_ok",
-            "Dory process memory sampled",
-            f"rss={format_bytes(report.get('rss_bytes', 0))} processes={len(report.get('processes', []))}",
+            "memory.footprint_ok",
+            "Dory memory footprint",
+            detail,
             **report,
         )
+
+    def guest_memory(self) -> dict[str, Any]:
+        try:
+            info = self.api_json("/info")
+        except Exception:
+            return {}
+        if not isinstance(info, dict):
+            return {}
+        return {
+            "guest_total_bytes": int(info.get("MemTotal") or 0),
+            "containers_running": int(info.get("ContainersRunning") or 0),
+            "containers_total": int(info.get("Containers") or 0),
+        }
 
     def check_helpers(self) -> None:
         resolver = Path(f"/etc/resolver/{DOMAIN_SUFFIX}")
@@ -1455,8 +1532,25 @@ def memory_report() -> dict[str, Any]:
         except ValueError:
             continue
         rss += rss_bytes
-        processes.append({"pid": int(pid_text), "rss_bytes": rss_bytes, "command": rest[:240]})
-    return {"generated_at": now_iso(), "rss_bytes": rss, "processes": processes}
+        lowered = rest.lower()
+        if "dory-hv" in lowered or "dory-vm" in lowered or "dory-vmboot" in lowered:
+            role = "engine"
+        elif "gvproxy" in lowered:
+            role = "network"
+        else:
+            role = "app"
+        processes.append({"pid": int(pid_text), "rss_bytes": rss_bytes, "role": role, "command": rest[:240]})
+    engine_rss = sum(p["rss_bytes"] for p in processes if p["role"] == "engine")
+    app_rss = sum(p["rss_bytes"] for p in processes if p["role"] == "app")
+    helper_rss = sum(p["rss_bytes"] for p in processes if p["role"] == "network")
+    return {
+        "generated_at": now_iso(),
+        "rss_bytes": rss,
+        "engine_rss_bytes": engine_rss,
+        "app_rss_bytes": app_rss,
+        "helper_rss_bytes": helper_rss,
+        "processes": processes,
+    }
 
 
 def route_table(sock: Path | None = None) -> dict[str, Any]:

@@ -297,6 +297,20 @@ idle_set_rc=$?
 set -e
 [ "$idle_set_rc" = "2" ] || { echo "unknown idle key should exit 2, got $idle_set_rc"; exit 1; }
 
+# Memory inspector + guest disk (Track 5 P1): footprint breaks host RSS into engine/app roles;
+# the guest disk probe is active-only and must skip cleanly in the default passive run.
+scripts/dory-doctor doctor --json --only memory,disk | python3 -c '
+import json, sys
+results = json.load(sys.stdin)["results"]
+mem = [r for r in results if r["id"] == "memory.footprint"]
+assert mem, "memory.footprint check missing"
+data = mem[0].get("data", {})
+assert "engine_rss_bytes" in data and "app_rss_bytes" in data, data
+guest = [r for r in results if r["id"] == "disk.guest"]
+assert guest and guest[0]["status"] == "skip", "guest disk should skip passively"
+assert guest[0]["code"] == "disk.active_probe_skipped", guest[0]
+'
+
 scripts/dory-idle-proxy launch-agent print | python3 -c '
 import plistlib, sys
 data = plistlib.loads(sys.stdin.buffer.read())
