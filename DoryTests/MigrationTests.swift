@@ -40,7 +40,7 @@ final class MigrationTargetRuntime: ContainerRuntime {
     func remove(containerID: String) async throws {}
     func logs(containerID: String) async throws -> [LogLine] { [] }
     func env(containerID: String) async throws -> [EnvVar] { [] }
-    func pull(image: String) async throws { pulled.append(image) }
+    func pull(image: String, registryAuth: String?) async throws { pulled.append(image) }
     func create(_ spec: ContainerSpec) async throws -> String { created.append(spec); return "new" }
     func exec(containerID: String, command: [String]) async throws -> ExecResult { ExecResult(exitCode: 0, output: "") }
 }
@@ -91,7 +91,7 @@ final class ArchiveMigrationTargetRuntime: ContainerRuntime {
     func remove(containerID: String) async throws {}
     func logs(containerID: String) async throws -> [LogLine] { [] }
     func env(containerID: String) async throws -> [EnvVar] { [] }
-    func pull(image: String) async throws { pulled.append(image); throw TestError.pullShouldNotBeUsed }
+    func pull(image: String, registryAuth: String?) async throws { pulled.append(image); throw TestError.pullShouldNotBeUsed }
     func create(_ spec: ContainerSpec) async throws -> String { "unused" }
     func exec(containerID: String, command: [String]) async throws -> ExecResult { ExecResult(exitCode: 0, output: "") }
     func loadImage(tar: Data) async throws { loadedArchives.append(tar) }

@@ -231,7 +231,7 @@ final class RecordingRuntime: ContainerRuntime {
         }
     }
     func env(containerID: String) async throws -> [EnvVar] { [] }
-    func pull(image: String) async throws {
+    func pull(image: String, registryAuth: String?) async throws {
         pulledImages.append(image)
         if let pullError { throw pullError }
     }
@@ -308,7 +308,7 @@ final class RecordingRuntime: ContainerRuntime {
     func tagImage(source: String, repo: String, tag: String) async throws {
         taggedImages.append((source, repo, tag))
     }
-    func pushImage(reference: String) async throws -> AsyncStream<Data> {
+    func pushImage(reference: String, registryAuth: String?) async throws -> AsyncStream<Data> {
         pushedImages.append(reference)
         let chunks = imagePushChunks
         return AsyncStream { continuation in

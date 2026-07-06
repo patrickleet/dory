@@ -11,18 +11,18 @@ struct ContainerActionsTests {
                   restartPolicy: "", labels: [:])
     }
 
-    @Test func portURLPrefersDomain() {
+    @Test func portURLUsesPublishedLoopbackPortWhenDomainExists() {
         let store = AppStore()
         let c = container("a", running: true, domain: "web-api.dory.local")
         let url = store.portURL(for: c, port: PublishedPort(hostPort: 8080, containerPort: 80, proto: "tcp"))
-        #expect(url.absoluteString == "https://web-api.dory.local")
+        #expect(url.absoluteString == "http://127.0.0.1:8080")
     }
 
-    @Test func portURLFallsBackToLocalhost() {
+    @Test func portURLUsesPublishedLoopbackPortWithoutDomain() {
         let store = AppStore()
         let c = container("a", running: true, domain: "")
         let url = store.portURL(for: c, port: PublishedPort(hostPort: 8080, containerPort: 80, proto: "tcp"))
-        #expect(url.absoluteString == "http://localhost:8080")
+        #expect(url.absoluteString == "http://127.0.0.1:8080")
     }
 
     @Test func cpuHistoryAppendsAndCaps() {
