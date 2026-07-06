@@ -244,9 +244,9 @@ enum KubernetesProvisioner {
         mergeIntoDefaultKubeconfig()
     }
 
-    static func hostKubectl() -> String? {
-        Shell.find("kubectl", candidates: ["/opt/homebrew/bin/kubectl", "/usr/local/bin/kubectl", "/usr/bin/kubectl"])
-    }
+    /// kubectl used for the kubeconfig merge/unmerge — resolved through HostTools so the copy
+    /// bundled in the app wins and packaged installs merge without any system kubectl.
+    static func hostKubectl() -> String? { HostTools.kubectl() }
 
     /// Fold the side-file context into `~/.kube/config` via kubectl itself — dory hand-rolls its
     /// YAML and must never rewrite the file holding the user's other cluster credentials. Stale
