@@ -14,3 +14,4 @@ russh = "0.54"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+dory-agent = { path = "../agent" }
