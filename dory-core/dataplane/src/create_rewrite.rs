@@ -37,6 +37,13 @@ pub fn rewrite_create_body(body: &[u8], opts: &RewriteOpts) -> Result<Vec<u8>, R
     let host_config = obj
         .entry("HostConfig")
         .or_insert_with(|| Value::Object(Default::default()));
+    // The Go docker SDK marshals a nil HostConfig as an explicit `"HostConfig": null` (e.g.
+    // ContainerCreate(ctx, config, nil, ...)). or_insert_with only fires on a VACANT entry, so a
+    // present-but-null value would otherwise fall through as_object_mut and skip EVERY rewrite —
+    // the same null-as-empty bug this crate fixed one level down for ExtraHosts. Coerce to empty.
+    if !host_config.is_object() {
+        *host_config = Value::Object(Default::default());
+    }
     if let Some(hc) = host_config.as_object_mut() {
         normalize_port_bindings(hc);
         ensure_extra_hosts(hc);
@@ -162,6 +169,28 @@ mod tests {
         let hosts = out["HostConfig"]["ExtraHosts"].as_array().unwrap();
         assert!(hosts.contains(&json!("host.docker.internal:host-gateway")));
         assert!(hosts.contains(&json!("host.dory.internal:host-gateway")));
+    }
+
+    /// The Go SDK marshals a nil HostConfig as `"HostConfig": null` (ContainerCreate with a nil
+    /// host config — common in CI tools/testcontainers). A present-but-null parent must not skip
+    /// every rewrite (adversarial review 2026-07-07, INVARIANT D).
+    #[test]
+    fn null_host_config_still_gets_rewrites() {
+        let out = rewrite(json!({"Image": "alpine", "HostConfig": null}), false).unwrap();
+        let hosts = out["HostConfig"]["ExtraHosts"].as_array().unwrap();
+        assert!(hosts.contains(&json!("host.docker.internal:host-gateway")));
+        assert!(hosts.contains(&json!("host.dory.internal:host-gateway")));
+    }
+
+    /// A GPU request inside an otherwise-present HostConfig is still gated even though the sibling
+    /// coercion path exists — guards against the coercion accidentally masking the GPU check.
+    #[test]
+    fn gpu_still_gated_after_null_coercion_path() {
+        let err = rewrite(
+            json!({"HostConfig": {"DeviceRequests": [{"Capabilities": [["gpu"]]}]}}),
+            false,
+        );
+        assert!(matches!(err, Err(RewriteError::GpuUnsupported)));
     }
 
     #[test]

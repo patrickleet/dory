@@ -35,6 +35,10 @@ pub struct ServeOpts {
     pub gpu_supported: bool,
 }
 
+/// A docker create body is small JSON (a few KB). Anything past this is malformed or hostile and is
+/// rejected before it can overflow the request-length arithmetic.
+const MAX_CREATE_BODY: usize = 8 * 1024 * 1024;
+
 /// Supplies a fresh connection to the guest `dockerd` per client. In production `Stream` is the
 /// captive vsock stream owned by the VMM; in tests it is an in-memory `UnixStream`.
 pub trait Backend: Send + Sync + 'static {
@@ -214,14 +218,26 @@ impl<B: Backend> Proxy<B> {
                 }
                 Disposition::CreateRewrite => {
                     let want = content_length(&head_text).unwrap_or(0);
-                    while buf.len() < head_len + want {
+                    // A create body is small JSON. An absurd/overflowing Content-Length is malformed
+                    // or hostile: reject it rather than overflow head_len+want — with panic=abort a
+                    // reverse-range slice panic would crash the WHOLE dataplane, not just this conn.
+                    if want > MAX_CREATE_BODY {
+                        let mut w = self.client_write.lock().await;
+                        let _ = w
+                            .write_all(&http_error(413, "Payload Too Large", "create body too large"))
+                            .await;
+                        let _ = w.shutdown().await;
+                        return Ok(());
+                    }
+                    let request_end = head_len + want; // no overflow: want <= MAX_CREATE_BODY
+                    while buf.len() < request_end {
                         let n = client_read.read(&mut tmp).await?;
                         if n == 0 {
                             break;
                         }
                         buf.extend_from_slice(&tmp[..n]);
                     }
-                    let body_end = (head_len + want).min(buf.len());
+                    let body_end = request_end.min(buf.len());
                     let rewrite = rewrite_create_body(
                         &buf[head_len..body_end],
                         &RewriteOpts { gpu_supported: opts.gpu_supported },
@@ -257,7 +273,11 @@ impl<B: Backend> Proxy<B> {
                         return Ok(());
                     }
                     let want = content_length(&head_text).unwrap_or(0);
-                    let request_end = head_len + want;
+                    // Guard the same overflow class as the create branch (panic=abort => whole-
+                    // process crash). A passthrough body over usize is malformed; drop the conn.
+                    let Some(request_end) = head_len.checked_add(want) else {
+                        return Ok(());
+                    };
                     if buf.len() >= request_end {
                         let upstream_write = self.upstream().await?;
                         upstream_write.write_all(&buf[..request_end]).await?;
@@ -635,6 +655,46 @@ mod tests {
 
         let got = captured.lock().unwrap().clone();
         assert_eq!(got, raw.to_vec(), "chunked request forwarded byte-exact");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An absurd Content-Length on a create must not panic (with panic=abort that would abort the
+    /// whole dataplane process). It is rejected with a 413 and the backend is never dialed.
+    #[tokio::test]
+    async fn absurd_content_length_on_create_is_rejected_not_a_panic() {
+        let (captured, path) = spawn_fake(false).await;
+
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        // usize::MAX Content-Length with only the head on the wire.
+        client
+            .write_all(b"POST /v1.47/containers/create HTTP/1.1\r\nHost: d\r\nContent-Length: 18446744073709551615\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), client.read_to_end(&mut resp)).await;
+
+        assert!(String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 413"), "got: {}", String::from_utf8_lossy(&resp));
+        assert!(captured.lock().unwrap().is_empty(), "backend must not be dialed for a rejected create");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The same overflow class on a passthrough request must drop the connection cleanly, not panic.
+    #[tokio::test]
+    async fn absurd_content_length_on_passthrough_does_not_panic() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(RawSink { captured });
+        let (listener, path) = bind_temp_listener().await;
+        tokio::spawn(serve(listener, backend, Arc::new(ServeOpts { gpu_supported: false })));
+
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        client
+            .write_all(b"POST /v1.47/containers/abc/update HTTP/1.1\r\nHost: d\r\nContent-Length: 18446744073709551615\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        // The connection is dropped; read_to_end returns without a panic bringing down the process.
+        let r = tokio::time::timeout(std::time::Duration::from_secs(3), client.read_to_end(&mut resp)).await;
+        assert!(r.is_ok(), "connection should close, not hang");
         let _ = std::fs::remove_file(&path);
     }
 
