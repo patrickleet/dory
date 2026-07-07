@@ -61,8 +61,8 @@ pub async fn serve_fd<B: Backend>(
     serve(listener, backend, opts).await
 }
 
-/// A backend that dials a unix socket per connection: the guest `dockerd` reachable through the
-/// vsock forward socket in production, or a plain dockerd socket.
+/// A backend that dials a unix socket per connection: a plain `dockerd` socket, or the guest
+/// `dockerd` reachable directly.
 pub struct UnixBackend {
     pub path: std::path::PathBuf,
 }
@@ -72,6 +72,35 @@ impl Backend for UnixBackend {
     fn connect(&self) -> Pin<Box<dyn Future<Output = std::io::Result<UnixStream>> + Send + '_>> {
         let path = self.path.clone();
         Box::pin(async move { UnixStream::connect(path).await })
+    }
+}
+
+/// The docker-tier backend: dial `dory-hv`'s forward socket and write a `HostToGuest` preamble for
+/// the docker port, so `dory-hv` opens a fresh guest vsock stream to `dockerd` and pumps raw bytes.
+/// After the preamble the stream is a transparent pipe to the guest `dockerd`.
+pub struct ForwardBackend {
+    pub forward_socket: std::path::PathBuf,
+    pub cid: u32,
+    pub port: u32,
+}
+
+impl Backend for ForwardBackend {
+    type Stream = UnixStream;
+    fn connect(&self) -> Pin<Box<dyn Future<Output = std::io::Result<UnixStream>> + Send + '_>> {
+        let path = self.forward_socket.clone();
+        let (cid, port) = (self.cid, self.port);
+        Box::pin(async move {
+            let mut stream = UnixStream::connect(path).await?;
+            let preamble = dory_proto::preamble::Preamble {
+                direction: dory_proto::preamble::Direction::HostToGuest,
+                cid,
+                port,
+            };
+            dory_proto::preamble::write_preamble(&mut stream, &preamble)
+                .await
+                .map_err(std::io::Error::other)?;
+            Ok(stream)
+        })
     }
 }
 
@@ -308,5 +337,64 @@ mod tests {
         assert!(resp_text.starts_with("HTTP/1.1 501"), "got: {resp_text}");
         assert!(captured.lock().unwrap().is_empty(), "backend must NOT be dialed for an unsupported GPU request");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// ForwardBackend must write a HostToGuest docker-port preamble before the request, exactly what
+    /// dory-hv expects to open a guest vsock stream — then the (rewritten) request follows.
+    #[tokio::test]
+    async fn forward_backend_writes_preamble_then_request() {
+        use dory_proto::preamble::{read_preamble, Direction};
+
+        // Fake dory-hv forward: read the preamble, then the forwarded request.
+        let (fwd_listener, fwd_path) = bind_temp_listener().await;
+        let got_preamble = Arc::new(Mutex::new(None));
+        let got_request = Arc::new(Mutex::new(Vec::new()));
+        let (gp, gr) = (got_preamble.clone(), got_request.clone());
+        tokio::spawn(async move {
+            let (mut s, _) = fwd_listener.accept().await.unwrap();
+            let preamble = read_preamble(&mut s).await.unwrap();
+            *gp.lock().unwrap() = Some(preamble);
+            let mut req = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_millis(300), s.read(&mut tmp)).await {
+                    Ok(Ok(n)) if n > 0 => req.extend_from_slice(&tmp[..n]),
+                    _ => break,
+                }
+            }
+            *gr.lock().unwrap() = req;
+            let _ = s.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n").await;
+            let _ = s.shutdown().await;
+        });
+
+        let backend = Arc::new(ForwardBackend {
+            forward_socket: fwd_path.clone(),
+            cid: 3,
+            port: dory_proto::channels::PORT_DOCKER,
+        });
+        let (listener, path) = bind_temp_listener().await;
+        tokio::spawn(serve(listener, backend, Arc::new(ServeOpts { gpu_supported: false })));
+
+        let body = r#"{"HostConfig":{"PortBindings":{"80/tcp":[{"HostIp":"127.0.0.1","HostPort":"8080"}]}}}"#;
+        let req = format!(
+            "POST /v1.47/containers/create HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        client.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), client.read_to_end(&mut resp)).await;
+
+        let preamble = got_preamble.lock().unwrap().clone().expect("preamble received");
+        assert_eq!(preamble.direction, Direction::HostToGuest);
+        assert_eq!(preamble.cid, 3);
+        assert_eq!(preamble.port, dory_proto::channels::PORT_DOCKER);
+        let request = String::from_utf8_lossy(&got_request.lock().unwrap()).into_owned();
+        assert!(request.contains("/containers/create"), "forwarded request: {request}");
+        assert!(request.contains("\"HostIp\":\"\""), "body rewritten: {request}");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&fwd_path);
     }
 }
