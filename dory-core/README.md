@@ -43,8 +43,21 @@ cargo run -p dory-ffi --features bindgen --bin uniffi-bindgen -- \
   generate --library target/debug/libdory_ffi.dylib --language swift --out-dir ffi/generated
 ```
 
+## Proven on hardware (2026-07-07)
+
+The docker-tier spine ran end-to-end on a real VM: docker CLI → `dory.sock` → dataplane
+(`examples/forward_serve`) → `ForwardBackend` preamble → `dory-hv --agent-vsock-forward` → guest
+vsock 1026 → `dockerd`. `version`/`ps`/`run --rm` (attach half-close), `-i` stdin-EOF streaming,
+and a full `pull` all relayed byte-exact. During the same run the *legacy* Go-agent RPC (port 1024)
+wedged with `malformedFrame` — field evidence for the cutover; the Rust path stayed healthy.
+
 ## Not yet built (integration, next sessions)
 
+- **Per-request classification in `dataplane::serve`** — `handle_conn` classifies only the first
+  request per connection, then splices raw. The docker CLI pools keep-alive connections, so a
+  create on a reused connection (after `GET /_ping`) bypasses create-rewrite/GPU gating (proven:
+  `docker run --gpus all` reached dockerd; the same body on a fresh connection got the 501). Loop
+  over request heads client→backend, rewrite each create, splice only on hijack.
 - `remote` crate (russh SSH transport + chunked sync + reconciler).
 - The Swift side: `doryd` (control plane, launchd) and `dory-vmm` (VZ per-VM, embeds the dataplane
   via FFI, owns the captive vsock fds). The `startDataplane(listenFd, …)` /
