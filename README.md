@@ -142,9 +142,11 @@ scripts/dory k8s enable         # bootstrap k3s in the shared VM
 ```
 
 `dory k8s enable` also takes `--publish HOST:CONTAINER[/proto]` (repeatable) for extra port
-publishings, `--image` to pin the k3s image, and `--recreate` to apply create-time config
+publishings, `--image` to pin the k3s image, `--recreate` to apply create-time config
 drift (destroys cluster state; without it, drift is reported and the cluster is left
-untouched). Once enabled:
+untouched), and `--no-kubeconfig-merge` to leave `~/.kube/config` alone and use only the
+`~/.kube/dory-config` side file (for CI or deliberately isolated KUBECONFIG setups). Once
+enabled:
 
 ```sh
 kubectl --context dory get pods -A
