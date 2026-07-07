@@ -78,13 +78,15 @@ final class ShimHTTPServer: @unchecked Sendable {
     let socketPath: String
     private let handler: Handler
     private let rawProxy: RawProxy?
+    private let activity: ShimActivity?
     private var listenFD: Int32 = -1
     private var running = false
     private let lock = NSLock()
 
-    init(socketPath: String, rawProxy: RawProxy? = nil, handler: @escaping Handler) {
+    init(socketPath: String, rawProxy: RawProxy? = nil, activity: ShimActivity? = nil, handler: @escaping Handler) {
         self.socketPath = socketPath
         self.rawProxy = rawProxy
+        self.activity = activity
         self.handler = handler
     }
 
@@ -160,6 +162,11 @@ final class ShimHTTPServer: @unchecked Sendable {
     }
 
     private func handleConnection(_ fd: Int32) {
+        // Count the whole connection as in-flight: a hijacked/streaming handler (build, pull, exec,
+        // logs -f) blocks here until the stream ends, so the idle monitor sees active > 0 and will
+        // not sleep the engine out from under a long-running docker request.
+        activity?.begin()
+        defer { activity?.end() }
         var hijacked = false
         defer { if !hijacked { shutdown(fd, SHUT_RDWR); close(fd) } }
         var buffer = Data()

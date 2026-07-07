@@ -3,6 +3,24 @@ import Foundation
 import Darwin
 #endif
 
+/// Thread-safe engine-activity tracker shared between the shim's connection threads and the
+/// MainActor idle monitor. `active` counts in-flight docker requests (so a long build/pull/exec that
+/// holds one connection for minutes blocks the idle sleep), `last` is the last meaningful use (used
+/// to time the idle window), and `sleeping` lets a shim thread learn the engine is asleep without a
+/// MainActor hop, hopping over only to wake it.
+final class ShimActivity: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _active = 0
+    private var _last = Date()
+    private var _sleeping = false
+    func begin() { lock.lock(); _active += 1; lock.unlock() }
+    func end() { lock.lock(); if _active > 0 { _active -= 1 }; lock.unlock() }
+    func touch() { lock.lock(); _last = Date(); lock.unlock() }
+    func setSleeping(_ value: Bool) { lock.lock(); _sleeping = value; lock.unlock() }
+    var isSleeping: Bool { lock.lock(); defer { lock.unlock() }; return _sleeping }
+    var snapshot: (active: Int, last: Date) { lock.lock(); defer { lock.unlock() }; return (_active, _last) }
+}
+
 final class ExecStore: @unchecked Sendable {
     private let lock = NSLock()
     private var commands: [String: (container: String, cmd: [String])] = [:]
@@ -25,6 +43,10 @@ struct DockerShim: Sendable {
     var apiVersion: String = "1.47"
     let execStore = ExecStore()
     var registrySearch: any RegistryImageSearch = HubImageSearch()
+    /// Shared activity tracker (nil for backends that never sleep / in tests). The shim records
+    /// meaningful requests here and, when the engine is asleep, calls `onWake` to bring it back.
+    var activity: ShimActivity?
+    var onWake: (@Sendable () async -> Void)?
 
     static var defaultSocketPath: String { "\(NSHomeDirectory())/.dory/dory.sock" }
 
@@ -34,12 +56,20 @@ struct DockerShim: Sendable {
     }
 
     func handle(_ request: ParsedRequest) async -> ShimResponse {
+        let path = Self.normalize(request.path)
+        let method = request.method.uppercased()
+        // `/_ping` is a pure liveness probe (the docker CLI, health checkers, and the Auto-Idle proxy
+        // all poll it) and is answered by the shim without touching the engine, so it must NOT count
+        // as use or wake a sleeping engine. Every other request is real use: record it, and if the
+        // idle monitor slept the engine, wake it first so the request runs against a live engine.
+        if path != "/_ping" {
+            activity?.touch()
+            if activity?.isSleeping == true { await onWake?() }
+        }
         // Docker-compatible backends proxy unsupported normal endpoints at the fallback below.
         // True connection-hijack endpoints still return `ShimResponse.hijacked` from their
         // per-endpoint handlers, which keeps exec/attach/BuildKit bidirectional streams intact
         // without tunneling unrelated future requests on the same client connection.
-        let path = Self.normalize(request.path)
-        let method = request.method.uppercased()
 
         switch (method, path) {
         case ("GET", "/_ping"), ("HEAD", "/_ping"):

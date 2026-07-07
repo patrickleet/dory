@@ -70,6 +70,9 @@ final class AppStore {
     var machines: [Machine] = []
     var engineRunning = false
     var engineVersion = "1.4.0"
+    /// True while the in-app Auto-Idle monitor has stopped the engine to reclaim memory. The docker
+    /// socket stays listening; the next docker request (or returning to the app) wakes it on demand.
+    var engineSleeping = false
 
     var loadState: LoadState = .connecting
     var launchSplashComplete = false
@@ -377,7 +380,21 @@ final class AppStore {
     func startBackendIfNeeded() {
         guard !backendStartRequested else { return }
         backendStartRequested = true
+        observeAppActivation()
         Task { await connectBackend() }
+    }
+
+    @ObservationIgnored private var activationObserver: (any NSObjectProtocol)?
+
+    /// Returning to Dory is a strong "I'm about to use it" signal, so wake an idle-slept engine the
+    /// moment the app becomes active — the window is usable again before the user reaches for it.
+    private func observeAppActivation() {
+        guard activationObserver == nil, !isAutomationContext else { return }
+        activationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in await self?.ensureEngineAwake() }
+        }
     }
 
     private func adoptSharedRuntime(_ shared: any ContainerRuntime) async {
@@ -507,6 +524,7 @@ final class AppStore {
         startAutoRefresh()
         Task { [weak self] in
             guard let self else { return }
+            await self.loadIdlePolicy()
             await self.loadKubernetes()
             self.loadMachines()
             self.offerLegacyMachineCleanup()
@@ -1049,8 +1067,15 @@ final class AppStore {
 
     func startShim() {
         guard shimServer == nil else { return }
-        let shim = DockerShim(runtime: runtime)
-        let server = ShimHTTPServer(socketPath: DockerShim.defaultSocketPath) { request in await shim.handle(request) }
+        var shim = DockerShim(runtime: runtime)
+        // Only Dory's own engine sleeps; external/custom sockets are always-on, so leave the tracker
+        // and wake unwired there (the shim then never records activity or tries to wake).
+        let activity: ShimActivity? = runtimeKind == .sharedVM ? engineActivity : nil
+        if runtimeKind == .sharedVM {
+            shim.activity = engineActivity
+            shim.onWake = { [weak self] in await self?.ensureEngineAwake() }
+        }
+        let server = ShimHTTPServer(socketPath: DockerShim.defaultSocketPath, activity: activity) { request in await shim.handle(request) }
         do {
             try server.start()
             shimServer = server
@@ -1066,8 +1091,8 @@ final class AppStore {
             if loadState != .engineOff { loadState = .engineOff }
             return
         }
-        if containers != snap.containers { containers = snap.containers; syncMachineStats() }
-        if images != snap.images { images = snap.images }
+        if containers != snap.containers { containers = snap.containers; syncMachineStats(); noteEngineActivity() }
+        if images != snap.images { images = snap.images; noteEngineActivity() }
         if volumes != snap.volumes { volumes = snap.volumes }
         if networks != snap.networks { networks = snap.networks }
         if runtimeKind == .mock, pods != snap.pods { pods = snap.pods }
@@ -1112,10 +1137,86 @@ final class AppStore {
     /// open sheet, an in-flight connect, onboarding, or the mock runtime.
     func refreshIfIdle() async {
         guard runtimeKind != .mock, !isConnecting, activeSheet == nil, !onboarding else { return }
+        // A sleeping engine has no socket to poll; leave it alone until a docker request wakes it.
+        if engineSleeping { return }
         capEngineLogIfDue()
         await reload()
         loadMachines()
         if runtimeKind == .sharedVM { await loadKubernetes() }
+        await evaluateIdleSleep()
+    }
+
+    // MARK: - In-app Auto-Idle (sleep the engine while the app is open)
+
+    let engineActivity = ShimActivity()
+    @ObservationIgnored private var wakeTask: Task<Void, Never>?
+
+    /// Records engine use so the idle countdown restarts. Called from GUI actions; external docker
+    /// use is recorded by the shim directly on `engineActivity`.
+    func noteEngineActivity() { engineActivity.touch() }
+
+    /// Restarts the engine if the idle monitor slept it. Concurrent callers coalesce onto one wake so
+    /// a burst of docker requests boots the VM exactly once. A failed wake leaves `engineSleeping`
+    /// true so the next request retries rather than proxying to a dead socket.
+    func ensureEngineAwake() async {
+        guard engineSleeping else { return }
+        if wakeTask == nil {
+            wakeTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                if self.engineSleeping {
+                    self.sharedVMStatus = "Waking Dory's engine…"
+                    await self.connectBackend()
+                    if self.loadState == .ready {
+                        self.engineSleeping = false
+                        self.engineActivity.setSleeping(false)
+                        self.engineActivity.touch()
+                        SharedVMProvisioner.recordIncident("wake", "woke on demand after idle sleep")
+                    }
+                }
+                self.wakeTask = nil
+            }
+        }
+        await wakeTask?.value
+    }
+
+    /// Decides whether the idle engine may sleep. Conservative on purpose: only when the app is not
+    /// frontmost, in an idle runtime mode, engine ready, nothing running, and no in-flight docker
+    /// request — so a live workload, an active user, or a running build/pull never loses the engine.
+    /// In-app operations that drive the engine directly (bypassing the shim's connection counter):
+    /// `compose up`, a container action, a migration, a k8s or volume-browse op. While any is in
+    /// flight the engine must stay awake, or the idle monitor could stop it mid-operation.
+    private var isEngineBusyInApp: Bool {
+        composeBusy || !pendingContainerIDs.isEmpty || kubernetesBusy || migrationBusy || volumeBrowseBusy || machineBusy
+    }
+
+    private func evaluateIdleSleep() async {
+        guard runtimeKind == .sharedVM, !engineSleeping, !isConnecting, loadState == .ready else { return }
+        guard runtimeMode == "auto-idle" || runtimeMode == "battery-saver" else { return }
+        if NSApp.isActive || runningCount > 0 || isEngineBusyInApp { engineActivity.touch(); return }
+        let (active, last) = engineActivity.snapshot
+        guard active == 0 else { return }
+        let minutes = max(1, idlePolicy.sleepAfterMinutes)
+        guard Date().timeIntervalSince(last) >= TimeInterval(minutes * 60) else { return }
+        await sleepEngineForIdle(minutes: minutes)
+    }
+
+    private func sleepEngineForIdle(minutes: Int) async {
+        guard !engineSleeping else { return }
+        // Claim the sleep on the MainActor (both flags flip together, no await between), then re-check
+        // that nothing is in flight. A docker request that slipped in either already bumped `active`
+        // (we abort and stay awake) or, having arrived after, sees the sleeping flag and wakes us.
+        engineSleeping = true
+        engineActivity.setSleeping(true)
+        guard engineActivity.snapshot.active == 0 else {
+            engineSleeping = false
+            engineActivity.setSleeping(false)
+            return
+        }
+        stopAutoRefresh()
+        sharedVMStatus = "Sleeping — idle \(minutes) min. Docker use wakes it."
+        await SharedVMProvisioner.stopEngine()
+        engineRunning = false
+        SharedVMProvisioner.recordIncident("idle-sleep", "engine slept after \(minutes) min idle (app open, nothing running)")
     }
 
     @ObservationIgnored private var lastLogCap = Date.distantPast
@@ -1506,6 +1607,8 @@ final class AppStore {
     }
 
     func performToggle(_ container: Container) async {
+        noteEngineActivity()
+        await ensureEngineAwake()
         guard let idx = containers.firstIndex(where: { $0.id == container.id }) else { return }
         let wasRunning = container.status == .running
         pendingContainerIDs.insert(container.id)

@@ -938,6 +938,57 @@ idle_proxy_cmd() {
   exec "$helper" "$@"
 }
 
+# When the Dory app is running it owns the engine, so `dory engine` talks to the app's sockets rather
+# than a standalone runtime: engine.sock answers only when the engine is awake, dory.sock (the app's
+# shim) answers whenever the app is up, and any real API call through it wakes an idle-slept engine.
+_engine_socket_up() { curl -sf --max-time "${2:-3}" --unix-socket "$1" http://d/_ping >/dev/null 2>&1; }
+
+engine_cmd() {
+  local esock="$HOME/.dory/engine.sock" dsock="$HOME/.dory/dory.sock"
+  case "${1:-status}" in
+    status)
+      if _engine_socket_up "$esock"; then
+        echo "Dory engine: running"
+      elif _engine_socket_up "$dsock"; then
+        echo "Dory engine: sleeping (idle) — docker use or 'dory engine wake' resumes it"
+      else
+        echo "Dory engine: not running — open the Dory app to start it"
+      fi
+      ;;
+    wake|start)
+      if _engine_socket_up "$esock"; then
+        echo "Dory engine: already running"
+      elif _engine_socket_up "$dsock"; then
+        # A real API call through the app's shim triggers the wake, but the shim answers /version
+        # even while the engine is down, so that response is NOT proof. Confirm by the real engine
+        # socket coming up.
+        curl -s --max-time 90 --unix-socket "$dsock" http://d/version >/dev/null 2>&1 || true
+        local waited=0
+        while [ "$waited" -lt 30 ]; do
+          if _engine_socket_up "$esock"; then
+            echo "Dory engine: awake"
+            return 0
+          fi
+          sleep 1
+          waited=$((waited + 1))
+        done
+        echo "Dory engine: wake requested but the engine did not come up — see ~/.dory/engine.log" >&2
+        exit 1
+      else
+        echo "Dory's engine is managed by the Dory app. Open Dory to start it." >&2
+        exit 1
+      fi
+      ;;
+    sleep|stop)
+      echo "Dory's engine sleeps on its own when idle (Settings → Auto-Idle). To stop it now, quit the Dory app." >&2
+      ;;
+    *)
+      echo "usage: dory engine status|wake|sleep" >&2
+      exit 64
+      ;;
+  esac
+}
+
 case "${1:-help}" in
   help|-h|--help) usage ;;
   doctor)         shift; doctor_cmd doctor "$@" ;;
@@ -957,12 +1008,7 @@ case "${1:-help}" in
                     proxy-status|proxy-state) shift; idle_proxy_cmd status "$@" ;;
                     *) doctor_cmd idle "$@" ;;
                   esac ;;
-  engine)
-                  shift
-                  case "${1:-status}" in
-                    sleep|wake|start|stop|status) idle_proxy_cmd engine "$@" ;;
-                    *) echo "usage: dory engine sleep|wake|status" >&2; exit 64 ;;
-                  esac ;;
+  engine)         shift; engine_cmd "$@" ;;
   bundle)         shift; doctor_cmd bundle "$@" ;;
   shell)          exec docker -H "unix://$DORY_SOCK" exec -it "$2" sh -c 'command -v bash >/dev/null && exec bash || exec sh' ;;
   debug)          shift; debug_cmd "$@" ;;
