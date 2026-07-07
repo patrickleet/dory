@@ -63,8 +63,8 @@ pub async fn manifest(req: SyncManifestRequest) -> Result<SyncManifestResponse, 
 pub async fn file_status(req: SyncFileStatusRequest) -> Result<SyncFileStatusResponse, SyncError> {
     let root = PathBuf::from(&req.root);
     // Reject a bad path even on status so the host gets a consistent error surface.
-    safe_join(&root, &req.path)?;
-    let staging = staging_path(&root, &req.hash);
+    safe_join(&root, &req.path).await?;
+    let staging = safe_join(&root, &staging_rel(&req.path, &req.hash)).await?;
     let have_bytes = match tokio::fs::metadata(&staging).await {
         Ok(m) => m.len(),
         Err(_) => 0,
@@ -76,11 +76,10 @@ pub async fn put_chunk(req: SyncPutChunkRequest) -> Result<SyncPutChunkResponse,
     use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
     let root = PathBuf::from(&req.root);
-    let dest = safe_join(&root, &req.path)?;
-    let staging = staging_path(&root, &req.hash);
-    if let Some(parent) = staging.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
+    let dest = safe_join(&root, &req.path).await?;
+    // Ensure the staging dir exists (as a real dir) before confining the staging path through it.
+    tokio::fs::create_dir_all(root.join(STAGING_DIR)).await?;
+    let staging = safe_join(&root, &staging_rel(&req.path, &req.hash)).await?;
 
     // Strict append: the chunk offset must match what is already staged. offset 0 (re)starts the
     // file; a resumed chunk must land exactly at the current staged size.
@@ -111,19 +110,31 @@ pub async fn put_chunk(req: SyncPutChunkRequest) -> Result<SyncPutChunkResponse,
         });
     }
 
-    // Commit: verify the FULL content hash before the file becomes visible.
+    // Commit. Do the setup (parent dirs, mode) FIRST, then verify the full content hash and rename
+    // immediately with no await in between — minimizing any window in which the staged file could be
+    // mutated between the hash check and the atomic publish.
     file.sync_all().await?;
     drop(file);
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    apply_mode(&staging, req.mode).await?;
     let contents = tokio::fs::read(&staging).await?;
     if dory_sync::hash_bytes(&contents).as_slice() != req.hash.as_slice() {
         let _ = tokio::fs::remove_file(&staging).await; // never leave poisoned staging around
         return Err(SyncError::HashMismatch);
     }
-    if let Some(parent) = dest.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+    // Retry once on ENOENT: a concurrent delete's prune_empty_parents can race the dest parent away.
+    if let Err(e) = tokio::fs::rename(&staging, &dest).await {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            if let Some(parent) = dest.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::rename(&staging, &dest).await?;
+        } else {
+            return Err(SyncError::Io(e));
+        }
     }
-    apply_mode(&staging, req.mode).await?;
-    tokio::fs::rename(&staging, &dest).await?; // atomic publish
     Ok(SyncPutChunkResponse {
         next_offset,
         committed: true,
@@ -134,7 +145,7 @@ pub async fn delete(req: SyncDeleteRequest) -> Result<SyncDeleteResponse, SyncEr
     let root = PathBuf::from(&req.root);
     let mut deleted = 0u32;
     for rel in &req.paths {
-        let path = safe_join(&root, rel)?;
+        let path = safe_join(&root, rel).await?;
         match tokio::fs::remove_file(&path).await {
             Ok(()) => {
                 deleted += 1;
@@ -178,8 +189,14 @@ async fn prune_empty_parents(root: &Path, path: &Path) {
     }
 }
 
-/// Join `rel` (a forward-slash relpath) onto `root`, rejecting anything that would escape it.
-fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, SyncError> {
+/// Join `rel` (a forward-slash relpath) onto `root` and confine it there. Lexical checks reject
+/// `..`/absolute/empty/`.`; then EACH existing component is `lstat`ed and a symlink is refused —
+/// `rename`/`remove_file`/`create_dir_all` follow symlinks in non-final components, so a symlinked
+/// directory would otherwise redirect a write or delete outside the root. (walk_manifest skips
+/// symlinks, so a legitimately synced tree never contains one; a pre-planted symlink is an escape
+/// primitive.) There is a benign TOCTOU against a local attacker who can mutate the tree concurrently
+/// — out of scope, since such an attacker already has filesystem access on the remote.
+async fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, SyncError> {
     if rel.is_empty() || rel.starts_with('/') {
         return Err(SyncError::PathEscape);
     }
@@ -189,6 +206,11 @@ fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, SyncError> {
             return Err(SyncError::PathEscape);
         }
         out.push(part);
+        if let Ok(meta) = tokio::fs::symlink_metadata(&out).await {
+            if meta.file_type().is_symlink() {
+                return Err(SyncError::PathEscape);
+            }
+        }
     }
     Ok(out)
 }
@@ -201,8 +223,22 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-fn staging_path(root: &Path, hash: &[u8]) -> PathBuf {
-    root.join(STAGING_DIR).join(hex(hash))
+/// Staging rel-path for `(path, hash)`, under the staging dir. Keyed by BOTH so two destinations that
+/// happen to share content (same hash) never collide in one staging file — otherwise a concurrent
+/// push of one could truncate the other's staged bytes and publish a torn file. `file_status`
+/// receives the same `(path, hash)`, so resume keys identically.
+fn staging_rel(path: &str, hash: &[u8]) -> String {
+    format!(
+        "{STAGING_DIR}/{}.{}",
+        hex(&dory_sync::hash_bytes(path.as_bytes())),
+        hex(hash)
+    )
+}
+
+/// The staging path as a plain join (no confinement I/O) — for tests asserting existence.
+#[cfg(test)]
+fn staging_path(root: &Path, path: &str, hash: &[u8]) -> PathBuf {
+    root.join(staging_rel(path, hash))
 }
 
 #[cfg(test)]
@@ -252,7 +288,7 @@ mod tests {
         assert_eq!(resp.next_offset, data.len() as u64);
         assert_eq!(fs::read(t.path.join("dir/file.txt")).unwrap(), data);
         // Staging cleaned up after commit.
-        assert!(!t.path.join(STAGING_DIR).join(hex(&hash)).exists());
+        assert!(!staging_path(&t.path, "dir/file.txt", &hash).exists());
     }
 
     #[tokio::test]
@@ -343,7 +379,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, SyncError::HashMismatch));
         assert!(!t.path.join("f").exists(), "a corrupt file must never be published");
-        assert!(!t.path.join(STAGING_DIR).join(hex(&declared)).exists(), "poisoned staging removed");
+        assert!(!staging_path(&t.path, "f", &declared).exists(), "poisoned staging removed");
     }
 
     #[tokio::test]
@@ -365,6 +401,50 @@ mod tests {
         }
     }
 
+    /// A pre-existing symlinked directory component must NOT let a write escape the sync root.
+    /// (walk_manifest skips symlinks, so a legit tree never contains one the host put there, but a
+    /// pre-planted one is an escape primitive — the critical finding.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_component_cannot_redirect_a_write_outside_root() {
+        let t = TempRoot::new("symlink-write");
+        let outside = TempRoot::new("symlink-write-outside");
+        // <root>/link -> <outside>
+        std::os::unix::fs::symlink(&outside.path, t.path.join("link")).unwrap();
+
+        let data = b"pwned".to_vec();
+        let err = put_chunk(SyncPutChunkRequest {
+            root: t.root(),
+            path: "link/evil.txt".into(),
+            hash: hash_bytes(&data).to_vec(),
+            offset: 0,
+            data,
+            last: true,
+            mode: 0o600,
+            mtime_ns: 0,
+        })
+        .await;
+        assert!(matches!(err, Err(SyncError::PathEscape)), "write through a symlink must be rejected");
+        assert!(!outside.path.join("evil.txt").exists(), "nothing may be written outside the root");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_component_cannot_redirect_a_delete_outside_root() {
+        let t = TempRoot::new("symlink-del");
+        let outside = TempRoot::new("symlink-del-outside");
+        fs::write(outside.path.join("victim.txt"), "precious").unwrap();
+        std::os::unix::fs::symlink(&outside.path, t.path.join("link")).unwrap();
+
+        let err = delete(SyncDeleteRequest {
+            root: t.root(),
+            paths: vec!["link/victim.txt".into()],
+        })
+        .await;
+        assert!(matches!(err, Err(SyncError::PathEscape)), "delete through a symlink must be rejected");
+        assert!(outside.path.join("victim.txt").exists(), "a file outside the root must survive");
+    }
+
     #[tokio::test]
     async fn delete_removes_files_and_prunes_empty_dirs() {
         let t = TempRoot::new("delete");
@@ -383,6 +463,46 @@ mod tests {
         assert!(!t.path.join("a/b").exists(), "empty dir pruned");
         assert!(!t.path.join("a").exists(), "empty parent pruned");
         assert!(t.path.join("keep.txt").exists(), "untouched file kept");
+    }
+
+    /// Two different paths with identical content (same hash) must NOT share one staging file, or
+    /// completing one destroys the other's resume state / can publish a torn file. Deterministic
+    /// proxy for the concurrent same-hash corruption the adversarial review found.
+    #[tokio::test]
+    async fn same_hash_different_paths_have_isolated_staging() {
+        let t = TempRoot::new("same-hash");
+        let c = b"0123456789abcdef".to_vec();
+        let h = hash_bytes(&c).to_vec();
+
+        let half = |root: &str, path: &str, off: u64, data: Vec<u8>, last: bool| SyncPutChunkRequest {
+            root: root.to_string(),
+            path: path.into(),
+            hash: h.clone(),
+            offset: off,
+            data,
+            last,
+            mode: 0o644,
+            mtime_ns: 0,
+        };
+
+        // Stage both a and b halfway with the same content/hash.
+        put_chunk(half(&t.root(), "a.txt", 0, c[..8].to_vec(), false)).await.unwrap();
+        put_chunk(half(&t.root(), "b.txt", 0, c[..8].to_vec(), false)).await.unwrap();
+        assert_eq!(file_status(SyncFileStatusRequest { root: t.root(), path: "a.txt".into(), hash: h.clone() }).await.unwrap().have_bytes, 8);
+        assert_eq!(file_status(SyncFileStatusRequest { root: t.root(), path: "b.txt".into(), hash: h.clone() }).await.unwrap().have_bytes, 8);
+
+        // Finish a (commits + cleans a's staging). b's staging must be untouched.
+        put_chunk(half(&t.root(), "a.txt", 8, c[8..].to_vec(), true)).await.unwrap();
+        assert_eq!(
+            file_status(SyncFileStatusRequest { root: t.root(), path: "b.txt".into(), hash: h.clone() }).await.unwrap().have_bytes,
+            8,
+            "finishing a.txt must not wipe b.txt's independent staging"
+        );
+
+        // Finish b — must still resume from 8 and commit.
+        put_chunk(half(&t.root(), "b.txt", 8, c[8..].to_vec(), true)).await.unwrap();
+        assert_eq!(fs::read(t.path.join("a.txt")).unwrap(), c);
+        assert_eq!(fs::read(t.path.join("b.txt")).unwrap(), c);
     }
 
     #[tokio::test]

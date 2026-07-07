@@ -70,19 +70,22 @@ pub async fn push<T: SyncTarget>(
 
         // Resume: pick up where the remote left off, unless its staged size is past our file (stale).
         let staged = target.staged_bytes(remote_root, rel, &entry.hash).await?;
-        let mut offset = if staged <= bytes.len() as u64 { staged } else { 0 };
+        let mut offset: usize = if staged <= bytes.len() as u64 { staged as usize } else { 0 };
 
         loop {
             let end = (offset as usize + CHUNK_BYTES).min(bytes.len());
-            let chunk = bytes[offset as usize..end].to_vec();
+            let chunk = bytes[offset..end].to_vec();
             let last = end == bytes.len();
             let sent = chunk.len() as u64;
-            let next = target
+            // The peer's returned next_offset is NOT trusted for indexing: a buggy/hostile agent
+            // could return an out-of-bounds value and panic the slice below (panic=abort => doryd
+            // dies). The host knows the true position; advance by what we sent.
+            let _ = target
                 .put_chunk(SyncPutChunkRequest {
                     root: remote_root.to_string(),
                     path: rel.clone(),
                     hash: entry.hash.to_vec(),
-                    offset,
+                    offset: offset as u64,
                     data: chunk,
                     last,
                     mode: entry.mode,
@@ -90,7 +93,7 @@ pub async fn push<T: SyncTarget>(
                 })
                 .await?;
             stats.bytes_sent += sent;
-            offset = next;
+            offset = end;
             if last {
                 break;
             }
@@ -191,6 +194,8 @@ mod tests {
     struct FakeTarget {
         remote: Manifest,
         preset_staged: HashMap<String, u64>,
+        /// If set, put_chunk returns this bogus next_offset — models a buggy/hostile agent.
+        bogus_next_offset: Option<u64>,
         rec: Mutex<Recorded>,
     }
     impl FakeTarget {
@@ -198,6 +203,7 @@ mod tests {
             FakeTarget {
                 remote,
                 preset_staged: HashMap::new(),
+                bogus_next_offset: None,
                 rec: Mutex::new(Recorded::default()),
             }
         }
@@ -223,9 +229,9 @@ mod tests {
             Ok(self.preset_staged.get(path).copied().unwrap_or(0))
         }
         async fn put_chunk(&self, req: SyncPutChunkRequest) -> Result<u64, RemoteError> {
-            let next = req.offset + req.data.len() as u64;
+            let honest = req.offset + req.data.len() as u64;
             self.rec.lock().unwrap().chunks.push(req);
-            Ok(next)
+            Ok(self.bogus_next_offset.unwrap_or(honest))
         }
         async fn delete(&self, _root: &str, paths: &[String]) -> Result<u32, RemoteError> {
             self.rec.lock().unwrap().deleted.extend_from_slice(paths);
@@ -310,6 +316,20 @@ mod tests {
         let rec = target.rec.lock().unwrap();
         assert!(rec.chunks.iter().all(|c| c.path == "changed.txt"), "same.txt must not be re-sent");
         assert_eq!(rec.deleted, vec!["gone.txt".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn push_does_not_trust_a_bogus_agent_next_offset() {
+        let t = TempTree::new("bogus-offset");
+        // Multi-chunk file so the loop iterates and would re-index with the bogus offset.
+        t.write("f", &vec![3u8; CHUNK_BYTES + 50]);
+        let mut target = FakeTarget::new(Manifest::default());
+        target.bogus_next_offset = Some(u64::MAX); // a hostile/buggy agent
+
+        // Must complete without panicking (panic=abort would kill doryd) and send the whole file.
+        let stats = push(&t.root, "/remote", &target).await.unwrap();
+        assert_eq!(stats.bytes_sent, (CHUNK_BYTES + 50) as u64);
+        assert_eq!(target.assembled("f"), vec![3u8; CHUNK_BYTES + 50]);
     }
 
     #[tokio::test]
