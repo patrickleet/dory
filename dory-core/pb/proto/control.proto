@@ -1,0 +1,83 @@
+syntax = "proto3";
+
+// The app <-> doryd control API (Dory.app is a pure client; doryd owns all state). Carried over the
+// XPC/unix control socket, length-delimited. Swift decodes via swift-protobuf, Rust via prost.
+// This is the representative core; it grows as surfaces land.
+package dory.control.v1;
+
+message EngineStatus {
+  enum State {
+    STOPPED = 0;
+    STARTING = 1;
+    RUNNING = 2;
+    SLEEPING = 3;
+  }
+  State state = 1;
+  string detail = 2;
+  uint64 host_memory_bytes = 3; // dory-hv RSS returned-to-host aware
+  string engine_version = 4;
+}
+
+message Container {
+  string id = 1;
+  string name = 2;
+  string image = 3;
+  string state = 4; // "running" | "exited" | ...
+  bool running = 5;
+  repeated PublishedPort ports = 6;
+}
+message PublishedPort {
+  uint32 host_port = 1;
+  uint32 container_port = 2;
+  string protocol = 3;
+}
+
+message IdlePolicy {
+  string mode = 1; // "manual" | "auto-idle" | "battery-saver" | "always-on"
+  uint32 sleep_after_minutes = 2;
+  bool keep_published_ports_awake = 3;
+  bool keep_kubernetes_awake = 4;
+}
+
+message ControlRequest {
+  oneof op {
+    EngineStart engine_start = 1;
+    EngineStop engine_stop = 2;
+    EngineStatusRequest engine_status = 3;
+    ContainersListRequest containers_list = 4;
+    ContainerAction container_action = 5;
+    StateSubscribe state_subscribe = 6;
+    IdlePolicy set_idle_policy = 7;
+  }
+}
+message EngineStart {}
+message EngineStop {}
+message EngineStatusRequest {}
+message ContainersListRequest { bool all = 1; }
+message ContainerAction {
+  string id = 1;
+  string action = 2; // "start" | "stop" | "restart" | "remove"
+}
+message StateSubscribe {}
+
+message ControlError {
+  int32 code = 1;
+  string message = 2;
+}
+
+message ControlResponse {
+  oneof result {
+    ControlError error = 1;
+    EngineStatus engine_status = 2;
+    ContainersList containers = 3;
+    Ack ack = 4;
+  }
+}
+message ContainersList { repeated Container containers = 1; }
+message Ack {}
+
+// Server-pushed, unsolicited, after StateSubscribe: a coalesced delta of authoritative state.
+message StateDelta {
+  EngineStatus engine = 1;
+  ContainersList containers = 2;
+}

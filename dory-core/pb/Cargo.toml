@@ -1,0 +1,11 @@
+[package]
+name = "dory-pb"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+prost = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }

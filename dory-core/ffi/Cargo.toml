@@ -1,0 +1,25 @@
+[package]
+name = "dory-ffi"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+name = "dory_ffi"
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+required-features = ["bindgen"]
+
+[dependencies]
+dory-proto = { path = "../proto" }
+dory-dataplane = { path = "../dataplane" }
+uniffi = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[features]
+# Enables the uniffi-bindgen helper binary that generates the Swift bindings.
+bindgen = ["uniffi/cli"]

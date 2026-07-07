@@ -1,0 +1,59 @@
+syntax = "proto3";
+
+// Guest agent RPC, carried as the payload of a dory-proto mux request/response on the control
+// channel (vsock port 1024). One request maps to one response by mux id; this envelope only picks
+// the method and body.
+package dory.agent.v1;
+
+message ClockSyncRequest {
+  int64 host_epoch_ns = 1;
+}
+message ClockSyncResponse {
+  bool synced = 1;
+}
+
+message InfoRequest {}
+message InfoResponse {
+  uint32 proto_version = 1;
+  string kernel = 2;
+  string agent_build = 3;
+  uint64 uptime_secs = 4;
+}
+
+message ListenPort {
+  string protocol = 1; // "tcp" | "udp"
+  uint32 port = 2;
+}
+message PortEvent {
+  string action = 1; // "added" | "removed"
+  string protocol = 2;
+  uint32 port = 3;
+}
+message PortsWatchRequest {}
+message PortsWatchResponse {
+  repeated ListenPort ports = 1;
+  repeated PortEvent added = 2;
+  repeated PortEvent removed = 3;
+}
+
+message RpcError {
+  int32 code = 1;
+  string message = 2;
+}
+
+message AgentRequest {
+  oneof method {
+    ClockSyncRequest clock_sync = 1;
+    InfoRequest info = 2;
+    PortsWatchRequest ports_watch = 3;
+  }
+}
+
+message AgentResponse {
+  oneof result {
+    RpcError error = 1;
+    ClockSyncResponse clock_sync = 2;
+    InfoResponse info = 3;
+    PortsWatchResponse ports_watch = 4;
+  }
+}
