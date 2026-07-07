@@ -14,6 +14,7 @@ pub mod dispatch;
 pub mod handler;
 pub mod proc_net;
 pub mod sync_apply;
+pub mod telemetry;
 
 #[cfg(target_os = "linux")]
 pub mod vsock_server;

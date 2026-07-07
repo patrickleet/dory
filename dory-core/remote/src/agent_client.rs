@@ -12,7 +12,7 @@ use dory_pb::agent::{
     self, agent_request::Method, agent_response::Result as Res, AgentRequest, AgentResponse,
     ClockSyncRequest, InfoRequest, PortsWatchRequest, SyncDeleteRequest, SyncDeleteResponse,
     SyncFileStatusRequest, SyncFileStatusResponse, SyncManifestRequest, SyncManifestResponse,
-    SyncPutChunkRequest, SyncPutChunkResponse,
+    SyncPutChunkRequest, SyncPutChunkResponse, TelemetryRequest, TelemetryResponse,
 };
 use dory_proto::handshake::{handshake, Hello};
 use dory_proto::mux::Mux;
@@ -71,6 +71,13 @@ impl AgentClient {
     pub async fn ports_watch(&self) -> Result<agent::PortsWatchResponse, RemoteError> {
         match self.call(Method::PortsWatch(PortsWatchRequest {})).await? {
             Res::PortsWatch(r) => Ok(r),
+            _ => Err(RemoteError::UnexpectedVariant),
+        }
+    }
+
+    pub async fn telemetry(&self) -> Result<TelemetryResponse, RemoteError> {
+        match self.call(Method::Telemetry(TelemetryRequest {})).await? {
+            Res::Telemetry(r) => Ok(r),
             _ => Err(RemoteError::UnexpectedVariant),
         }
     }

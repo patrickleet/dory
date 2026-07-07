@@ -71,6 +71,14 @@ pub struct PushStatsFfi {
     pub files_deleted: u64,
 }
 
+#[derive(uniffi::Record)]
+pub struct TelemetryFfi {
+    pub mem_total_kb: u64,
+    pub mem_available_kb: u64,
+    pub psi_some_avg10: f64,
+    pub psi_full_avg10: f64,
+}
+
 /// A live remote connection owned by `doryd`. Holds its own runtime + the SSH session.
 #[derive(uniffi::Object)]
 pub struct RemoteAgent {
@@ -135,6 +143,19 @@ impl RemoteAgent {
             kernel: i.kernel,
             agent_build: i.agent_build,
             uptime_secs: i.uptime_secs,
+        })
+    }
+
+    /// Guest memory + pressure telemetry (for doryd's balloon / idle decisions).
+    pub fn telemetry(&self) -> Result<TelemetryFfi, RemoteFfiError> {
+        let guard = self.runtime.lock().unwrap();
+        let runtime = guard.as_ref().ok_or_else(shutdown_error)?;
+        let t = runtime.block_on(self.agent.client.telemetry())?;
+        Ok(TelemetryFfi {
+            mem_total_kb: t.mem_total_kb,
+            mem_available_kb: t.mem_available_kb,
+            psi_some_avg10: t.psi_some_avg10,
+            psi_full_avg10: t.psi_full_avg10,
         })
     }
 

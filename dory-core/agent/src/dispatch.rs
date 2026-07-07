@@ -38,6 +38,7 @@ pub fn handle_method(method: Option<Method>) -> agent::AgentResponse {
         }),
         Some(Method::Info(_)) => Res::Info(info()),
         Some(Method::PortsWatch(_)) => Res::PortsWatch(ports_watch()),
+        Some(Method::Telemetry(_)) => Res::Telemetry(telemetry()),
         Some(_) => return err(500, "sync method must be dispatched via the async handler"),
         None => return err(400, "empty method"),
     };
@@ -65,6 +66,27 @@ fn kernel() -> String {
         let release = std::ffi::CStr::from_ptr(u.release.as_ptr()).to_string_lossy();
         format!("{sysname} {release}")
     }
+}
+
+#[cfg(target_os = "linux")]
+fn telemetry() -> agent::TelemetryResponse {
+    let (mem_total_kb, mem_available_kb) = std::fs::read_to_string("/proc/meminfo")
+        .map(|s| crate::telemetry::parse_meminfo(&s))
+        .unwrap_or((0, 0));
+    let (psi_some_avg10, psi_full_avg10) = std::fs::read_to_string("/proc/pressure/memory")
+        .map(|s| crate::telemetry::parse_pressure(&s))
+        .unwrap_or((0.0, 0.0));
+    agent::TelemetryResponse {
+        mem_total_kb,
+        mem_available_kb,
+        psi_some_avg10,
+        psi_full_avg10,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn telemetry() -> agent::TelemetryResponse {
+    agent::TelemetryResponse::default()
 }
 
 #[cfg(target_os = "linux")]

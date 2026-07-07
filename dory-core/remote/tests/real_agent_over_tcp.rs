@@ -35,6 +35,9 @@ async fn agent_client_drives_real_dispatch_over_tcp() {
     // ports_watch: real /proc/net parse on Linux, empty on a non-Linux host — must not error.
     let _ports = client.ports_watch().await.expect("ports rpc");
 
+    // telemetry: real /proc parse on Linux, zeros on host — must round-trip through real dispatch.
+    let _telemetry = client.telemetry().await.expect("telemetry rpc");
+
     // Concurrent calls are id-routed by the mux — fire several and confirm each resolves.
     let (a, b, c) = tokio::join!(client.info(), client.info(), client.info());
     assert!(a.is_ok() && b.is_ok() && c.is_ok(), "concurrent RPCs all resolve");

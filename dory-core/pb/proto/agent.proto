@@ -41,6 +41,16 @@ message RpcError {
   string message = 2;
 }
 
+// Guest memory + pressure telemetry, polled by doryd to compute balloon set-points and idle
+// decisions (it alone sees host pressure plus every VM's telemetry). Zeros on a non-Linux host.
+message TelemetryRequest {}
+message TelemetryResponse {
+  uint64 mem_total_kb = 1;
+  uint64 mem_available_kb = 2;
+  double psi_some_avg10 = 3; // memory-pressure "some" 10s average, percent (0..100)
+  double psi_full_avg10 = 4; // memory-pressure "full" 10s average, percent (0..100)
+}
+
 // --- Host-authoritative file sync (remote machines) ---
 // The host is the source of truth; these push a host tree into a remote `root` directory, making it
 // an exact replica. `root` is an absolute path on the remote; `path` is relative to it (forward
@@ -102,6 +112,7 @@ message AgentRequest {
     SyncFileStatusRequest sync_file_status = 5;
     SyncPutChunkRequest sync_put_chunk = 6;
     SyncDeleteRequest sync_delete = 7;
+    TelemetryRequest telemetry = 8;
   }
 }
 
@@ -115,5 +126,6 @@ message AgentResponse {
     SyncFileStatusResponse sync_file_status = 6;
     SyncPutChunkResponse sync_put_chunk = 7;
     SyncDeleteResponse sync_delete = 8;
+    TelemetryResponse telemetry = 9;
   }
 }
