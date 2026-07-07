@@ -1,7 +1,17 @@
-//! The docker socket serving loop. Accepts a client on `dory.sock`, reads just the request head,
-//! classifies it, and either (a) rewrites a `create` body and forwards the reconstructed request, or
-//! (b) replays the head and splices the raw connection to the backend (guest `dockerd`). A GPU
-//! request on an engine without GPU is answered with a 501 and never dialed to the backend.
+//! The docker socket serving loop. Accepts a client on `dory.sock` and classifies **every request
+//! on the connection** — the docker CLI pools keep-alive connections, so classifying only the first
+//! request would let a `create` sent after a `GET /_ping` bypass the compatibility rewrites and the
+//! GPU gate entirely.
+//!
+//! The shape per connection: one backend connection (dialed lazily on the first request), a blind
+//! response pump backend→client (responses are never parsed), and a request loop client→backend
+//! that tracks request boundaries (content-length framed). A `create` body is rewritten in place;
+//! a hijack/upgrade request (attach/exec/build/pull) drops the rest of the connection into a raw
+//! splice; everything else streams through verbatim. Half-close is preserved in both directions:
+//! client EOF becomes backend `SHUT_WR`, backend EOF becomes client `SHUT_WR`.
+//!
+//! Docker clients never pipeline (a request is only sent after the previous response), which is
+//! what makes the blind response pump and the direct 501 write safe.
 //!
 //! The backend is abstracted so the embedding VMM supplies the real transport (the captive vsock
 //! stream), while tests supply an in-memory `dockerd`.
@@ -11,13 +21,15 @@ use std::os::unix::io::{FromRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, WriteHalf};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 use crate::classify::{classify, Disposition};
 use crate::create_rewrite::{rewrite_create_body, RewriteOpts};
 use crate::http_head::{head_end, parse_head, MAX_HEAD_BYTES};
-use dory_proto::half_close::splice;
 
 pub struct ServeOpts {
     pub gpu_supported: bool,
@@ -105,76 +117,173 @@ impl Backend for ForwardBackend {
 }
 
 async fn handle_conn<B: Backend>(
-    mut client: UnixStream,
+    client: UnixStream,
     backend: Arc<B>,
     opts: Arc<ServeOpts>,
 ) -> std::io::Result<()> {
-    let mut buf = Vec::with_capacity(8192);
-    let mut tmp = [0u8; 8192];
-    let head_len = loop {
-        if let Some(end) = head_end(&buf) {
-            break end;
-        }
-        if buf.len() > MAX_HEAD_BYTES {
-            return Ok(()); // never found a head terminator; drop
-        }
-        let n = client.read(&mut tmp).await?;
-        if n == 0 {
-            return Ok(());
-        }
-        buf.extend_from_slice(&tmp[..n]);
+    let (client_read, client_write) = client.into_split();
+    let mut proxy = Proxy {
+        backend,
+        client_write: Arc::new(Mutex::new(client_write)),
+        upstream_write: None,
+        pump: None,
     };
-
-    let Some(head) = parse_head(&buf) else {
-        return Ok(());
-    };
-
-    if classify(&head) == Disposition::CreateRewrite {
-        return handle_create(client, backend, opts, &buf, head_len).await;
+    let served = proxy.drive(client_read, &opts).await;
+    // Whatever ended the request loop (client EOF, hijack finished, reject, error), give dockerd
+    // request-EOF so it finishes its last response and closes; the pump then half-closes the client.
+    if let Some(mut upstream_write) = proxy.upstream_write.take() {
+        let _ = upstream_write.shutdown().await;
     }
-
-    // Passthrough / hijack: replay the buffered head (+ any body bytes already read), then splice.
-    let mut upstream = backend.connect().await?;
-    upstream.write_all(&buf).await?;
-    splice(client, upstream).await?;
-    Ok(())
+    if let Some(pump) = proxy.pump.take() {
+        let _ = pump.await;
+    }
+    served
 }
 
-async fn handle_create<B: Backend>(
-    mut client: UnixStream,
+/// Per-connection proxy state: the backend write half (dialed lazily so a rejected or garbage first
+/// request never opens a guest stream) and the blind response pump that owns backend→client.
+struct Proxy<B: Backend> {
     backend: Arc<B>,
-    opts: Arc<ServeOpts>,
-    buf: &[u8],
-    head_len: usize,
-) -> std::io::Result<()> {
-    let head_text = std::str::from_utf8(&buf[..head_len]).unwrap_or("");
-    let want = content_length(head_text).unwrap_or(0);
+    client_write: Arc<Mutex<OwnedWriteHalf>>,
+    upstream_write: Option<WriteHalf<B::Stream>>,
+    pump: Option<JoinHandle<()>>,
+}
 
-    // Body bytes already buffered after the head, plus whatever remains on the wire.
-    let mut body = buf[head_len..].to_vec();
-    let mut tmp = [0u8; 8192];
-    while body.len() < want {
-        let n = client.read(&mut tmp).await?;
-        if n == 0 {
-            break;
+impl<B: Backend> Proxy<B> {
+    /// The backend connection, dialed on first use. Dialing also starts the response pump, which
+    /// relays backend bytes to the client without parsing them and half-closes the client's write
+    /// side when the backend is done sending.
+    async fn upstream(&mut self) -> std::io::Result<&mut WriteHalf<B::Stream>> {
+        if self.upstream_write.is_none() {
+            let stream = self.backend.connect().await?;
+            let (mut upstream_read, upstream_write) = tokio::io::split(stream);
+            let writer = self.client_write.clone();
+            self.pump = Some(tokio::spawn(async move {
+                let mut buf = vec![0u8; 64 * 1024];
+                loop {
+                    let n = match upstream_read.read(&mut buf).await {
+                        Ok(n) if n > 0 => n,
+                        _ => break,
+                    };
+                    let mut w = writer.lock().await;
+                    if w.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+                let mut w = writer.lock().await;
+                let _ = w.shutdown().await;
+            }));
+            self.upstream_write = Some(upstream_write);
         }
-        body.extend_from_slice(&tmp[..n]);
+        Ok(self.upstream_write.as_mut().expect("upstream just dialed"))
     }
 
-    match rewrite_create_body(&body, &RewriteOpts { gpu_supported: opts.gpu_supported }) {
-        Ok(new_body) => {
-            let new_head = rebuild_head(head_text, new_body.len());
-            let mut upstream = backend.connect().await?;
-            upstream.write_all(&new_head).await?;
-            upstream.write_all(&new_body).await?;
-            splice(client, upstream).await?;
-            Ok(())
-        }
-        Err(e) => {
-            let _ = client
-                .write_all(&http_error(501, "Not Implemented", &e.to_string()))
-                .await;
-            Ok(())
+    /// The request loop: parse each request head, classify, and forward with the request body
+    /// tracked to its boundary so the next head is parsed too. Returns when the client stops
+    /// sending or the connection degrades to a raw splice (hijack / chunked tail).
+    async fn drive(&mut self, mut client_read: OwnedReadHalf, opts: &ServeOpts) -> std::io::Result<()> {
+        let mut buf: Vec<u8> = Vec::with_capacity(8192);
+        let mut tmp = [0u8; 8192];
+        loop {
+            let head_len = loop {
+                if let Some(end) = head_end(&buf) {
+                    break end;
+                }
+                if buf.len() > MAX_HEAD_BYTES {
+                    return Ok(()); // never found a head terminator; drop
+                }
+                let n = client_read.read(&mut tmp).await?;
+                if n == 0 {
+                    return Ok(()); // keep-alive close (or half-close) between requests
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            };
+            let Some(head) = parse_head(&buf) else {
+                return Ok(());
+            };
+            let head_text = std::str::from_utf8(&buf[..head_len]).unwrap_or("").to_string();
+
+            match classify(&head) {
+                Disposition::Hijack => {
+                    // The connection stops being HTTP here (attach/exec upgrade, build/pull
+                    // stream): replay what is buffered and splice the rest raw.
+                    let upstream_write = self.upstream().await?;
+                    upstream_write.write_all(&buf).await?;
+                    let _ = tokio::io::copy(&mut client_read, upstream_write).await;
+                    return Ok(());
+                }
+                Disposition::CreateRewrite => {
+                    let want = content_length(&head_text).unwrap_or(0);
+                    while buf.len() < head_len + want {
+                        let n = client_read.read(&mut tmp).await?;
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    let body_end = (head_len + want).min(buf.len());
+                    let rewrite = rewrite_create_body(
+                        &buf[head_len..body_end],
+                        &RewriteOpts { gpu_supported: opts.gpu_supported },
+                    );
+                    match rewrite {
+                        Ok(new_body) => {
+                            let new_head = rebuild_head(&head_text, new_body.len());
+                            let upstream_write = self.upstream().await?;
+                            upstream_write.write_all(&new_head).await?;
+                            upstream_write.write_all(&new_body).await?;
+                        }
+                        Err(e) => {
+                            // Written directly to the client: safe because docker clients don't
+                            // pipeline, so no backend response can be in flight for this slot.
+                            let mut w = self.client_write.lock().await;
+                            let _ = w
+                                .write_all(&http_error(501, "Not Implemented", &e.to_string()))
+                                .await;
+                            let _ = w.shutdown().await;
+                            return Ok(());
+                        }
+                    }
+                    buf.drain(..body_end);
+                }
+                Disposition::Passthrough => {
+                    if is_chunked(&head_text) {
+                        // No docker CLI flow sends a chunked passthrough body (the big streams
+                        // are hijack-classified), so rather than parse chunk framing, degrade to
+                        // a raw tail from this request on — the pre-loop behavior.
+                        let upstream_write = self.upstream().await?;
+                        upstream_write.write_all(&buf).await?;
+                        let _ = tokio::io::copy(&mut client_read, upstream_write).await;
+                        return Ok(());
+                    }
+                    let want = content_length(&head_text).unwrap_or(0);
+                    let request_end = head_len + want;
+                    if buf.len() >= request_end {
+                        let upstream_write = self.upstream().await?;
+                        upstream_write.write_all(&buf[..request_end]).await?;
+                        buf.drain(..request_end);
+                    } else {
+                        // Stream the rest of the body through without buffering it whole; bytes
+                        // past the boundary belong to the next request and stay in `buf`.
+                        let mut remaining = request_end - buf.len();
+                        let upstream_write = self.upstream().await?;
+                        upstream_write.write_all(&buf).await?;
+                        buf.clear();
+                        while remaining > 0 {
+                            let n = client_read.read(&mut tmp).await?;
+                            if n == 0 {
+                                return Ok(());
+                            }
+                            let forward = n.min(remaining);
+                            upstream_write.write_all(&tmp[..forward]).await?;
+                            remaining -= forward;
+                            if forward < n {
+                                buf.extend_from_slice(&tmp[forward..n]);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -188,6 +297,19 @@ fn content_length(head_text: &str) -> Option<usize> {
         }
     }
     None
+}
+
+fn is_chunked(head_text: &str) -> bool {
+    for line in head_text.split("\r\n") {
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("transfer-encoding")
+                && value.to_ascii_lowercase().contains("chunked")
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Rebuild the request head with a corrected `Content-Length` (the rewrite changes the body length).
@@ -226,8 +348,9 @@ mod tests {
     use std::sync::Mutex;
     use tokio::io::AsyncReadExt;
 
-    /// A backend that hands each connection to an in-memory fake dockerd which records the full
-    /// request it receives and replies 201.
+    /// A keep-alive-faithful fake dockerd: serves any number of requests per connection, parsing
+    /// each head + content-length body, recording the raw request bytes, and answering per path.
+    /// An attach request upgrades the connection: 101, then echo raw bytes until EOF.
     struct FakeDockerd {
         captured: Arc<Mutex<Vec<u8>>>,
     }
@@ -238,29 +361,96 @@ mod tests {
             let captured = self.captured.clone();
             Box::pin(async move {
                 let (ours, theirs) = UnixStream::pair()?;
-                tokio::spawn(async move {
-                    let mut s = theirs;
-                    let mut got = Vec::new();
-                    let mut tmp = [0u8; 4096];
-                    loop {
-                        let n = s.read(&mut tmp).await.unwrap_or(0);
-                        if n == 0 {
-                            break;
-                        }
-                        got.extend_from_slice(&tmp[..n]);
-                        if let Some(he) = head_end(&got) {
-                            let cl = content_length(std::str::from_utf8(&got[..he]).unwrap_or(""))
-                                .unwrap_or(0);
-                            if got.len() >= he + cl {
-                                break;
+                tokio::spawn(fake_dockerd_conn(theirs, captured));
+                Ok(ours)
+            })
+        }
+    }
+
+    async fn fake_dockerd_conn(mut s: UnixStream, captured: Arc<Mutex<Vec<u8>>>) {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            let head_len = loop {
+                if let Some(end) = head_end(&buf) {
+                    break end;
+                }
+                match s.read(&mut tmp).await {
+                    Ok(n) if n > 0 => buf.extend_from_slice(&tmp[..n]),
+                    _ => return,
+                }
+            };
+            let head_text = String::from_utf8_lossy(&buf[..head_len]).into_owned();
+            let want = content_length(&head_text).unwrap_or(0);
+            while buf.len() < head_len + want {
+                match s.read(&mut tmp).await {
+                    Ok(n) if n > 0 => buf.extend_from_slice(&tmp[..n]),
+                    _ => return,
+                }
+            }
+            let request_end = head_len + want;
+            captured.lock().unwrap().extend_from_slice(&buf[..request_end]);
+            let request_line = head_text.lines().next().unwrap_or("").to_string();
+
+            if request_line.contains("/attach") {
+                if s.write_all(b"HTTP/1.1 101 UPGRADED\r\n\r\n").await.is_err() {
+                    return;
+                }
+                let leftover = buf[request_end..].to_vec();
+                if !leftover.is_empty() {
+                    captured.lock().unwrap().extend_from_slice(&leftover);
+                    if s.write_all(&leftover).await.is_err() {
+                        return;
+                    }
+                }
+                loop {
+                    match s.read(&mut tmp).await {
+                        Ok(n) if n > 0 => {
+                            captured.lock().unwrap().extend_from_slice(&tmp[..n]);
+                            if s.write_all(&tmp[..n]).await.is_err() {
+                                return;
                             }
                         }
+                        _ => break,
                     }
-                    *captured.lock().unwrap() = got;
-                    let _ = s
-                        .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n")
-                        .await;
-                    let _ = s.shutdown().await;
+                }
+                let _ = s.shutdown().await;
+                return;
+            }
+
+            let response: &[u8] = if request_line.contains("/containers/create") {
+                b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n"
+            } else {
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
+            };
+            if s.write_all(response).await.is_err() {
+                return;
+            }
+            buf.drain(..request_end);
+        }
+    }
+
+    /// Records every byte it receives, never responds; closes on client EOF. For asserting raw-tail
+    /// forwarding where the CL-framed fake would mis-parse.
+    struct RawSink {
+        captured: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Backend for RawSink {
+        type Stream = UnixStream;
+        fn connect(&self) -> Pin<Box<dyn Future<Output = std::io::Result<UnixStream>> + Send + '_>> {
+            let captured = self.captured.clone();
+            Box::pin(async move {
+                let (ours, theirs) = UnixStream::pair()?;
+                tokio::spawn(async move {
+                    let mut s = theirs;
+                    let mut tmp = [0u8; 4096];
+                    loop {
+                        match s.read(&mut tmp).await {
+                            Ok(n) if n > 0 => captured.lock().unwrap().extend_from_slice(&tmp[..n]),
+                            _ => break,
+                        }
+                    }
                 });
                 Ok(ours)
             })
@@ -281,61 +471,170 @@ mod tests {
         addr ^ std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos() as u64).unwrap_or(0)
     }
 
-    #[tokio::test]
-    async fn create_body_is_rewritten_before_forwarding() {
+    async fn spawn_fake(gpu_supported: bool) -> (Arc<Mutex<Vec<u8>>>, std::path::PathBuf) {
         let captured = Arc::new(Mutex::new(Vec::new()));
-        let backend = Arc::new(FakeDockerd {
-            captured: captured.clone(),
-        });
+        let backend = Arc::new(FakeDockerd { captured: captured.clone() });
         let (listener, path) = bind_temp_listener().await;
-        let opts = Arc::new(ServeOpts { gpu_supported: false });
-        tokio::spawn(serve(listener, backend, opts));
+        tokio::spawn(serve(listener, backend, Arc::new(ServeOpts { gpu_supported })));
+        (captured, path)
+    }
 
-        let body = r#"{"HostConfig":{"PortBindings":{"80/tcp":[{"HostIp":"127.0.0.1","HostPort":"8080"}]}}}"#;
-        let req = format!(
+    /// Read exactly one HTTP response (head + content-length body) off the connection.
+    async fn read_response(client: &mut UnixStream) -> String {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let head_len = loop {
+            if let Some(end) = head_end(&buf) {
+                break end;
+            }
+            let n = client.read(&mut tmp).await.expect("read response");
+            assert!(n > 0, "eof before a full response head; got: {}", String::from_utf8_lossy(&buf));
+            buf.extend_from_slice(&tmp[..n]);
+        };
+        let want = content_length(std::str::from_utf8(&buf[..head_len]).unwrap_or("")).unwrap_or(0);
+        while buf.len() < head_len + want {
+            let n = client.read(&mut tmp).await.expect("read response body");
+            assert!(n > 0, "eof mid response body");
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        String::from_utf8_lossy(&buf[..head_len + want]).into_owned()
+    }
+
+    fn create_request(body: &str) -> String {
+        format!(
             "POST /v1.47/containers/create HTTP/1.1\r\nHost: d\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             body.len(),
             body
-        );
+        )
+    }
+
+    const LOOPBACK_BODY: &str =
+        r#"{"HostConfig":{"PortBindings":{"80/tcp":[{"HostIp":"127.0.0.1","HostPort":"8080"}]}}}"#;
+
+    #[tokio::test]
+    async fn create_body_is_rewritten_before_forwarding() {
+        let (captured, path) = spawn_fake(false).await;
+
         let mut client = UnixStream::connect(&path).await.unwrap();
-        client.write_all(req.as_bytes()).await.unwrap();
-        // Read the 201 so the exchange completes.
+        client.write_all(create_request(LOOPBACK_BODY).as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
         let mut resp = Vec::new();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), client.read_to_end(&mut resp)).await;
 
-        let got = captured.lock().unwrap().clone();
-        let got_text = String::from_utf8_lossy(&got);
+        let got_text = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
         assert!(got_text.contains("/containers/create"), "backend got the request");
         // The loopback HostIp must have been emptied before forwarding.
         assert!(got_text.contains("\"HostIp\":\"\""), "HostIp rewritten; got: {got_text}");
         assert!(got_text.contains("host-gateway"), "ExtraHosts injected");
+        assert!(String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 201"), "201 relayed back");
         let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
     async fn gpu_request_gets_501_and_is_not_forwarded() {
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let backend = Arc::new(FakeDockerd {
-            captured: captured.clone(),
-        });
-        let (listener, path) = bind_temp_listener().await;
-        let opts = Arc::new(ServeOpts { gpu_supported: false });
-        tokio::spawn(serve(listener, backend, opts));
+        let (captured, path) = spawn_fake(false).await;
 
         let body = r#"{"HostConfig":{"DeviceRequests":[{"Capabilities":[["gpu"]]}]}}"#;
-        let req = format!(
-            "POST /containers/create HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(),
-            body
-        );
         let mut client = UnixStream::connect(&path).await.unwrap();
-        client.write_all(req.as_bytes()).await.unwrap();
+        client.write_all(create_request(body).as_bytes()).await.unwrap();
         let mut resp = Vec::new();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), client.read_to_end(&mut resp)).await;
 
         let resp_text = String::from_utf8_lossy(&resp);
         assert!(resp_text.starts_with("HTTP/1.1 501"), "got: {resp_text}");
         assert!(captured.lock().unwrap().is_empty(), "backend must NOT be dialed for an unsupported GPU request");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE keep-alive regression (proven on hardware 2026-07-07): the docker CLI reuses one
+    /// connection for `GET /_ping` then `POST create`. The second request must still be classified
+    /// and rewritten, not spliced through raw.
+    #[tokio::test]
+    async fn keepalive_second_request_create_is_still_rewritten() {
+        let (captured, path) = spawn_fake(false).await;
+
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        client.write_all(b"GET /_ping HTTP/1.1\r\nHost: d\r\n\r\n").await.unwrap();
+        let ping = read_response(&mut client).await;
+        assert!(ping.starts_with("HTTP/1.1 200"), "ping relayed: {ping}");
+
+        client.write_all(create_request(LOOPBACK_BODY).as_bytes()).await.unwrap();
+        let create = read_response(&mut client).await;
+        assert!(create.starts_with("HTTP/1.1 201"), "create relayed: {create}");
+        client.shutdown().await.unwrap();
+
+        let got_text = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
+        assert!(got_text.contains("/_ping"), "ping reached the backend");
+        assert!(got_text.contains("\"HostIp\":\"\""), "create on the REUSED connection was rewritten; got: {got_text}");
+        assert!(got_text.contains("host-gateway"), "ExtraHosts injected on the reused connection");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn keepalive_gpu_create_after_ping_is_rejected_and_never_reaches_dockerd() {
+        let (captured, path) = spawn_fake(false).await;
+
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        client.write_all(b"GET /_ping HTTP/1.1\r\nHost: d\r\n\r\n").await.unwrap();
+        assert!(read_response(&mut client).await.starts_with("HTTP/1.1 200"));
+
+        let body = r#"{"HostConfig":{"DeviceRequests":[{"Capabilities":[["gpu"]]}]}}"#;
+        client.write_all(create_request(body).as_bytes()).await.unwrap();
+        let mut resp = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), client.read_to_end(&mut resp)).await;
+
+        assert!(String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 501"), "501 on the reused connection");
+        let got_text = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
+        assert!(got_text.contains("/_ping"), "ping reached the backend");
+        assert!(!got_text.contains("/containers/create"), "GPU create must NOT reach the backend: {got_text}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A hijack mid-connection (ping, then attach) must replay the head and splice raw with
+    /// half-close: the client's SHUT_WR after sending stdin still lets the echoed stream back.
+    #[tokio::test]
+    async fn keepalive_hijack_after_ping_splices_with_half_close() {
+        let (captured, path) = spawn_fake(false).await;
+
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        client.write_all(b"GET /_ping HTTP/1.1\r\nHost: d\r\n\r\n").await.unwrap();
+        assert!(read_response(&mut client).await.starts_with("HTTP/1.1 200"));
+
+        client
+            .write_all(b"POST /v1.47/containers/abc/attach?stream=1 HTTP/1.1\r\nHost: d\r\nUpgrade: tcp\r\nConnection: Upgrade\r\n\r\nstdin-bytes")
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut resp = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), client.read_to_end(&mut resp)).await;
+        let resp_text = String::from_utf8_lossy(&resp);
+        assert!(resp_text.contains("101 UPGRADED"), "upgrade relayed: {resp_text}");
+        assert!(resp_text.contains("stdin-bytes"), "post-upgrade bytes echoed back after client SHUT_WR: {resp_text}");
+        let got_text = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
+        assert!(got_text.contains("/attach"), "attach head reached the backend");
+        assert!(got_text.contains("stdin-bytes"), "raw hijack bytes reached the backend");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A chunked passthrough body has no boundary we track; the connection degrades to a raw tail
+    /// and every byte still reaches the backend verbatim.
+    #[tokio::test]
+    async fn chunked_passthrough_degrades_to_raw_tail() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(RawSink { captured: captured.clone() });
+        let (listener, path) = bind_temp_listener().await;
+        tokio::spawn(serve(listener, backend, Arc::new(ServeOpts { gpu_supported: false })));
+
+        let raw = b"PUT /v1.47/containers/abc/archive?path=/ HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        client.write_all(raw).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut resp = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), client.read_to_end(&mut resp)).await;
+
+        let got = captured.lock().unwrap().clone();
+        assert_eq!(got, raw.to_vec(), "chunked request forwarded byte-exact");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -375,14 +674,8 @@ mod tests {
         let (listener, path) = bind_temp_listener().await;
         tokio::spawn(serve(listener, backend, Arc::new(ServeOpts { gpu_supported: false })));
 
-        let body = r#"{"HostConfig":{"PortBindings":{"80/tcp":[{"HostIp":"127.0.0.1","HostPort":"8080"}]}}}"#;
-        let req = format!(
-            "POST /v1.47/containers/create HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(),
-            body
-        );
         let mut client = UnixStream::connect(&path).await.unwrap();
-        client.write_all(req.as_bytes()).await.unwrap();
+        client.write_all(create_request(LOOPBACK_BODY).as_bytes()).await.unwrap();
         let mut resp = Vec::new();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), client.read_to_end(&mut resp)).await;
 
