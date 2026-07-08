@@ -8,9 +8,18 @@
 import XCTest
 
 final class DoryUITests: XCTestCase {
+    private var app: XCUIApplication?
 
     override func setUpWithError() throws {
         continueAfterFailure = false
+    }
+
+    override func tearDownWithError() throws {
+        if let app, app.state != .notRunning {
+            app.terminate()
+            _ = app.wait(for: .notRunning, timeout: 5)
+        }
+        app = nil
     }
 
     @MainActor
@@ -38,6 +47,7 @@ final class DoryUITests: XCTestCase {
     private func makeApp() -> XCUIApplication {
         let app = XCUIApplication()
         app.launchEnvironment["DORY_UI_TEST"] = "1"
+        self.app = app
         return app
     }
 }

@@ -48,8 +48,10 @@ struct LSUIElementBuildSettingTests {
         let build = try repositoryFile("scripts/build.sh")
         let test = try repositoryFile("scripts/test.sh")
         let clean = try repositoryFile("scripts/clean-xcode-products.sh")
+        let uiScheme = try repositoryFile("Dory.xcodeproj/xcshareddata/xcschemes/Dory UI Tests.xcscheme")
         #expect(build.contains("scripts/clean-xcode-products.sh --strip-test-products"))
         #expect(test.components(separatedBy: "scripts/clean-xcode-products.sh").count - 1 >= 2)
+        #expect(uiScheme.components(separatedBy: "scripts/clean-xcode-products.sh").count - 1 >= 2)
         #expect(clean.contains("DoryUITests-Runner.app"))
         #expect(clean.contains("lsregister"))
         #expect(clean.contains("com\\.pythonxi\\.DoryUITests\\.xctrunner"))
@@ -57,6 +59,7 @@ struct LSUIElementBuildSettingTests {
         #expect(clean.contains("DoryTests.xctest"))
         #expect(clean.contains("com.apple.provenance"))
         #expect(clean.contains("com.apple.quarantine"))
+        #expect(!clean.contains("rm -rf \"$app\""))
     }
 
     @Test func buildScriptCanBundleHostCLIsOnCleanMacs() throws {

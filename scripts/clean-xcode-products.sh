@@ -67,7 +67,6 @@ purge_registered_test_runners() {
       *DoryUITests-Runner.app)
         unregister_launchservices "$app"
         clear_xattrs "$app"
-        rm -rf "$app"
         ;;
     esac
   done < <(registered_test_runners | sort -u)

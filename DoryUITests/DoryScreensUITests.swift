@@ -12,9 +12,17 @@ final class DoryScreensUITests: XCTestCase {
         app.launchEnvironment["DORY_UI_TEST"] = "1"
         if app.state != .notRunning {
             app.terminate()
+            _ = app.wait(for: .notRunning, timeout: 5)
         }
-        Thread.sleep(forTimeInterval: 0.5)
         app.launch()
+    }
+
+    override func tearDownWithError() throws {
+        if let app, app.state != .notRunning {
+            app.terminate()
+            _ = app.wait(for: .notRunning, timeout: 5)
+        }
+        app = nil
     }
 
     private func nav(_ id: String) {

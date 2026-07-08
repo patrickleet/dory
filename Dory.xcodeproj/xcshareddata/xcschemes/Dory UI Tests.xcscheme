@@ -29,6 +29,24 @@
       selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
       shouldUseLaunchSchemeArgsEnv = "YES"
       shouldAutocreateTestPlan = "YES">
+      <PreActions>
+         <ExecutionAction
+            ActionType = "Xcode.IDEStandardExecutionActionsCore.ExecutionActionType.ShellScriptAction">
+            <ActionContent
+               title = "Clean Dory transient Xcode products"
+               scriptText = "cd &quot;${SRCROOT}&quot;&#10;scripts/clean-xcode-products.sh&#10;">
+               <EnvironmentBuildable>
+                  <BuildableReference
+                     BuildableIdentifier = "primary"
+                     BlueprintIdentifier = "3E705CEE2FE37C790094B33C"
+                     BuildableName = "Dory.app"
+                     BlueprintName = "Dory"
+                     ReferencedContainer = "container:Dory.xcodeproj">
+                  </BuildableReference>
+               </EnvironmentBuildable>
+            </ActionContent>
+         </ExecutionAction>
+      </PreActions>
       <Testables>
          <TestableReference
             skipped = "NO">
@@ -50,6 +68,24 @@
             ReferencedContainer = "container:Dory.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
+      <PostActions>
+         <ExecutionAction
+            ActionType = "Xcode.IDEStandardExecutionActionsCore.ExecutionActionType.ShellScriptAction">
+            <ActionContent
+               title = "Clean Dory transient Xcode products"
+               scriptText = "cd &quot;${SRCROOT}&quot;&#10;scripts/clean-xcode-products.sh&#10;">
+               <EnvironmentBuildable>
+                  <BuildableReference
+                     BuildableIdentifier = "primary"
+                     BlueprintIdentifier = "3E705CEE2FE37C790094B33C"
+                     BuildableName = "Dory.app"
+                     BlueprintName = "Dory"
+                     ReferencedContainer = "container:Dory.xcodeproj">
+                  </BuildableReference>
+               </EnvironmentBuildable>
+            </ActionContent>
+         </ExecutionAction>
+      </PostActions>
    </TestAction>
    <LaunchAction
       buildConfiguration = "Debug"
