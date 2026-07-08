@@ -98,6 +98,9 @@
 **Networking that disappears**
 - Published ports on `localhost`, automatic **`*.dory.local` domains** for every container, and
   local **HTTPS** issued by a local CA. All consent-gated, nothing installed silently.
+- While `doryd` is running it reconciles container domains, loopback routes, low-port redirects,
+  and machine routes for assigned VM addresses, so the app does not need to stay open for local
+  networking.
 - Internal guest control ports stay private; only Docker-published ports and explicit Dory routes
   are exposed on macOS loopback.
 - **Apple GPU AI bridge**: run Metal-backed services on macOS, such as Ollama, LM Studio, MLX, or

@@ -94,27 +94,6 @@ struct NetworkingTests {
         #expect(AppStore.machineDNSHosts(machines, suffix: "dory.local") == ["dev.dory.local": "172.17.0.5"])
     }
 
-    @Test func dorydRoutesConvertPublishedPortsAndMachineHosts() {
-        let routes = AppStore.dorydRoutes(
-            containerEndpoints: [
-                "Web.dory.local.": 8080,
-                "root.dory.local": 80,
-                "too-high.dory.local": 70_000,
-                "zero.dory.local": 0,
-            ],
-            machineHosts: [
-                "dev.dory.local": "172.17.0.5",
-                "bad.dory.local": "not-an-ip",
-            ]
-        )
-
-        #expect(routes == [
-            DorydDomainRoute(hostname: "dev.dory.local", address: "172.17.0.5", port: 80),
-            DorydDomainRoute(hostname: "root.dory.local", address: "127.0.0.1", port: 60_080),
-            DorydDomainRoute(hostname: "web.dory.local", address: "127.0.0.1", port: 8080),
-        ])
-    }
-
     @Test func lowPublishedPortsUseHighLoopbackBackends() {
         #expect(AppStore.effectivePublishedPort(80) == 60_080)
         #expect(AppStore.effectivePublishedPort(443) == 60_443)

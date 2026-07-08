@@ -51,9 +51,23 @@ let dockerTier = dorydEnvironment.dockerTierConfiguration().map {
 }
 let machineManager = dorydEnvironment.machineManagerConfiguration().map { MachineManager(configuration: $0) }
 let remoteManager = RemoteMachineManager()
-let networkingController = dorydEnvironment.networkingConfiguration().map(NetworkingController.init(configuration:))
+let networkingConfiguration = dorydEnvironment.networkingConfiguration()
+let networkingController = networkingConfiguration.map(NetworkingController.init(configuration:))
 let incidentPath = env["DORY_INCIDENTS"] ?? "\(dorydEnvironment.home)/.dory/incidents.jsonl"
 let incidentWriter = IncidentWriter(path: incidentPath)
+let networkRouteReconciler = networkingController.map { controller in
+    NetworkRouteReconciler(
+        networkingController: controller,
+        suffix: networkingConfiguration?.suffix ?? "dory.local",
+        containerProvider: {
+            dockerTier?.containerSummariesForIdle() ?? .ok([])
+        },
+        machineProvider: {
+            machineManager?.list() ?? []
+        },
+        interval: dorydEnvironment.networkRouteReconcileIntervalSeconds
+    )
+}
 let dnsTargets = wakeDNSProbeTargets(env["DORYD_WAKE_DNS_PROBES"])
 var sleepHandlers: [HostSleepHandling] = []
 var clockSyncers: [WakeClockSyncing] = []
@@ -132,6 +146,7 @@ private let shutdownCoordinator = DorydShutdownCoordinator(
     hostCLIReconciler: hostCLIReconciler,
     idleSleepScheduler: idleSleepScheduler,
     wakeCoordinator: wakeCoordinator,
+    networkRouteReconciler: networkRouteReconciler,
     networkingController: networkingController,
     dockerTier: dockerTier,
     machineManager: machineManager,
@@ -160,8 +175,10 @@ do {
 if let networkingController {
     do {
         try networkingController.start()
+        let routeCount = networkRouteReconciler?.reconcileNow().count ?? 0
+        networkRouteReconciler?.start()
         let status = networkingController.status()
-        FileHandle.standardError.write(Data("doryd: DNS serving \(status.suffix) on \(status.dnsBindAddress):\(status.dnsPort)\n".utf8))
+        FileHandle.standardError.write(Data("doryd: DNS serving \(status.suffix) on \(status.dnsBindAddress):\(status.dnsPort), \(routeCount) route(s)\n".utf8))
     } catch {
         incidentWriter.record(type: "network.dns_failed", detail: "\(error)")
         FileHandle.standardError.write(Data("doryd: DNS unavailable: \(error)\n".utf8))
@@ -175,6 +192,7 @@ private final class DorydShutdownCoordinator {
     private let hostCLIReconciler: HostCLIReconciler?
     private let idleSleepScheduler: IdleSleepScheduler?
     private let wakeCoordinator: HostWakeCoordinator
+    private let networkRouteReconciler: NetworkRouteReconciler?
     private let networkingController: NetworkingController?
     private let dockerTier: DockerTier?
     private let machineManager: MachineManager?
@@ -187,6 +205,7 @@ private final class DorydShutdownCoordinator {
         hostCLIReconciler: HostCLIReconciler?,
         idleSleepScheduler: IdleSleepScheduler?,
         wakeCoordinator: HostWakeCoordinator,
+        networkRouteReconciler: NetworkRouteReconciler?,
         networkingController: NetworkingController?,
         dockerTier: DockerTier?,
         machineManager: MachineManager?,
@@ -196,6 +215,7 @@ private final class DorydShutdownCoordinator {
         self.hostCLIReconciler = hostCLIReconciler
         self.idleSleepScheduler = idleSleepScheduler
         self.wakeCoordinator = wakeCoordinator
+        self.networkRouteReconciler = networkRouteReconciler
         self.networkingController = networkingController
         self.dockerTier = dockerTier
         self.machineManager = machineManager
@@ -216,6 +236,7 @@ private final class DorydShutdownCoordinator {
         hostCLIReconciler?.stop()
         idleSleepScheduler?.stop()
         wakeCoordinator.stop()
+        networkRouteReconciler?.stop()
         networkingController?.stop()
         remoteManager.disconnectAll()
         machineManager?.stopAll()

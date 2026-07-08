@@ -186,6 +186,23 @@ final class DorydConfigurationTests: XCTestCase {
         )
     }
 
+    func testNetworkRouteReconcileIntervalDefaultsToFiveSecondsAndClamps() {
+        XCTAssertEqual(
+            DorydEnvironment(values: [:], home: "/tmp/doryd-home").networkRouteReconcileIntervalSeconds,
+            5
+        )
+        XCTAssertEqual(
+            DorydEnvironment(values: ["DORYD_NETWORK_ROUTE_RECONCILE_SECONDS": "0.5"], home: "/tmp/doryd-home")
+                .networkRouteReconcileIntervalSeconds,
+            1
+        )
+        XCTAssertEqual(
+            DorydEnvironment(values: ["DORYD_NETWORK_ROUTE_RECONCILE_SECONDS": "2"], home: "/tmp/doryd-home")
+                .networkRouteReconcileIntervalSeconds,
+            2
+        )
+    }
+
     func testNetworkingConfigurationIsOptInAndHighPortOnly() throws {
         XCTAssertNil(DorydEnvironment(values: [:], home: "/tmp/doryd-home", cwd: "/tmp").networkingConfiguration())
 

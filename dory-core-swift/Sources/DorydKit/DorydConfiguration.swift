@@ -92,6 +92,10 @@ public struct DorydEnvironment: Sendable {
         max(30, double("DORYD_HOST_CLI_RECONCILE_SECONDS") ?? 300)
     }
 
+    public var networkRouteReconcileIntervalSeconds: TimeInterval {
+        max(1, double("DORYD_NETWORK_ROUTE_RECONCILE_SECONDS") ?? 5)
+    }
+
     public func machineManagerConfiguration() -> MachineManagerConfiguration? {
         guard let helper = executablePath(firstOf: ["DORYD_VMM_HELPER", "DORY_VMM_HELPER"], fallbackCandidates: helperCandidates(named: "dory-vmm")) else {
             return nil

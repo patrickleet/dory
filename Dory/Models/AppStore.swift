@@ -891,29 +891,18 @@ final class AppStore {
     @ObservationIgnored private let reverseProxy: DoryReverseProxy
     private var networkingStarted = false
     var localNetworkingActiveForTests: Bool { networkingStarted }
-    @ObservationIgnored private var dorydContainerEndpoints: [String: Int] = [:]
     private var portForwardingTask: Task<Void, Never>?
 
 
-    /// On the shared VM, published container ports live on the VM's IP, not the host. This keeps a
-    /// host-side forwarder + `*.dory.local` reverse proxy reconciled so every published port is
-    /// reachable at `localhost:port` AND `http://<name>.dory.local` — OrbStack behavior. A no-op
-    /// (and torn down) on other backends, where the host already owns the ports.
+    /// On the shared VM, published container ports live on the VM's IP, not the host. Legacy
+    /// app-managed engines keep a host-side forwarder + `*.dory.local` reverse proxy reconciled
+    /// here. The doryd-managed engine owns route reconciliation inside the daemon.
     func startPortForwarding() {
         portForwardingTask?.cancel()
         guard runtimeKind == .sharedVM else { portForwarder.stopAll(); stopLocalNetworking(); return }
         if runtimeOwnedByDoryd {
             portForwarder.stopAll()
             stopLocalNetworking()
-            let runtime = self.runtime
-            let suffix = self.domainSuffix
-            portForwardingTask = Task { [weak self] in
-                while !Task.isCancelled {
-                    let endpoints = await Self.containerEndpoints(runtime, suffix: suffix)
-                    await self?.publishDorydNetworkRoutes(containerEndpoints: endpoints)
-                    try? await Task.sleep(for: .seconds(3))
-                }
-            }
             return
         }
         startLocalNetworking()
@@ -1010,7 +999,6 @@ final class AppStore {
         if suffixChanged {
             domainTable.replaceContainers([:])
             domainTable.replaceKube([:])
-            dorydContainerEndpoints = [:]
             dns = DoryDNS(suffix: self.domainSuffix)
         }
         startPortForwarding()
@@ -1022,12 +1010,8 @@ final class AppStore {
     private func refreshDorydLaunchAgentForNetworkingSettings() {
         guard dorydClient.usesMachService else { return }
         let configuration = dorydLaunchAgentConfiguration()
-        Task { [weak self] in
-            let ok = await DorydLaunchAgent.ensureCurrent(configuration: configuration)
-            guard ok, let self else { return }
-            if self.runtimeOwnedByDoryd {
-                await self.publishDorydNetworkRoutes()
-            }
+        Task {
+            _ = await DorydLaunchAgent.ensureCurrent(configuration: configuration)
         }
     }
 
@@ -1176,44 +1160,6 @@ final class AppStore {
         return result
     }
 
-    nonisolated static func dorydRoutes(
-        containerEndpoints: [String: Int],
-        machineHosts: [String: String]
-    ) -> [DorydDomainRoute] {
-        var routes: [String: DorydDomainRoute] = [:]
-        for (rawHost, port) in containerEndpoints {
-            guard let backendPort = UInt16(exactly: effectivePublishedPort(port)), backendPort > 0 else { continue }
-            let host = DoryDNS.normalizeHost(rawHost)
-            guard !host.isEmpty else { continue }
-            routes[host] = DorydDomainRoute(hostname: host, address: "127.0.0.1", port: backendPort)
-        }
-        for (rawHost, address) in machineHosts {
-            let host = DoryDNS.normalizeHost(rawHost)
-            guard !host.isEmpty, DoryDNS.ipv4Bytes(address) != nil else { continue }
-            routes[host] = DorydDomainRoute(hostname: host, address: address, port: 80)
-        }
-        return routes.values.sorted {
-            if $0.hostname == $1.hostname { return $0.address < $1.address }
-            return $0.hostname < $1.hostname
-        }
-    }
-
-    private func publishDorydNetworkRoutes(containerEndpoints: [String: Int]? = nil) async {
-        if let containerEndpoints { dorydContainerEndpoints = containerEndpoints }
-        let routes = Self.dorydRoutes(
-            containerEndpoints: dorydContainerEndpoints,
-            machineHosts: Self.machineDNSHosts(machines, suffix: domainSuffix)
-        )
-        do {
-            let result = try await dorydClient.networkReplaceRoutes(routes)
-            if !result.ok {
-                actionError = result.message.isEmpty ? "doryd could not update local domain routes." : result.message
-            }
-        } catch {
-            actionError = "doryd networking is unavailable: \(error)"
-        }
-    }
-
     func authorizeLocalNetworking() async {
         guard runtimeOwnedByDoryd else {
             networkingAuthorizationMessage = "Start Dory's daemon-managed engine before authorizing local domains."
@@ -1239,7 +1185,6 @@ final class AppStore {
             let result = await Shell.runAsyncResult("/usr/bin/osascript", ["-e", script])
             if result.exit == 0 {
                 networkingAuthorizationMessage = "Dory networking is authorized for \(plan.suffix). \(Self.networkingAuthorizationSummary(plan))"
-                await publishDorydNetworkRoutes()
             } else {
                 let output = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
                 networkingAuthorizationMessage = output.isEmpty ? "Local domain authorization was cancelled or failed." : output
@@ -2764,7 +2709,6 @@ final class AppStore {
             machines = try await dorydClient.machineList().map {
                 Self.machine(fromDoryd: $0, domainSuffix: domainSuffix)
             }
-            await publishDorydNetworkRoutes()
             return machines
         } catch {
             actionError = "doryd machine list failed: \(error)"
