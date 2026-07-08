@@ -171,13 +171,13 @@ struct MachineComposerView: View {
             }
             VStack(alignment: .leading, spacing: 6) {
                 fieldLabel("ADDRESS")
-                TextField(defaultAddress, text: $address)
+                TextField("192.168.215.42", text: $address)
                     .textFieldStyle(.plain).font(.mono(12.5)).foregroundStyle(p.text)
                     .padding(.horizontal, 10).padding(.vertical, 7)
                     .frame(width: 260)
                     .background(p.bgInput, in: RoundedRectangle(cornerRadius: 8))
                     .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(p.border))
-                Text("Leave blank to use \(defaultAddress).")
+                Text("Optional IPv4 address published as \(dnsName).")
                     .font(.system(size: 11)).foregroundStyle(p.text3)
             }
             if nameInvalid {
@@ -292,9 +292,9 @@ struct MachineComposerView: View {
         Task { _ = await store.createMachine(image: "ubuntu:24.04", name: machineName, arch: .host, recipe: recipe, settings: settings, identity: identity) }
     }
 
-    private var defaultAddress: String {
+    private var dnsName: String {
         let trimmedName = name.trimmingCharacters(in: .whitespaces)
-        return AppStore.defaultMachineAddress(name: trimmedName.isEmpty ? "machine" : trimmedName, suffix: store.domainSuffix)
+        return AppStore.machineDNSName(name: trimmedName.isEmpty ? "machine" : trimmedName, suffix: store.domainSuffix)
     }
 
     private var trimmedAddress: String? {

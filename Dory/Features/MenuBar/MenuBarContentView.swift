@@ -346,7 +346,7 @@ struct MenuBarContentView: View {
                             if let command = store.machineTerminalCommand(machine) {
                                 Button("Copy Command") { copy(command) }
                             }
-                            Button("Copy Address") { copy(machine.ip) }
+                            Button(DoryDNS.ipv4Bytes(machine.ip) != nil ? "Copy Address" : "Copy DNS Name") { copy(machine.ip) }
                             Button("Edit Address") {
                                 store.openMachineEdit(machine)
                                 openSection(.machines)

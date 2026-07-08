@@ -540,6 +540,7 @@ nonisolated final class DorydClient: @unchecked Sendable {
         memoryMB: UInt64? = nil,
         cpuCount: Int? = nil,
         address: String? = nil,
+        updatesAddress: Bool = false,
         shares: [DorydMachineShareConfiguration]? = nil
     ) async throws -> DorydMachineStatus {
         var config: [String: Any] = [:]
@@ -549,7 +550,9 @@ nonisolated final class DorydClient: @unchecked Sendable {
         if let cpuCount {
             config["cpuCount"] = cpuCount
         }
-        if let address {
+        if updatesAddress {
+            config["address"] = address ?? ""
+        } else if let address {
             config["address"] = address
         }
         if let shares {

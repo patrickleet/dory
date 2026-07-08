@@ -159,7 +159,7 @@ final class MachineManagerTests: XCTestCase {
             rootfsPath: "/tmp/rootfs",
             memoryMB: 2048,
             cpuCount: 2,
-            address: "Dev.Dory.Local"
+            address: "192.168.215.40"
         ))
         _ = try manager.start(id: "dev")
 
@@ -167,7 +167,7 @@ final class MachineManagerTests: XCTestCase {
             id: "dev",
             memoryMB: 4096,
             cpuCount: 4,
-            address: "Workstation.Dory.Local",
+            address: "192.168.215.41",
             updatesAddress: true,
             shares: [
                 DoryMachineShareConfiguration(tag: "src", hostPath: share, guestPath: "/workspace/src"),
@@ -178,7 +178,7 @@ final class MachineManagerTests: XCTestCase {
         XCTAssertEqual(updated.state, .running)
         XCTAssertEqual(updated.memoryMB, 4096)
         XCTAssertEqual(updated.cpuCount, 4)
-        XCTAssertEqual(updated.address, "workstation.dory.local")
+        XCTAssertEqual(updated.address, "192.168.215.41")
         XCTAssertEqual(updated.shares, [
             DoryMachineShareConfiguration(tag: "src", hostPath: share, guestPath: "/workspace/src"),
         ])
@@ -188,10 +188,31 @@ final class MachineManagerTests: XCTestCase {
         )
         XCTAssertEqual(stored.memoryMB, 4096)
         XCTAssertEqual(stored.cpuCount, 4)
-        XCTAssertEqual(stored.address, "workstation.dory.local")
+        XCTAssertEqual(stored.address, "192.168.215.41")
         XCTAssertEqual(stored.shares, [
             DoryMachineShareConfiguration(tag: "src", hostPath: share, guestPath: "/workspace/src"),
         ])
+    }
+
+    func testRejectsNonIPv4MachineAddress() throws {
+        let base = "/tmp/dory-machine-address-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        defer { try? FileManager.default.removeItem(atPath: base) }
+        let manager = MachineManager(configuration: MachineManagerConfiguration(
+            vmmExecutablePath: "/bin/sleep",
+            stateDirectory: base,
+            baseArguments: ["30"],
+            passMachineArguments: false,
+            requiresReadyHandoff: false
+        ))
+
+        XCTAssertThrowsError(try manager.create(DoryMachineConfiguration(
+            id: "dev",
+            kernelPath: "/tmp/kernel",
+            rootfsPath: "/tmp/rootfs",
+            address: "dev.dory.local"
+        ))) { error in
+            XCTAssertEqual(error as? MachineManagerError, .invalidAddress("dev.dory.local"))
+        }
     }
 
     func testCreateClonesRootfsIntoPerMachineStateDirectory() throws {

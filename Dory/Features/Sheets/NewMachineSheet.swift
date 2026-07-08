@@ -359,8 +359,8 @@ struct NewMachineSheet: View {
             }
             VStack(alignment: .leading, spacing: 9) {
                 sectionLabel("ADDRESS")
-                fieldInput(defaultAddress, text: $address, width: 260)
-                Text("Leave blank to use \(defaultAddress).")
+                fieldInput("192.168.215.42", text: $address, width: 260)
+                Text("Optional IPv4 address published as \(dnsName).")
                     .font(.system(size: 11)).foregroundStyle(p.text3)
             }
         }
@@ -626,9 +626,9 @@ struct NewMachineSheet: View {
         "\(family.id)-\(String(UUID().uuidString.prefix(4).lowercased()))"
     }
 
-    private var defaultAddress: String {
+    private var dnsName: String {
         let trimmedName = name.trimmingCharacters(in: .whitespaces)
-        return AppStore.defaultMachineAddress(name: trimmedName.isEmpty ? "machine" : trimmedName, suffix: store.domainSuffix)
+        return AppStore.machineDNSName(name: trimmedName.isEmpty ? "machine" : trimmedName, suffix: store.domainSuffix)
     }
 
     private var trimmedAddress: String? {

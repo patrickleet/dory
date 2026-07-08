@@ -1466,7 +1466,7 @@ final class AppStore {
 
     static func kubeErrorText(_ error: KubeError) -> String {
         switch error {
-        case .kubectlMissing: "kubectl not found — install it (brew install kubectl)."
+        case .kubectlMissing: "kubectl not found in Dory's bundled tools. Restart Dory so doryd can repair terminal integration, or reinstall the app bundle."
         case .nonZero(_, let stderr): stderr.trimmingCharacters(in: .whitespacesAndNewlines)
         case .decode: "Could not read the cluster response."
         }
@@ -2481,7 +2481,7 @@ final class AppStore {
     func applyKubernetesYAML(_ yaml: String) async -> String? {
         guard runtimeKind == .sharedVM else { return "Enable Kubernetes on Dory's shared VM first" }
         guard !yaml.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return "Paste or open a YAML manifest" }
-        guard let kubectl = KubeServiceProxy.kubectl() else { return "kubectl not found — install it (brew install kubectl) to apply manifests" }
+        guard let kubectl = KubeServiceProxy.kubectl() else { return "kubectl not found in Dory's bundled tools. Restart Dory so doryd can repair terminal integration, or reinstall the app bundle." }
         let kubeconfig = NSHomeDirectory() + "/.kube/dory-config"
         let result: String? = await Task.detached {
             Self.runKubectlApply(kubectl: kubectl, kubeconfig: kubeconfig, yaml: yaml)
@@ -2717,7 +2717,7 @@ final class AppStore {
         }
     }
 
-    nonisolated static func defaultMachineAddress(name: String, suffix: String) -> String {
+    nonisolated static func machineDNSName(name: String, suffix: String) -> String {
         "\(name).\(suffix)".lowercased()
     }
 
@@ -2747,7 +2747,7 @@ final class AppStore {
             status: runState,
             cpuPercent: 0,
             memoryDisplay: status.memoryMB.map { "\($0) MB" } ?? "—",
-            ip: status.address ?? Self.defaultMachineAddress(name: status.id, suffix: domainSuffix),
+            ip: status.address ?? Self.machineDNSName(name: status.id, suffix: domainSuffix),
             letter: "D",
             badgeHex: 0x3B82F6,
             containerID: "",
@@ -3044,7 +3044,6 @@ final class AppStore {
 
     private func createDorydMachine(name: String, settings: MachineSettings, recipe: DevRecipe?) async -> String? {
         let address = Self.trimmedNonEmpty(settings.address)
-            ?? Self.defaultMachineAddress(name: name, suffix: domainSuffix)
         guard let config = Self.dorydMachineConfiguration(name: name, settings: settings, environment: environment, address: address) else {
             let message = "Set DORYD_MACHINE_KERNEL and DORYD_MACHINE_ROOTFS to create doryd VM machines from the app."
             actionError = message
@@ -3111,12 +3110,12 @@ final class AppStore {
             let cpus = settings.cpus ?? current?.cpuCount
             let address = Self.trimmedNonEmpty(settings.address)
                 ?? current?.address
-                ?? Self.defaultMachineAddress(name: machine.name, suffix: domainSuffix)
             _ = try await dorydClient.machineUpdate(
                 machine.name,
                 memoryMB: memory,
                 cpuCount: cpus,
                 address: address,
+                updatesAddress: true,
                 shares: Self.dorydShares(from: settings.mounts)
             )
             appendMachineCreationLog("Settings applied to doryd VM definition.")

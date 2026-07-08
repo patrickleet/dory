@@ -98,6 +98,7 @@ private struct MachineCard: View {
     @State private var confirmingDelete = false
 
     private var isRunning: Bool { machine.status == .running }
+    private var hasAssignedAddress: Bool { DoryDNS.ipv4Bytes(machine.ip) != nil }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -124,7 +125,7 @@ private struct MachineCard: View {
                 metric("CPU", isRunning ? String(format: "%.1f%%", machine.cpuPercent) : "—")
                 metric("MEMORY", isRunning ? machine.memoryDisplay : "—")
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("ADDRESS").font(.system(size: 10, weight: .semibold)).foregroundStyle(p.text3).tracking(0.4)
+                    Text(hasAssignedAddress ? "ADDRESS" : "DNS NAME").font(.system(size: 10, weight: .semibold)).foregroundStyle(p.text3).tracking(0.4)
                     Text(machine.ip).font(.mono(12.5, weight: .semibold)).foregroundStyle(isRunning ? p.accentText : p.text3).lineLimit(1)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -351,7 +352,7 @@ private struct MachineEditSheet: View {
         let settings = await store.machineSettings(machine.name)
         cpus = max(1, min(8, settings.cpus ?? 4))
         memoryGB = max(1, min(16, settings.memoryMB.map { $0 / 1024 } ?? 4))
-        address = settings.address ?? machine.ip
+        address = settings.address ?? ""
         mountRows = settings.mounts.map { MountRow(host: $0.host, guest: $0.guest, readOnly: $0.readOnly) }
     }
 
@@ -404,8 +405,8 @@ private struct MachineEditSheet: View {
     private var addressBlock: some View {
         VStack(alignment: .leading, spacing: 8) {
             sectionLabel("ADDRESS")
-            fieldInput("\(machine.name).dory.local", text: $address, width: 260)
-            Text("Use a hostname such as \(machine.name).dory.local for terminal access and local DNS.")
+            fieldInput("192.168.215.42", text: $address, width: 260)
+            Text("IPv4 address published as \(machine.name).dory.local. Leave blank to clear.")
                 .font(.system(size: 11)).foregroundStyle(p.text3)
         }
     }

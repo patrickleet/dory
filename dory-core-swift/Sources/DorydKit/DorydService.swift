@@ -748,13 +748,15 @@ private struct MachineUpdateRequest {
     init(xpcDictionary dictionary: NSDictionary) throws {
         self.memoryMB = try dictionary.optionalUInt64("memoryMB")
         self.cpuCount = try dictionary.optionalInt("cpuCount")
-        self.address = dictionary.optionalString("address")
         self.updatesAddress = dictionary["address"] != nil
+        if updatesAddress {
+            let trimmedAddress = dictionary.optionalString("address")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            self.address = trimmedAddress.isEmpty ? nil : trimmedAddress
+        } else {
+            self.address = nil
+        }
         self.shares = dictionary["shares"] == nil ? nil : try dictionary.optionalMachineShares("shares")
         self.updatesShares = dictionary["shares"] != nil
-        if let address, address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            throw XPCRemoteConfigError.invalid("address")
-        }
         if memoryMB == nil, cpuCount == nil, !updatesAddress, !updatesShares {
             throw XPCRemoteConfigError.invalid("config")
         }

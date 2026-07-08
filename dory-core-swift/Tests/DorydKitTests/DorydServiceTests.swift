@@ -812,11 +812,11 @@ final class DorydServiceTests: XCTestCase {
             "rootfsPath": "/tmp/rootfs",
             "memoryMB": 1024,
             "cpuCount": 2,
-            "address": "dev.dory.local",
+            "address": "192.168.215.40",
         ]) { ok, body, message in
             XCTAssertTrue(ok, message)
             XCTAssertEqual(body["state"] as? String, "created")
-            XCTAssertEqual(body["address"] as? String, "dev.dory.local")
+            XCTAssertEqual(body["address"] as? String, "192.168.215.40")
             create.fulfill()
         }
         wait(for: [create], timeout: 5)
@@ -835,7 +835,7 @@ final class DorydServiceTests: XCTestCase {
             XCTAssertEqual(message, "")
             let statuses = body as? [NSDictionary]
             XCTAssertEqual(statuses?.first?["id"] as? String, "dev")
-            XCTAssertEqual(statuses?.first?["address"] as? String, "dev.dory.local")
+            XCTAssertEqual(statuses?.first?["address"] as? String, "192.168.215.40")
             list.fulfill()
         }
         wait(for: [list], timeout: 5)
@@ -852,7 +852,7 @@ final class DorydServiceTests: XCTestCase {
         proxy.machineUpdate("dev", config: [
             "memoryMB": UInt64(4096),
             "cpuCount": 4,
-            "address": "work.dory.local",
+            "address": "192.168.215.41",
             "shares": [
                 [
                     "tag": "src",
@@ -866,7 +866,7 @@ final class DorydServiceTests: XCTestCase {
             XCTAssertEqual(body["state"] as? String, "stopped")
             XCTAssertEqual((body["memoryMB"] as? NSNumber)?.uint64Value, 4096)
             XCTAssertEqual((body["cpuCount"] as? NSNumber)?.intValue, 4)
-            XCTAssertEqual(body["address"] as? String, "work.dory.local")
+            XCTAssertEqual(body["address"] as? String, "192.168.215.41")
             let shares = body["shares"] as? [NSDictionary]
             XCTAssertEqual(shares?.first?["hostPath"] as? String, share)
             XCTAssertEqual(shares?.first?["guestPath"] as? String, "/workspace/src")
@@ -874,6 +874,16 @@ final class DorydServiceTests: XCTestCase {
             update.fulfill()
         }
         wait(for: [update], timeout: 5)
+
+        let clearAddress = expectation(description: "machineUpdate clear address reply")
+        proxy.machineUpdate("dev", config: [
+            "address": "",
+        ]) { ok, body, message in
+            XCTAssertTrue(ok, message)
+            XCTAssertNil(body["address"])
+            clearAddress.fulfill()
+        }
+        wait(for: [clearAddress], timeout: 5)
 
         let delete = expectation(description: "machineDelete reply")
         proxy.machineDelete("dev") { ok, message in

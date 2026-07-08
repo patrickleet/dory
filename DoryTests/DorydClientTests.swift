@@ -102,7 +102,7 @@ struct DorydClientTests {
             rootfsPath: "/tmp/rootfs",
             memoryMB: 2048,
             cpuCount: 2,
-            address: "dev.dory.local",
+            address: "192.168.215.40",
             shares: [
                 DorydMachineShareConfiguration(tag: "src", hostPath: "/Users/me/src", guestPath: "/workspace/src", readOnly: true),
             ]
@@ -123,7 +123,7 @@ struct DorydClientTests {
         let importedSnapshot = try await client.machineImportSnapshot(from: "/tmp/dev.dorymachine")
         let deletedSnapshot = try await client.machineDeleteSnapshot(machineID: "dev", snapshotID: "s1")
         let stoppedMachine = try await client.machineStop("dev")
-        let updatedMachine = try await client.machineUpdate("dev", memoryMB: 4096, cpuCount: 4, address: "work.dory.local")
+        let updatedMachine = try await client.machineUpdate("dev", memoryMB: 4096, cpuCount: 4, address: "192.168.215.41")
         let machines = try await client.machineList()
         let deletedMachine = try await client.machineDelete("dev")
         let remoteInfo = try await client.remoteConnect(DorydRemoteMachineConfiguration(
@@ -178,7 +178,7 @@ struct DorydClientTests {
         #expect(startedMachine.pid == 1234)
         #expect(startedMachine.agentBuild == "agent-test")
         #expect(startedMachine.agentSocketPath == "/tmp/agent.sock")
-        #expect(startedMachine.address == "dev.dory.local")
+        #expect(startedMachine.address == "192.168.215.40")
         #expect(startedMachine.shares == [
             DorydMachineShareConfiguration(tag: "src", hostPath: "/Users/me/src", guestPath: "/workspace/src", readOnly: true),
         ])
@@ -197,7 +197,7 @@ struct DorydClientTests {
         #expect(stoppedMachine.state == "stopped")
         #expect(updatedMachine.memoryMB == 4096)
         #expect(updatedMachine.cpuCount == 4)
-        #expect(updatedMachine.address == "work.dory.local")
+        #expect(updatedMachine.address == "192.168.215.41")
         #expect(machines.map(\.id) == ["dev", "dev-copy"])
         #expect(deletedMachine == DorydCommandResult(ok: true, message: ""))
         #expect(remoteInfo.agentBuild == "remote-agent")
@@ -359,7 +359,7 @@ struct DorydClientTests {
         #expect(machine.distro == "Dory VM")
         #expect(machine.status == .running)
         #expect(machine.memoryDisplay == "2048 MB")
-        #expect(machine.ip == "dev.dory.local")
+        #expect(machine.ip == "192.168.215.40")
         #expect(machine.mounts == [MountPair(host: "/Users/me/src", guest: "/workspace/src", readOnly: true)])
         #expect(machine.containerID.isEmpty)
         #expect(store.machineTerminalCommand(machine)?.contains("dorydctl") == true)
@@ -368,7 +368,7 @@ struct DorydClientTests {
         let currentSettings = await store.machineSettings(machine.name)
         #expect(currentSettings.cpus == 2)
         #expect(currentSettings.memoryMB == 2048)
-        #expect(currentSettings.address == "dev.dory.local")
+        #expect(currentSettings.address == "192.168.215.40")
         #expect(currentSettings.mounts == [MountPair(host: "/Users/me/src", guest: "/workspace/src", readOnly: true)])
 
         store.toggleMachine(machine)
@@ -391,7 +391,7 @@ struct DorydClientTests {
                 cpus: 4,
                 memoryMB: 4096,
                 mounts: [MountPair(host: "/Users/me/app", guest: "/workspace/app")],
-                address: "work.dory.local"
+                address: "192.168.215.41"
             )
         )
         #expect(editResult == nil)
@@ -400,7 +400,7 @@ struct DorydClientTests {
         }
         #expect((service.latestMachineUpdateConfig?["memoryMB"] as? NSNumber)?.uint64Value == 4096)
         #expect((service.latestMachineUpdateConfig?["cpuCount"] as? NSNumber)?.intValue == 4)
-        #expect(service.latestMachineUpdateConfig?["address"] as? String == "work.dory.local")
+        #expect(service.latestMachineUpdateConfig?["address"] as? String == "192.168.215.41")
         let updateShares = try #require(service.latestMachineUpdateConfig?["shares"] as? [NSDictionary])
         #expect(updateShares.first?["hostPath"] as? String == "/Users/me/app")
         #expect(updateShares.first?["guestPath"] as? String == "/workspace/app")
@@ -525,7 +525,7 @@ struct DorydClientTests {
         #expect(config["rootfsPath"] as? String == "/vm/rootfs.raw")
         #expect((config["memoryMB"] as? NSNumber)?.uint64Value == 3072)
         #expect((config["cpuCount"] as? NSNumber)?.intValue == 3)
-        #expect(config["address"] as? String == "vmdev.dory.local")
+        #expect(config["address"] == nil)
         let createShares = try #require(config["shares"] as? [NSDictionary])
         #expect(createShares.first?["hostPath"] as? String == "/Users/me/project")
         #expect(createShares.first?["guestPath"] as? String == "/workspace/project")
@@ -739,7 +739,7 @@ private final class FakeDorydService: NSObject, DorydControlXPC {
             pid: 1234,
             agentBuild: "agent-test",
             handoffFDCount: 2,
-            address: "dev.dory.local",
+            address: "192.168.215.40",
             shares: [
                 [
                     "tag": "src",
@@ -983,7 +983,7 @@ private final class FakeDorydService: NSObject, DorydControlXPC {
             ?? (current["cpuCount"] as? NSNumber)?.intValue
             ?? current["cpuCount"] as? Int
             ?? 2
-        let address = config["address"] as? String ?? current["address"] as? String
+        let address = config["address"] == nil ? current["address"] as? String : config["address"] as? String
         let shares = config["shares"] == nil ? Self.shareRows(current["shares"]) : Self.shareRows(config["shares"])
         let state = current["state"] as? String ?? "stopped"
         let row = Self.machineRow(

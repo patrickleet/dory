@@ -1035,10 +1035,9 @@ public final class MachineManager: @unchecked Sendable {
 
     private static func normalizedAddress(_ raw: String?) throws -> String? {
         guard let raw else { return nil }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        guard trimmed.count <= 255,
-              !trimmed.contains(where: { $0.isWhitespace || $0 == "/" || $0 == "\\" }) else {
+        guard IPv4Address(trimmed) != nil else {
             throw MachineManagerError.invalidAddress(raw)
         }
         return trimmed
