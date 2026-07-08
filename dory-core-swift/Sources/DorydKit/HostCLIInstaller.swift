@@ -27,7 +27,8 @@ public struct HostCLIInstaller: Sendable {
     private static let beginSentinel = "# >>> dory cli >>>"
     private static let endSentinel = "# <<< dory cli <<<"
     private static let tools = ["docker", "docker-compose", "kubectl", "dory", "dory-doctor", "dorydctl"]
-    private static let profiles = [".zprofile", ".zshrc", ".bash_profile", ".profile"]
+    private static let profiles = [".zprofile", ".zshrc", ".bash_profile", ".bashrc", ".profile"]
+    private static let defaultProfiles = [".zprofile", ".zshrc"]
 
     public var home: String
     public var helpersDirectory: String?
@@ -122,7 +123,7 @@ public struct HostCLIInstaller: Sendable {
     }
 
     public static func pathBlock(binDir: String) -> String {
-        "\(beginSentinel)\nexport PATH=\"\(binDir):$PATH\"\n\(endSentinel)\n"
+        "\(beginSentinel)\nDORY_CLI_BIN=\"\(binDir)\"\ncase \":$PATH:\" in\n  *\":$DORY_CLI_BIN:\"*) ;;\n  *) export PATH=\"$DORY_CLI_BIN:$PATH\" ;;\nesac\n\(endSentinel)\n"
     }
 
     public static func appendingPathBlock(to content: String, binDir: String) -> String? {
@@ -252,21 +253,18 @@ public struct HostCLIInstaller: Sendable {
     private func addToPath() -> Bool {
         let fileManager = FileManager.default
         let binDir = "\(home)/.dory/bin"
-        var sawProfile = false
         var changed = false
         for name in Self.profiles {
             let path = "\(home)/\(name)"
             guard fileManager.fileExists(atPath: path),
                   let content = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
-            sawProfile = true
             guard let updated = Self.appendingPathBlock(to: content, binDir: binDir) else { continue }
             if (try? updated.write(toFile: path, atomically: true, encoding: .utf8)) != nil {
                 changed = true
             }
         }
-        if !sawProfile {
-            let path = "\(home)/.zprofile"
-            if (try? Self.pathBlock(binDir: binDir).write(toFile: path, atomically: true, encoding: .utf8)) != nil {
+        for name in Self.defaultProfiles where !fileManager.fileExists(atPath: "\(home)/\(name)") {
+            if (try? Self.pathBlock(binDir: binDir).write(toFile: "\(home)/\(name)", atomically: true, encoding: .utf8)) != nil {
                 changed = true
             }
         }

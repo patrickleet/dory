@@ -25,7 +25,8 @@ final class HostCLIInstallerTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: home + "/.dory/bin/docker"), helpers + "/docker")
         XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: home + "/.docker/cli-plugins/docker-compose"), helpers + "/docker-compose")
         let profile = try String(contentsOfFile: home + "/.zprofile", encoding: .utf8)
-        XCTAssertTrue(profile.contains("export PATH=\"\(home)/.dory/bin:$PATH\""))
+        XCTAssertTrue(profile.contains("DORY_CLI_BIN=\"\(home)/.dory/bin\""))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: home + "/.zshrc"))
     }
 
     func testInstallerIsIdempotent() throws {
@@ -126,6 +127,30 @@ final class HostCLIInstallerTests: XCTestCase {
     func testPathBlockAppendIsIdempotent() throws {
         let once = try XCTUnwrap(HostCLIInstaller.appendingPathBlock(to: "export FOO=1\n", binDir: "/home/u/.dory/bin"))
         XCTAssertNil(HostCLIInstaller.appendingPathBlock(to: once, binDir: "/home/u/.dory/bin"))
+        XCTAssertTrue(once.contains("case \":$PATH:\" in"))
+        XCTAssertTrue(once.contains("DORY_CLI_BIN=\"/home/u/.dory/bin\""))
+    }
+
+    func testInstallerCreatesLoginAndInteractiveZshProfilesForCleanHome() throws {
+        let directory = "/tmp/doryd-cli-zsh-profiles-\(getpid())-\(UUID().uuidString)"
+        let home = directory + "/home"
+        let helpers = directory + "/Dory.app/Contents/Helpers"
+        try FileManager.default.createDirectory(atPath: helpers, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+
+        for tool in ["docker", "docker-compose", "kubectl", "dory", "dory-doctor", "dorydctl"] {
+            _ = try executableFixture(at: helpers + "/\(tool)")
+        }
+
+        let result = HostCLIInstaller(home: home, helpersDirectory: helpers).install()
+
+        XCTAssertTrue(result.pathProfileChanged)
+        for profile in [".zprofile", ".zshrc"] {
+            let content = try String(contentsOfFile: home + "/\(profile)", encoding: .utf8)
+            XCTAssertTrue(content.contains("DORY_CLI_BIN=\"\(home)/.dory/bin\""), profile)
+            XCTAssertTrue(content.contains("case \":$PATH:\" in"), profile)
+        }
     }
 
     func testRemoveUnlinksToolsComposePluginAndPathBlock() throws {
