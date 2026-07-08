@@ -580,16 +580,35 @@ final class AppStore {
             _ = await DorydLaunchAgent.ensureCurrent(configuration: dorydLaunchAgentConfiguration())
         }
         do {
-            let started = try await dorydClient.engineStart()
-            guard started.ok else {
-                sharedVMStatus = started.message.isEmpty ? "doryd could not start the engine." : started.message
-                loadState = .engineOff
-                return false
-            }
+            let status = try await dorydClient.engineStatus()
             let socketPath = try await dorydClient.dorySocketPath()
             daemonSocketPath = socketPath
             runtimeOwnedByDoryd = true
             runtime = DockerEngineRuntime(socketPath: socketPath, kind: .sharedVM)
+
+            if status.state == "sleeping" {
+                engineSleeping = true
+                engineActivity.setSleeping(true)
+                engineRunning = false
+                loadState = .ready
+                sharedVMStatus = status.detail.isEmpty ? "Sleeping — Docker use wakes it." : "Sleeping — \(status.detail)"
+                return true
+            }
+
+            if status.state != "running" {
+                let started = try await dorydClient.engineStart()
+                guard started.ok else {
+                    sharedVMStatus = started.message.isEmpty ? "doryd could not start the engine." : started.message
+                    loadState = .engineOff
+                    runtimeOwnedByDoryd = false
+                    daemonSocketPath = nil
+                    runtime = DisconnectedRuntime()
+                    return false
+                }
+            }
+
+            engineSleeping = false
+            engineActivity.setSleeping(false)
             sharedVMStatus = "Running through doryd"
             await reload()
             if loadState == .engineOff {

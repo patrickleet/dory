@@ -279,7 +279,7 @@ struct DorydClientTests {
 
         await store.connectBackend()
 
-        #expect(service.engineStartCount == 1)
+        #expect(service.engineStartCount == 0)
         #expect(store.runtimeKind == .sharedVM)
         #expect(store.shimSocketPath == socketPath)
         #expect(!store.shimRunning)
@@ -300,6 +300,7 @@ struct DorydClientTests {
     @Test func appStoreKeepsDoryPreferenceOnDorydStartFailure() async throws {
         let listener = NSXPCListener.anonymous()
         let service = FakeDorydService()
+        service.setEngineStatus("stopped", detail: "stopped")
         service.setEngineStartResult(ok: false, message: "doryd test failure")
         let delegate = FakeDorydListenerDelegate(service: service)
         listener.delegate = delegate
@@ -613,6 +614,33 @@ struct DorydClientTests {
         #expect(!store.engineRunning)
         #expect(store.containers.isEmpty)
         #expect(service.engineWakeCount == 0)
+    }
+
+    @MainActor
+    @Test func appStoreAttachesSleepingDorydWithoutStartingEngine() async throws {
+        let listener = NSXPCListener.anonymous()
+        let service = FakeDorydService(socketPath: "/tmp/doryd-sleeping.sock")
+        service.setEngineStatus("sleeping", detail: "armed")
+        let delegate = FakeDorydListenerDelegate(service: service)
+        listener.delegate = delegate
+        listener.resume()
+        defer { listener.invalidate() }
+
+        let store = AppStore(
+            dorydClient: DorydClient(endpoint: listener.endpoint),
+            useDorydEngine: true
+        )
+        store.routeDockerCLI = false
+
+        await store.connectBackend()
+
+        #expect(service.engineStartCount == 0)
+        #expect(service.engineWakeCount == 0)
+        #expect(store.runtimeKind == .sharedVM)
+        #expect(store.loadState == .ready)
+        #expect(store.engineSleeping)
+        #expect(!store.engineRunning)
+        #expect(store.sharedVMStatus == "Sleeping — armed")
     }
 
     @MainActor
