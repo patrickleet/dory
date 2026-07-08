@@ -5,7 +5,8 @@ come with the machine spec, the command used, raw TSV/JSON output, and a note ab
 were installed and running on the same Mac.
 
 The main harness is [`scripts/benchmark-compare.sh`](scripts/benchmark-compare.sh). It compares Dory
-against Docker Desktop, OrbStack, and Apple Container where those engines are present.
+against Docker Desktop and OrbStack by default. Apple's separate `container` CLI can be added as an
+optional competitor on macOS 26+ hosts, but it is not part of the default 0.3 release benchmark.
 
 ## What 0.3 Measures
 
@@ -18,8 +19,8 @@ against Docker Desktop, OrbStack, and Apple Container where those engines are pr
 
 Every run writes:
 
-- `machine-spec.tsv`: Mac model, memory, CPU, macOS build, Docker client, Apple Container CLI,
-  and the released Dory.app identity when `--dory-app` is used.
+- `machine-spec.tsv`: Mac model, memory, CPU, macOS build, Docker client, optional Apple
+  Container CLI, and the released Dory.app identity when `--dory-app` is used.
 - `engine-versions.tsv`: per-engine interface, endpoint, server/CLI version, OS/kernel, and arch.
 - `memory.tsv`, `cpu.tsv`, `network.tsv`, `filesystem.tsv`: raw per-metric data.
 - `status.tsv`: pass, fail, and skip reasons per engine.
@@ -46,7 +47,7 @@ have the nested virtualization needed for this benchmark.
 ```sh
 # Audit the work before touching any engine:
 scripts/benchmark-compare.sh \
-  --engines dory,orbstack,docker-desktop,apple-container \
+  --engines dory,orbstack,docker-desktop \
   --metrics memory,cpu,network,fs \
   --dry-run
 
@@ -54,7 +55,7 @@ scripts/benchmark-compare.sh \
 BENCH_WORKDIR="$PWD/.benchmark-results" \
 scripts/benchmark-compare.sh \
   --dory-app /Applications/Dory.app \
-  --engines dory,orbstack,docker-desktop,apple-container \
+  --engines dory,orbstack,docker-desktop \
   --metrics memory,cpu,network,fs \
   --memory-counts 0,1,3,5,10 \
   --runs 3 \
@@ -84,7 +85,7 @@ Recommended runner matrix for 0.3:
 | Runner | Required labels | Engines |
 |---|---|---|
 | Apple silicon, macOS 15+ | `self-hosted`, `macOS`, `dory` | Dory, Docker Desktop, OrbStack |
-| Apple silicon, macOS 26+ | `self-hosted`, `macOS`, `dory`, `apple-container` | Dory, Docker Desktop, OrbStack, Apple Container |
+| Apple silicon, macOS 26+ optional competitor run | `self-hosted`, `macOS`, `dory`, `apple-container` | Dory, Docker Desktop, OrbStack, Apple Container |
 | Intel, macOS 14/15+ | `self-hosted`, `macOS`, `dory`, `intel` | Dory Intel beta, Docker Desktop, Colima/OrbStack where supported |
 
 ## Publication Rules

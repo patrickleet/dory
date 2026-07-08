@@ -194,8 +194,7 @@ jobs:
           sed -i -E "s/  sha256 \"[0-9a-f]+\"/  sha256 \"$S\"/" Casks/dory.rb
           test -f appcast-artifact/appcast.xml
           cp appcast-artifact/appcast.xml website/public/appcast.xml
-          cp appcast-artifact/appcast.xml docs-build/appcast.xml
-          git add Casks/dory.rb website/public/appcast.xml docs-build/appcast.xml
+          git add Casks/dory.rb website/public/appcast.xml
           if git diff --cached --quiet; then echo "cask already current"; exit 0; fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

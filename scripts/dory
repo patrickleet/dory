@@ -46,8 +46,8 @@ host_guest_arch() {
   [ "$(uname -m)" = "x86_64" ] && printf '%s\n' "amd64" || printf '%s\n' "arm64"
 }
 
-# The framework-engine helper (Rosetta-fast x86 + host mounts via Apple's containerization), bundled
-# in the app and signed with the virtualization entitlement. Falls back to a local dev build.
+# The VM helper bundled in the app and signed with the virtualization entitlement. Falls back to a
+# local dev build.
 vm_helper() {
   for p in "${DORY_VM_HELPER:-}" \
            "$(dirname "$0")/../Helpers/dory-vm" \

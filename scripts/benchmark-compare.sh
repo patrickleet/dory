@@ -30,10 +30,11 @@
 #                    and the host/in-container ratio -- the ratio is the VM-boundary tax, independent
 #                    of raw disk speed. Median of BENCH_RUNS runs each.
 #
-# Engines: dory, orbstack, docker-desktop, apple-container. Docker-API engines are driven over their
-# unix socket (selected via DORY_SOCK / ORBSTACK_SOCK / DOCKER_DESKTOP_SOCK, mirroring readiness.sh).
-# Apple Container is driven via its own `container` CLI. Any engine whose socket or CLI is absent is
-# reported [SKIP] and never fails the run. Every resource created carries a run-scoped label
+# Engines: dory, orbstack, docker-desktop by default; apple-container can be requested explicitly
+# as a competitor on macOS 26+ hosts. Docker-API engines are driven over their unix socket (selected
+# via DORY_SOCK / ORBSTACK_SOCK / DOCKER_DESKTOP_SOCK, mirroring readiness.sh). Apple Container is
+# driven via its own `container` CLI. Any engine whose socket or CLI is absent is reported [SKIP]
+# and never fails the run. Every resource created carries a run-scoped label
 # (dev.dory.bench=<runId>) or a run-scoped name prefix, and cleanup removes only those.
 #
 # This measures; it does not market. Output is measurements + this methodology comment only.
@@ -43,7 +44,8 @@
 #   scripts/benchmark-compare.sh --engines dory,orbstack,apple-container --memory-count 4 --runs 5
 #   scripts/benchmark-compare.sh --engines dory --metrics memory,cpu,fs
 #   scripts/benchmark-compare.sh --dory-app /Applications/Dory.app --engines dory,orbstack,docker-desktop
-#   scripts/benchmark-compare.sh --dry-run --engines dory,orbstack,docker-desktop,apple-container
+#   scripts/benchmark-compare.sh --dry-run --engines dory,orbstack,docker-desktop
+#   scripts/benchmark-compare.sh --engines dory,orbstack,docker-desktop,apple-container
 #
 # Environment knobs:
 #   DORY_SOCK, ORBSTACK_SOCK, DOCKER_DESKTOP_SOCK   engine socket overrides
@@ -64,7 +66,7 @@ set -u
 # --------------------------------------------------------------------------------------------------
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-ENGINES="${ENGINES:-dory,orbstack,docker-desktop,apple-container}"
+ENGINES="${ENGINES:-dory,orbstack,docker-desktop}"
 METRICS="${METRICS:-memory,cpu,network,fs}"
 ALPINE_IMAGE="${BENCH_ALPINE_IMAGE:-alpine:latest}"
 IPERF_IMAGE="${BENCH_IPERF_IMAGE:-taoyou/iperf3-alpine:latest}"
@@ -107,7 +109,7 @@ usage() {
 Usage: scripts/benchmark-compare.sh [options]
 
 Options:
-  --engines LIST       Comma-separated: dory,orbstack,docker-desktop,apple-container (default: all)
+  --engines LIST       Comma-separated: dory,orbstack,docker-desktop,apple-container (default: $ENGINES)
   --metrics LIST       Comma-separated subset of: memory,cpu,network,fs (default: all)
   --memory-count N     Idle containers for the memory metric (default: $MEMORY_COUNT)
   --memory-counts LIST Comma-separated idle-container counts for memory sweeps

@@ -4,8 +4,9 @@ name: Benchmark
 #
 # IMPORTANT: this needs real Mac hardware with hardware virtualization. GitHub-HOSTED macOS runners
 # are themselves VMs without nested virtualization, so they CANNOT run the container engine. This
-# job produces Dory/Docker/OrbStack/Apple Container numbers only on a SELF-HOSTED Mac with the target
-# engines installed. Apple Container comparison rows require macOS 26+ and are N/A on Intel macOS 15.
+# job produces Dory/Docker/OrbStack numbers only on a SELF-HOSTED Mac with the target engines
+# installed. Apple's separate `container` CLI can still be added explicitly as a competitor on
+# macOS 26+ runners, but it is not part of the default 0.3 local-release benchmark.
 # Label such a runner `[self-hosted, macOS, dory]`; add `intel` to the runner labels for the Intel
 # track.
 
@@ -13,8 +14,8 @@ on:
   workflow_dispatch:
     inputs:
       engines:
-        description: 'Comma-separated engines: dory,orbstack,docker-desktop,apple-container'
-        default: 'dory,orbstack,docker-desktop,apple-container'
+        description: 'Comma-separated engines: dory,orbstack,docker-desktop (optionally apple-container)'
+        default: 'dory,orbstack,docker-desktop'
       metrics:
         description: 'Comma-separated metrics: memory,cpu,network,fs'
         default: 'memory,cpu,network,fs'
@@ -50,7 +51,7 @@ jobs:
           DORY_BENCH_APP_INPUT: ${{ github.event.inputs.dory_app || '' }}
         run: |
           args=( \
-            --engines "${{ github.event.inputs.engines || 'dory,orbstack,docker-desktop,apple-container' }}" \
+            --engines "${{ github.event.inputs.engines || 'dory,orbstack,docker-desktop' }}" \
             --metrics "${{ github.event.inputs.metrics || 'memory,cpu,network,fs' }}" \
             --memory-count "${{ github.event.inputs.memory_count || '3' }}" \
             --runs "${{ github.event.inputs.runs || '3' }}" \
