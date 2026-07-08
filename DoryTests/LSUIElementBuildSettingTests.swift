@@ -2,6 +2,14 @@ import Testing
 import Foundation
 
 struct LSUIElementBuildSettingTests {
+    private func infoPlist() throws -> [String: Any] {
+        let here = URL(fileURLWithPath: #filePath)
+        let root = here.deletingLastPathComponent().deletingLastPathComponent()
+        let path = root.appendingPathComponent("Config/Dory-Info.plist")
+        let data = try Data(contentsOf: path)
+        return try #require(PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
+    }
+
     private func pbxproj() throws -> String {
         let here = URL(fileURLWithPath: #filePath)
         let root = here.deletingLastPathComponent().deletingLastPathComponent()
@@ -13,6 +21,11 @@ struct LSUIElementBuildSettingTests {
         let text = try pbxproj()
         let occurrences = text.components(separatedBy: "INFOPLIST_KEY_LSUIElement = YES;").count - 1
         #expect(occurrences >= 2)
+    }
+
+    @Test func appInfoPlistProhibitsMultipleLaunchServicesInstances() throws {
+        let plist = try infoPlist()
+        #expect(plist["LSMultipleInstancesProhibited"] as? Bool == true)
     }
 
     @Test func appBuildPrunesStaleBundledHelpersBeforeSigning() throws {

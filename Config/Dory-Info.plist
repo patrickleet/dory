@@ -8,5 +8,7 @@
 	<string>AFetajNbqZty68rRY7OMWYNt6suUsrokQmYMhDJtnP4=</string>
 	<key>SUEnableInstallerLauncherService</key>
 	<true/>
+	<key>LSMultipleInstancesProhibited</key>
+	<true/>
 </dict>
 </plist>
