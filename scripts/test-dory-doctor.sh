@@ -44,6 +44,8 @@ assert "machine" in commands["wait"]["targets"]
 assert commands["events"]["status"] == "available"
 assert "incident" in commands["events"]["sources"]
 assert commands["engine"]["json"] is True
+assert commands["machine"]["json"] is True
+assert "machine exec NAME --json" in commands["machine"]["notes"]
 assert commands["sandbox"]["status"] == "planned"
 assert data["recommendedRecoveryLoop"]
 '
@@ -89,6 +91,13 @@ elif [ "$1" = "engine" ] && [ "$2" = "sleep" ]; then
   printf '{"ok":true,"message":"sleep requested"}\n'
 elif [ "$1" = "engine" ] && [ "$2" = "wake" ]; then
   printf '{"ok":true,"message":"wake requested"}\n'
+elif [ "$1" = "machine" ] && [ "$2" = "exec" ]; then
+  test "$3" = "dev"
+  test "$4" = "--json"
+  test "$5" = "--"
+  test "$6" = "/bin/echo"
+  test "$7" = "ok"
+  printf '{"schema":"dev.dory.machine.exec","version":1,"machine":"dev","argv":["/bin/echo","ok"],"exitCode":0,"stdout":"ok\\n","stderr":"","stdoutBase64":"b2sK","stderrBase64":"","timedOut":false,"stdoutTruncated":false,"stderrTruncated":false}\n'
 else
   echo "unexpected args: $*" >&2
   exit 64
@@ -105,6 +114,14 @@ assert data["detail"] == "idle policy"
 
 DORYDCTL_BIN="$TMP_HOME/fake-dorydctl" scripts/dory engine status | grep -q "Dory engine: sleeping"
 DORYDCTL_BIN="$TMP_HOME/fake-dorydctl" scripts/dory engine sleep --json | grep -q '"sleep requested"'
+DORYDCTL_BIN="$TMP_HOME/fake-dorydctl" scripts/dory machine exec dev --json -- /bin/echo ok | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["schema"] == "dev.dory.machine.exec"
+assert data["machine"] == "dev"
+assert data["argv"] == ["/bin/echo", "ok"]
+assert data["stdout"] == "ok\n"
+'
 
 mkdir -p "$TMP_HOME/.dory"
 cat > "$TMP_HOME/.dory/idle-history.jsonl" <<'JSONL'

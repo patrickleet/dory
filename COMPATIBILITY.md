@@ -209,7 +209,10 @@ and `dory compat --recipe` for the full set.
   per container. This closes the headline memory gap and makes Dory a standalone engine.
 - **File-sharing performance** under the Apple `container` runtime + a real bind-mount dev loop is
   not yet benchmarked here.
-- **Distribution.** Signing works locally; **notarization requires an Apple Developer account**
-  (external gate). The Homebrew Cask and an auto-updater are scaffolding still to add.
+- **Distribution.** Release automation builds Apple-silicon, Intel, and universal app artifacts,
+  signs them with Developer ID, submits them for notarization when Apple credentials are present,
+  staples the tickets, generates the Sparkle appcast, and bumps/syncs the Homebrew Cask. The
+  remaining external gate is operational: the release runner must have the Developer ID/notary
+  credentials, Sparkle key, Homebrew tap token, and bundled engine assets before publishing.
 - The app runs **unsandboxed** (like Docker Desktop/OrbStack) to reach the engine socket and
   host its own socket.

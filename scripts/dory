@@ -74,6 +74,8 @@ dory — Dory CLI
   dory debug <container> [-- cmd...]
                                Enter a container's namespaces through the Dory guest agent
   dory machine <args...>       Manage Linux machines (ls, create, start, stop, delete, run)
+  dory machine exec <name> [--json] -- <command...>
+                               Run a command in a machine; --json emits schema v1 result metadata
   dory machine snapshot <name> Take a Dory machine snapshot
   dory machine restore <name> <tag|image>
                                Restore, clone, import, export, or delete snapshots
@@ -763,7 +765,7 @@ dorydctl_bin() {
 }
 
 doryd_machine_cmd() {
-  local ctl="$1" sub name
+  local ctl="$1" sub name args=()
   shift
   sub="${1:-list}"
   case "$sub" in
@@ -774,9 +776,13 @@ doryd_machine_cmd() {
       shift
       name="${1:?usage: dory machine run <name> -- <command...>}"
       shift
+      while [ "$#" -gt 0 ] && [ "${1:-}" != "--" ]; do
+        args+=("$1")
+        shift
+      done
       [ "${1:-}" != "--" ] || shift
       [ "$#" -gt 0 ] || { echo "usage: dory machine run <name> -- <command...>" >&2; exit 2; }
-      exec "$ctl" machine exec "$name" -- "$@"
+      exec "$ctl" machine exec "$name" "${args[@]}" -- "$@"
       ;;
     ssh|shell)
       shift
@@ -1562,10 +1568,10 @@ data = {
         {
             "id": "machine",
             "status": "available",
-            "invoke": "dory machine ls|create|start|stop|delete|snapshot|restore ...",
-            "json": "partial",
+            "invoke": "dory machine ls|create|start|stop|delete|snapshot|restore|exec ...",
+            "json": True,
             "safeForAutomation": True,
-            "notes": "Routes to dorydctl when present; legacy fallback remains during cutover.",
+            "notes": "Routes to dorydctl when present; use `dory machine exec NAME --json -- CMD` for schema dev.dory.machine.exec v1. Legacy fallback remains during cutover.",
         },
         {
             "id": "ssh",
@@ -1640,6 +1646,7 @@ Dory agent guide v1
 
 Use `dory agent guide --json` for the stable machine-readable contract.
 Prefer `--json` on doctor, network, mount, disk, cleanup, routes, compat, repair, and idle commands.
+Use `dory machine exec NAME --json -- CMD` for structured machine command results.
 Run read-only checks first; use `--apply` only for explicit repair/cleanup writes.
 Available agent-native primitive: `dory wait`.
 Available agent-native primitive: `dory events --follow --json`.

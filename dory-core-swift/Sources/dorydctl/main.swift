@@ -144,7 +144,7 @@ func usage(exitCode: Int32 = 2) -> Never {
           dorydctl [global] machine create NAME --kernel PATH --rootfs PATH [--memory-mb N] [--cpus N] [--address HOST]
           dorydctl [global] machine update NAME [--memory-mb N] [--cpus N] [--address HOST]
           dorydctl [global] machine start|stop|delete NAME
-          dorydctl [global] machine exec NAME [--cwd PATH] [--env KEY=VALUE] [--timeout-ms N] [--output-limit-bytes N] -- COMMAND [ARG...]
+          dorydctl [global] machine exec NAME [--json] [--cwd PATH] [--env KEY=VALUE] [--timeout-ms N] [--output-limit-bytes N] -- COMMAND [ARG...]
           dorydctl [global] machine shell NAME
           dorydctl [global] machine provision NAME --recipe RECIPE
           dorydctl [global] machine snapshots [NAME]
@@ -769,8 +769,9 @@ func runMachineShell(cursor: inout ArgumentCursor, client: DorydCtlClient) throw
 }
 
 func runMachineExec(cursor: inout ArgumentCursor, client: DorydCtlClient) throws {
-    let usage = "usage: dorydctl machine exec NAME [--cwd PATH] [--env KEY=VALUE] [--timeout-ms N] [--output-limit-bytes N] -- COMMAND [ARG...]"
+    let usage = "usage: dorydctl machine exec NAME [--json] [--cwd PATH] [--env KEY=VALUE] [--timeout-ms N] [--output-limit-bytes N] -- COMMAND [ARG...]"
     let name = try cursor.take(usage)
+    var jsonOutput = false
     var request: [String: Any] = [
         "cwd": "",
         "timeoutMs": UInt64(30_000),
@@ -783,6 +784,8 @@ func runMachineExec(cursor: inout ArgumentCursor, client: DorydCtlClient) throws
     while !cursor.values.isEmpty {
         let item = cursor.values.removeFirst()
         switch item {
+        case "--json":
+            jsonOutput = true
         case "--cwd":
             guard let value = cursor.values.first else { throw DorydCtlError.usage("missing value for --cwd") }
             request["cwd"] = value
@@ -825,11 +828,15 @@ func runMachineExec(cursor: inout ArgumentCursor, client: DorydCtlClient) throws
     let result: NSDictionary = try execClient.statusCommand { proxy, reply in
         proxy.machineExec(name, request: request as NSDictionary, reply: reply)
     }
-    if let stdout = result["stdout"] as? Data, !stdout.isEmpty {
-        FileHandle.standardOutput.write(stdout)
-    }
-    if let stderr = result["stderr"] as? Data, !stderr.isEmpty {
-        FileHandle.standardError.write(stderr)
+    if jsonOutput {
+        try emitJSON(machineExecJSON(machine: name, argv: argv, result: result))
+    } else {
+        if let stdout = result["stdout"] as? Data, !stdout.isEmpty {
+            FileHandle.standardOutput.write(stdout)
+        }
+        if let stderr = result["stderr"] as? Data, !stderr.isEmpty {
+            FileHandle.standardError.write(stderr)
+        }
     }
     if result["timedOut"] as? Bool == true {
         FileHandle.standardError.write(Data("dorydctl: machine exec timed out\n".utf8))
@@ -844,6 +851,26 @@ func runMachineExec(cursor: inout ArgumentCursor, client: DorydCtlClient) throws
     if exitCode != 0 {
         exit(exitCode)
     }
+}
+
+func machineExecJSON(machine: String, argv: [String], result: NSDictionary) -> NSDictionary {
+    let stdout = result["stdout"] as? Data ?? Data()
+    let stderr = result["stderr"] as? Data ?? Data()
+    let exitCode = (result["exitCode"] as? NSNumber)?.intValue ?? 1
+    return [
+        "schema": "dev.dory.machine.exec",
+        "version": 1,
+        "machine": machine,
+        "argv": argv,
+        "exitCode": exitCode,
+        "timedOut": result["timedOut"] as? Bool ?? false,
+        "stdout": String(decoding: stdout, as: UTF8.self),
+        "stderr": String(decoding: stderr, as: UTF8.self),
+        "stdoutBase64": stdout.base64EncodedString(),
+        "stderrBase64": stderr.base64EncodedString(),
+        "stdoutTruncated": result["stdoutTruncated"] as? Bool ?? false,
+        "stderrTruncated": result["stderrTruncated"] as? Bool ?? false,
+    ] as NSDictionary
 }
 
 final class RawTerminalMode {
