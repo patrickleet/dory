@@ -115,6 +115,8 @@ dory — Dory CLI
                                Manage the opt-in always-listening LaunchAgent
   dory agent guide [--json|--text]
                                Emit a versioned CLI capability map for coding agents
+  dory mcp serve [--read-only]
+                               Serve Dory tools over stdio MCP for Claude/Cursor-style clients
   dory wait engine|container|machine [NAME] --until STATE --timeout N [--json]
                                Wait for a runtime state without hand-written polling loops
   dory events [--json] [--follow] [--limit N]
@@ -1446,6 +1448,352 @@ while True:
 PY
 }
 
+mcp_cmd() {
+  local sub="${1:-serve}" read_only="${DORY_MCP_READ_ONLY:-0}"
+  case "$sub" in
+    serve) shift || true ;;
+    -h|--help)
+      echo "usage: dory mcp serve [--read-only]"
+      return 0
+      ;;
+    *)
+      echo "usage: dory mcp serve [--read-only]" >&2
+      exit 2
+      ;;
+  esac
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --read-only) read_only=1; shift ;;
+      --write) read_only=0; shift ;;
+      -h|--help) echo "usage: dory mcp serve [--read-only]"; return 0 ;;
+      *) echo "unknown mcp option: $1" >&2; exit 2 ;;
+    esac
+  done
+
+  python3 /dev/fd/3 "$DORY_SCRIPT_SOURCE" "$read_only" 3<<'PY'
+import json
+import os
+import subprocess
+import sys
+from typing import Any, Optional
+
+CLI = sys.argv[1]
+READ_ONLY = sys.argv[2] in ("1", "true", "yes", "on")
+PROTOCOL = "2025-11-25"
+SUPPORTED_PROTOCOLS = {PROTOCOL, "2025-06-18"}
+
+
+class ToolExecutionError(Exception):
+    pass
+
+
+def schema_object(properties: Optional[dict[str, Any]] = None, required: Optional[list[str]] = None) -> dict[str, Any]:
+    schema: dict[str, Any] = {
+        "type": "object",
+        "additionalProperties": False,
+    }
+    if properties:
+        schema["properties"] = properties
+    if required:
+        schema["required"] = required
+    return schema
+
+
+TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "dory.agent_guide",
+        "title": "Dory Agent Guide",
+        "description": "Return Dory's machine-readable CLI capability map.",
+        "inputSchema": schema_object(),
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "dory.doctor",
+        "title": "Dory Doctor",
+        "description": "Run Dory diagnostics as JSON. Use this before repair or runtime changes.",
+        "inputSchema": schema_object({
+            "active": {"type": "boolean", "description": "Run active probes."},
+            "only": {"type": "string", "description": "Comma-separated doctor groups."},
+        }),
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "dory.compat",
+        "title": "Dory Compatibility",
+        "description": "Check tool compatibility recipes and live status as JSON.",
+        "inputSchema": schema_object({
+            "only": {"type": "string", "description": "Comma-separated tool ids to check."},
+        }),
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "dory.engine_status",
+        "title": "Dory Engine Status",
+        "description": "Return local engine status without waking or changing it.",
+        "inputSchema": schema_object(),
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "dory.machine_list",
+        "title": "Dory Machine List",
+        "description": "List doryd-managed Linux machines.",
+        "inputSchema": schema_object(),
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "dory.machine_exec",
+        "title": "Dory Machine Exec",
+        "description": "Execute a command in a doryd-managed Linux machine and return schema dev.dory.machine.exec v1.",
+        "inputSchema": schema_object({
+            "name": {"type": "string", "description": "Machine name."},
+            "command": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "description": "Command argv to execute.",
+            },
+            "cwd": {"type": "string", "description": "Working directory inside the machine."},
+            "env": {
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+                "description": "Environment variables for the command.",
+            },
+            "timeoutSeconds": {"type": "integer", "minimum": 0, "maximum": 600},
+            "outputLimitBytes": {"type": "integer", "minimum": 0},
+        }, ["name", "command"]),
+        "annotations": {"readOnlyHint": False, "destructiveHint": True},
+    },
+    {
+        "name": "dory.wait",
+        "title": "Dory Wait",
+        "description": "Wait for an engine, container, or machine state using Dory's wait primitive.",
+        "inputSchema": schema_object({
+            "targetKind": {"type": "string", "enum": ["engine", "container", "machine"]},
+            "name": {"type": "string", "description": "Container or machine name/id."},
+            "until": {"type": "string", "description": "Desired state."},
+            "timeoutSeconds": {"type": "integer", "minimum": 0, "maximum": 3600},
+            "intervalSeconds": {"type": "integer", "minimum": 1, "maximum": 60},
+        }, ["targetKind", "until"]),
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "dory.events",
+        "title": "Dory Events",
+        "description": "Return recent Dory idle and incident events. This tool does not follow forever.",
+        "inputSchema": schema_object({
+            "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+        }),
+        "annotations": {"readOnlyHint": True},
+    },
+]
+
+
+def send(message: dict[str, Any]) -> None:
+    sys.stdout.write(json.dumps(message, separators=(",", ":"), sort_keys=True) + "\n")
+    sys.stdout.flush()
+
+
+def success(request_id: Any, result: dict[str, Any]) -> None:
+    send({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+
+def error(request_id: Any, code: int, message: str, data: Any = None) -> None:
+    body: dict[str, Any] = {"code": code, "message": message}
+    if data is not None:
+        body["data"] = data
+    send({"jsonrpc": "2.0", "id": request_id, "error": body})
+
+
+def tool_result(value: Any, is_error: bool = False) -> dict[str, Any]:
+    structured = value if isinstance(value, dict) else {"value": value}
+    text = json.dumps(value, separators=(",", ":"), sort_keys=True) if not isinstance(value, str) else value
+    return {
+        "content": [{"type": "text", "text": text}],
+        "structuredContent": structured,
+        "isError": is_error,
+    }
+
+
+def tool_error(message: str, data: Any = None) -> dict[str, Any]:
+    body = {"error": message}
+    if data is not None:
+        body["data"] = data
+    return tool_result(body, is_error=True)
+
+
+def run_cli(args: list[str], timeout: int = 90, expect_json: bool = True) -> Any:
+    proc = subprocess.run(
+        [CLI] + args,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        env=os.environ.copy(),
+    )
+    if expect_json:
+        try:
+            parsed = json.loads(proc.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            raise ToolExecutionError(f"dory {' '.join(args)} did not return JSON: {exc}; stderr={proc.stderr.strip()}") from exc
+        if proc.returncode != 0:
+            raise ToolExecutionError(proc.stderr.strip() or json.dumps(parsed, separators=(",", ":")))
+        return parsed
+    if proc.returncode != 0:
+        raise ToolExecutionError(proc.stderr.strip() or proc.stdout.strip() or f"dory exited {proc.returncode}")
+    return proc.stdout
+
+
+def require_object(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ToolExecutionError("arguments must be an object")
+    return value
+
+
+def int_arg(args: dict[str, Any], name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = args.get(name, default)
+    if not isinstance(raw, int) or isinstance(raw, bool) or raw < minimum or raw > maximum:
+        raise ToolExecutionError(f"{name} must be an integer between {minimum} and {maximum}")
+    return raw
+
+
+def string_arg(args: dict[str, Any], name: str, required: bool = False) -> str:
+    raw = args.get(name, "")
+    if required and not raw:
+        raise ToolExecutionError(f"{name} is required")
+    if raw and not isinstance(raw, str):
+        raise ToolExecutionError(f"{name} must be a string")
+    return raw
+
+
+def call_tool(name: str, arguments: Any) -> dict[str, Any]:
+    args = require_object(arguments)
+    if name == "dory.agent_guide":
+        return tool_result(run_cli(["agent", "guide", "--json"]))
+    if name == "dory.doctor":
+        command = ["doctor", "--json"]
+        if args.get("active") is True:
+            command.append("--active")
+        only = string_arg(args, "only")
+        if only:
+            command.extend(["--only", only])
+        return tool_result(run_cli(command))
+    if name == "dory.compat":
+        command = ["compat", "--json"]
+        only = string_arg(args, "only")
+        if only:
+            command.extend(["--only", only])
+        return tool_result(run_cli(command))
+    if name == "dory.engine_status":
+        return tool_result(run_cli(["engine", "status", "--json"]))
+    if name == "dory.machine_list":
+        return tool_result({"machines": run_cli(["machine", "list"])})
+    if name == "dory.machine_exec":
+        if READ_ONLY:
+            return tool_error("dory.machine_exec is disabled because this MCP server is running in read-only mode")
+        machine = string_arg(args, "name", required=True)
+        command_value = args.get("command")
+        if not isinstance(command_value, list) or not command_value or not all(isinstance(item, str) for item in command_value):
+            raise ToolExecutionError("command must be a non-empty array of strings")
+        command = ["machine", "exec", machine, "--json"]
+        cwd = string_arg(args, "cwd")
+        if cwd:
+            command.extend(["--cwd", cwd])
+        env = args.get("env", {})
+        if env:
+            if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
+                raise ToolExecutionError("env must be an object with string values")
+            for key, value in sorted(env.items()):
+                command.extend(["--env", f"{key}={value}"])
+        timeout_seconds = int_arg(args, "timeoutSeconds", 30, 0, 600)
+        output_limit = int_arg(args, "outputLimitBytes", 1024 * 1024, 0, 32 * 1024 * 1024)
+        command.extend(["--timeout-ms", str(timeout_seconds * 1000)])
+        command.extend(["--output-limit-bytes", str(output_limit)])
+        command.extend(["--", *command_value])
+        return tool_result(run_cli(command, timeout=max(10, timeout_seconds + 15)))
+    if name == "dory.wait":
+        target_kind = string_arg(args, "targetKind", required=True)
+        if target_kind not in ("engine", "container", "machine"):
+            raise ToolExecutionError("targetKind must be engine, container, or machine")
+        command = ["wait", target_kind]
+        if target_kind != "engine":
+            command.append(string_arg(args, "name", required=True))
+        command.extend(["--until", string_arg(args, "until", required=True)])
+        timeout_seconds = int_arg(args, "timeoutSeconds", 60, 0, 3600)
+        interval_seconds = int_arg(args, "intervalSeconds", 1, 1, 60)
+        command.extend(["--timeout", str(timeout_seconds), "--interval", str(interval_seconds), "--json"])
+        return tool_result(run_cli(command, timeout=max(10, timeout_seconds + 5)))
+    if name == "dory.events":
+        limit = int_arg(args, "limit", 50, 1, 500)
+        return tool_result(run_cli(["events", "--json", "--limit", str(limit)]))
+    raise ToolExecutionError(f"unknown tool: {name}")
+
+
+def handle(request: dict[str, Any]) -> None:
+    request_id = request.get("id")
+    method = request.get("method")
+    if not isinstance(method, str):
+        error(request_id, -32600, "invalid request")
+        return
+    if method == "initialize":
+        params = request.get("params") if isinstance(request.get("params"), dict) else {}
+        requested = params.get("protocolVersion")
+        success(request_id, {
+            "protocolVersion": requested if requested in SUPPORTED_PROTOCOLS else PROTOCOL,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {
+                "name": "dory",
+                "title": "Dory",
+                "version": "0.1.0",
+                "description": "Dory local runtime MCP server wrapping the dory CLI.",
+            },
+            "instructions": "Use read-only tools first. dory.machine_exec is unavailable when the server is launched with --read-only.",
+        })
+    elif method == "notifications/initialized":
+        return
+    elif method == "ping":
+        success(request_id, {})
+    elif method == "tools/list":
+        success(request_id, {"tools": TOOLS})
+    elif method == "tools/call":
+        params = request.get("params")
+        if not isinstance(params, dict) or not isinstance(params.get("name"), str):
+            error(request_id, -32602, "tools/call requires params.name")
+            return
+        try:
+            success(request_id, call_tool(params["name"], params.get("arguments", {})))
+        except ToolExecutionError as exc:
+            success(request_id, tool_error(str(exc)))
+        except subprocess.TimeoutExpired as exc:
+            success(request_id, tool_error(f"tool timed out after {exc.timeout} seconds"))
+    else:
+        error(request_id, -32601, f"method not found: {method}")
+
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        message = json.loads(line)
+    except json.JSONDecodeError as exc:
+        error(None, -32700, f"parse error: {exc}")
+        continue
+    if isinstance(message, list):
+        for item in message:
+            if isinstance(item, dict) and "id" in item:
+                handle(item)
+        continue
+    if not isinstance(message, dict):
+        error(None, -32600, "invalid request")
+        continue
+    if "id" not in message and message.get("method") != "notifications/initialized":
+        continue
+    handle(message)
+PY
+}
+
 agent_guide_json() {
   python3 - "$DORY_SOCK" <<'PY'
 import json
@@ -1623,10 +1971,14 @@ data = {
         },
         {
             "id": "mcp",
-            "status": "planned",
-            "invoke": "dory mcp serve",
+            "status": "available",
+            "invoke": "dory mcp serve [--read-only]",
             "json": True,
             "safeForAutomation": True,
+            "transport": "stdio",
+            "protocolVersion": "2025-11-25",
+            "tools": ["dory.agent_guide", "dory.doctor", "dory.compat", "dory.engine_status", "dory.machine_list", "dory.machine_exec", "dory.wait", "dory.events"],
+            "notes": "Thin stdio MCP server over the CLI command core. Launch with --read-only to block machine exec.",
         },
     ],
     "recommendedRecoveryLoop": [
@@ -1650,7 +2002,8 @@ Use `dory machine exec NAME --json -- CMD` for structured machine command result
 Run read-only checks first; use `--apply` only for explicit repair/cleanup writes.
 Available agent-native primitive: `dory wait`.
 Available agent-native primitive: `dory events --follow --json`.
-Planned agent-native primitives: `dory sandbox` and `dory mcp serve`.
+Available agent-native primitive: `dory mcp serve [--read-only]`.
+Planned agent-native primitive: `dory sandbox`.
 EOF
 }
 
@@ -1698,6 +2051,7 @@ case "${1:-help}" in
                   esac ;;
   engine)         shift; engine_cmd "$@" ;;
   agent)          shift; agent_cmd "$@" ;;
+  mcp)            shift; mcp_cmd "$@" ;;
   wait)           shift; wait_cmd "$@" ;;
   events)         shift; events_cmd "$@" ;;
   bundle)         shift; doctor_cmd bundle "$@" ;;

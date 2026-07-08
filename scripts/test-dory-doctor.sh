@@ -46,6 +46,9 @@ assert "incident" in commands["events"]["sources"]
 assert commands["engine"]["json"] is True
 assert commands["machine"]["json"] is True
 assert "machine exec NAME --json" in commands["machine"]["notes"]
+assert commands["mcp"]["status"] == "available"
+assert commands["mcp"]["transport"] == "stdio"
+assert "dory.machine_exec" in commands["mcp"]["tools"]
 assert commands["sandbox"]["status"] == "planned"
 assert data["recommendedRecoveryLoop"]
 '
@@ -316,8 +319,49 @@ scripts/dory help | grep -q "dory idle proxy-status"
 scripts/dory help | grep -q "dory cleanup"
 scripts/dory help | grep -q "dory compat"
 scripts/dory help | grep -q "dory agent guide"
+scripts/dory help | grep -q "dory mcp serve"
 scripts/dory help | grep -q "dory wait engine"
 scripts/dory help | grep -q "dory events"
+
+mcp_list="$(printf '%s\n%s\n%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+  | scripts/dory mcp serve --read-only)"
+printf '%s' "$mcp_list" | python3 -c '
+import json, sys
+lines = [json.loads(line) for line in sys.stdin.read().splitlines() if line.strip()]
+assert len(lines) == 2
+assert lines[0]["result"]["protocolVersion"] == "2025-11-25"
+assert "tools" in lines[0]["result"]["capabilities"]
+tools = {item["name"]: item for item in lines[1]["result"]["tools"]}
+assert "dory.agent_guide" in tools
+assert "dory.machine_exec" in tools
+'
+
+mcp_guide="$(printf '%s\n%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"dory.agent_guide","arguments":{}}}' \
+  | scripts/dory mcp serve --read-only)"
+printf '%s' "$mcp_guide" | python3 -c '
+import json, sys
+lines = [json.loads(line) for line in sys.stdin.read().splitlines() if line.strip()]
+result = lines[-1]["result"]
+assert result["isError"] is False
+assert result["structuredContent"]["schema"] == "dev.dory.agent.guide"
+'
+
+mcp_readonly="$(printf '%s\n%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"dory.machine_exec","arguments":{"name":"dev","command":["/bin/true"]}}}' \
+  | scripts/dory mcp serve --read-only)"
+printf '%s' "$mcp_readonly" | python3 -c '
+import json, sys
+lines = [json.loads(line) for line in sys.stdin.read().splitlines() if line.strip()]
+result = lines[-1]["result"]
+assert result["isError"] is True
+assert "read-only" in result["structuredContent"]["error"]
+'
 
 # Compatibility center: every registered tool is checked and every non-pass carries an action;
 # runs without an engine (skips/warns/fails, never crashes). `compat` exits 1 when a tool fails,
