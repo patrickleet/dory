@@ -1763,7 +1763,7 @@ def largest_matching_file(root: Path, patterns: list[str]) -> dict[str, Any]:
 
 
 def memory_report() -> dict[str, Any]:
-    patterns = [re.compile(p, re.I) for p in os.environ.get("DORY_PROCESS_PATTERN", "Dory|dory-hv|dory-vm|dory-vmboot|gvproxy").split("|")]
+    patterns = [re.compile(p, re.I) for p in os.environ.get("DORY_PROCESS_PATTERN", "Dory|doryd|dory-hv|dory-vmm|gvproxy").split("|")]
     processes: list[dict[str, Any]] = []
     rss = 0
     try:
@@ -1786,7 +1786,7 @@ def memory_report() -> dict[str, Any]:
             continue
         rss += rss_bytes
         lowered = rest.lower()
-        if "dory-hv" in lowered or "dory-vm" in lowered or "dory-vmboot" in lowered:
+        if "dory-hv" in lowered or "dory-vmm" in lowered:
             role = "engine"
         elif "gvproxy" in lowered:
             role = "network"

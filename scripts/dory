@@ -46,12 +46,12 @@ host_guest_arch() {
   [ "$(uname -m)" = "x86_64" ] && printf '%s\n' "amd64" || printf '%s\n' "arm64"
 }
 
-# The VM helper bundled in the app and signed with the virtualization entitlement. Falls back to a
-# local dev build.
-vm_helper() {
-  for p in "${DORY_VM_HELPER:-}" \
-           "$(dirname "$0")/../Helpers/dory-vm" \
-           "$(dirname "$0")/../Packages/ContainerizationEngine/.build/out/Products/Debug/dory-vmboot"; do
+# The VMM helper bundled in the app and signed with the virtualization entitlement. Falls back to a
+# local dev build for low-level debugging.
+vmm_helper() {
+  for p in "${DORY_VMM_HELPER:-}" \
+           "$(dirname "$0")/../Helpers/dory-vmm" \
+           "$(dirname "$0")/../dory-core-swift/.build/debug/dory-vmm"; do
     [ -n "$p" ] && [ -x "$p" ] && { echo "$p"; return; }
   done
 }
@@ -2979,7 +2979,7 @@ case "${1:-help}" in
                     if [ -z "$home" ]; then if [ "$user" = "root" ]; then home="/root"; else home="/home/$user"; fi; fi
                     exec "$DOCKER_BIN" -H "unix://$DORY_SOCK" exec -it -u "$user" -w "$home" "$cid" "$shell" -l
                   fi ;;
-  vm)             shift; H="$(vm_helper)"; [ -z "$H" ] && { echo "dory-vm helper not found; build+sign it (see scripts/bundle-engine.sh)"; exit 1; }; exec "$H" "$@" ;;
+  vm)             shift; H="$(vmm_helper)"; [ -z "$H" ] && { echo "dory-vmm helper not found; build+sign it (see scripts/bundle-engine.sh)"; exit 1; }; exec "$H" "$@" ;;
   k8s)            shift; exec "$KUBECTL_BIN" --kubeconfig "$KUBECONFIG_DORY" "$@" ;;
   *)              exec "$DOCKER_BIN" -H "unix://$DORY_SOCK" "$@" ;;
 esac

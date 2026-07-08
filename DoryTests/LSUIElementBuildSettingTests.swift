@@ -47,10 +47,9 @@ struct LSUIElementBuildSettingTests {
     @Test func appBuildPrunesStaleBundledHelpersBeforeSigning() throws {
         let text = try pbxproj()
         #expect(text.contains("Prune Stale Bundled Helpers"))
-        #expect(text.contains("for helper in container docker docker-compose"))
-        #expect(text.contains("rm -f \\\"$HELPERS/$helper\\\""))
+        #expect(text.contains("find \\\"$HELPERS\\\" -maxdepth 1 -type f -exec rm -f {} +"))
         #expect(text.contains("$(TARGET_BUILD_DIR)/$(WRAPPER_NAME)/Contents/Helpers"))
-        #expect(text.contains("$(TARGET_BUILD_DIR)/$(WRAPPER_NAME)/Contents/Helpers/dory-idle-proxy"))
+        #expect(!text.contains("$(TARGET_BUILD_DIR)/$(WRAPPER_NAME)/Contents/Helpers/dory-vm"))
     }
 
     @Test func buildAndTestScriptsScrubTransientXcodeProducts() throws {

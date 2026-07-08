@@ -95,7 +95,7 @@ Options:
   --bridge             Run guest→host bridge (dory-open) check
   --guest-agent        Run dory-hv guest-agent vsock smoke (requires DORY_GUEST_KERNEL and DORY_GUEST_INITFS)
   --dax                Run dory-hv virtio-fs DAX coherence probe (requires a signed dory-hv, DORY_HV_BIN)
-  --rosetta            Run Rosetta x86-64 machine execution smoke (requires a signed dory-vm + Rosetta; DORY_VM_HELPER)
+  --rosetta            Record Rosetta machine backend status (pending dory-vmm Rosetta support)
   --usb                Run USB/IP hardware smoke when DORY_USB_TEST_BUSID is set
   --vpn                Record route/DNS state and run userspace networking checks during VPN coexistence testing
   --debug-shell        Run debug shell smoke when DORY_DEBUG_AGENT_SOCK and DORY_DEBUG_CONTAINER_ID are set
@@ -221,7 +221,7 @@ used_mem() {
 process_rss_bytes() {
   local engine="$1" pattern
   case "$engine" in
-    dory|doryd) pattern="${DORY_PROCESS_PATTERN:-Dory|doryd|dory-hv|dory-vmm|dory-vm|dory-vmboot|containermanagerd}" ;;
+    dory|doryd) pattern="${DORY_PROCESS_PATTERN:-Dory|doryd|dory-hv|dory-vmm|gvproxy}" ;;
     orbstack) pattern="${ORBSTACK_PROCESS_PATTERN:-OrbStack}" ;;
     docker-desktop|desktop) pattern="${DOCKER_DESKTOP_PROCESS_PATTERN:-Docker|com.docker}" ;;
     *) pattern="${GENERIC_ENGINE_PROCESS_PATTERN:-$engine}" ;;
@@ -982,10 +982,8 @@ test_dax() {
 }
 
 test_rosetta() {
-  local vm="${DORY_VM_HELPER:-$ROOT/Packages/ContainerizationEngine/.build/out/Products/Debug/dory-vmboot}"
-  [ -x "$vm" ] || { echo "dory-vm helper not found or executable: $vm"; return 1; }
-  [ -e /Library/Apple/usr/libexec/oah/RosettaLinux ] || { echo "Rosetta for Linux not installed (softwareupdate --install-rosetta)"; return 1; }
-  "$vm" --image "${DORY_ROSETTA_IMAGE:-docker.io/library/alpine:latest}" --arch amd64 --rosetta -- 'uname -m' 2>/dev/null | grep -qx x86_64
+  echo "Rosetta machine execution is pending the dory-vmm machine backend; the removed legacy VZ helper path is no longer supported"
+  return 2
 }
 
 test_guest_agent() {
@@ -1257,7 +1255,7 @@ run_engine() {
   elif [ "$RUN_ROSETTA" = "1" ]; then
     run_case "$CURRENT_ENGINE" "Rosetta x86-64 machine execution" test_rosetta
   else
-    skip_case "$CURRENT_ENGINE" "Rosetta x86-64 machine execution" "enable with --rosetta (needs a signed dory-vm + Rosetta installed)"
+    skip_case "$CURRENT_ENGINE" "Rosetta x86-64 machine execution" "pending dory-vmm Rosetta machine backend"
   fi
 
   if [ "$RUN_CLOCK_SYNC" = "1" ] && ! is_dory_engine; then

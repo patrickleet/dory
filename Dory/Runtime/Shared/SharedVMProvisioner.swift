@@ -279,14 +279,7 @@ nonisolated enum SharedVMProvisioner {
     }
 
     static func vmEngineAvailable(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
-        guard environment["DORY_VM_ENGINE"] != "0" else { return false }
-        guard vmHelperBinary() != nil else { return false }
-        let hasKernel = Bundle.main.url(forResource: vmKernelResourceName(), withExtension: "lzfse") != nil
-            || (engineArch == "arm64" && Bundle.main.url(forResource: "dory-vm-kernel", withExtension: "lzfse") != nil)
-            || (engineArch == "arm64" && installedKernelPath() != nil)
-        let hasInitfs = Bundle.main.url(forResource: vmInitfsResourceName(), withExtension: "lzfse") != nil
-            || (engineArch == "arm64" && Bundle.main.url(forResource: "dory-vm-initfs.ext4", withExtension: "lzfse") != nil)
-        return hasKernel && hasInitfs
+        false
     }
 
     static func hostHypervisorSupported() -> Bool {
@@ -301,15 +294,10 @@ nonisolated enum SharedVMProvisioner {
         guard evaluation.support.isSupported else {
             throw ProvisionError.unsupportedHost(evaluation.support.reason)
         }
-        // The Apple-Virtualization (VZ) engine is retired as an x86 path: it drives Apple's
-        // ContainerManager, whose guest handshake never completes against Dory's own guest, so it only
-        // stalls. x86/amd64 images now run on our own dory-hv engine via qemu binfmt (config.rosettaX86).
-        // The VZ tier survives solely for Intel hosts that ship without the dory-hv assets.
+        // The legacy in-app VZ engine is retired. macOS 14 fallback now lives in doryd via dory-vmm,
+        // so this legacy provisioner should never try to launch an app-owned VZ engine.
         if evaluation.tier == .vzShared {
-            guard let socket = try await provisionWithVZEngine(config: config, rosetta: false) else {
-                throw ProvisionError.engineUnavailable
-            }
-            return socket
+            throw ProvisionError.engineUnavailable
         }
         guard let socket = try await provisionWithHVEngine(config: config) else {
             throw ProvisionError.engineUnavailable
@@ -540,18 +528,7 @@ nonisolated enum SharedVMProvisioner {
     }
 
     private static func vmHelperBinary() -> String? {
-        let environment = ProcessInfo.processInfo.environment
-        if let override = environment["DORY_VM_HELPER"],
-           !override.isEmpty,
-           FileManager.default.isExecutableFile(atPath: override) {
-            return override
-        }
-        if let helper = bundledHelperPath(named: "dory-vm"),
-           FileManager.default.isExecutableFile(atPath: helper) {
-            return helper
-        }
-        let cwd = FileManager.default.currentDirectoryPath
-        return helperDevCandidates(named: "dory-vmboot", cwd: cwd).first { FileManager.default.isExecutableFile(atPath: $0) }
+        nil
     }
 
     nonisolated static func helperDevCandidates(

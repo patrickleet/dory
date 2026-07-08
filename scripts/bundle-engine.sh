@@ -6,14 +6,13 @@
 #   * Contents/Helpers/doryd     — launchd/XPC daemon that owns the engine, idle policy, networking,
 #                                   health, and Linux machine lifecycle.
 #   * Contents/Helpers/dorydctl  — diagnostic/control CLI used by readiness and support flows.
-#   * Contents/Helpers/dory-vmm  — per-machine Virtualization.framework helper, signed with
-#                                   com.apple.security.virtualization.
+#   * Contents/Helpers/dory-vmm  — per-machine Virtualization.framework helper and macOS 14 Docker
+#                                   engine fallback, signed with com.apple.security.virtualization.
 #   * Contents/Helpers/dory-network-helper — local networking helper for doryd-owned domains/routes.
 #   * Contents/Helpers/dory-hv    — Dory's own Hypervisor.framework VMM (elastic memory via free-page
 #                                   reporting, SMP, journaled data disk), signed with
-#                                   com.apple.security.hypervisor. Preferred when DORY_HV_ENGINE=1.
+#                                   com.apple.security.hypervisor. Preferred where available.
 #   * Contents/Helpers/gvproxy    — userspace networking (Apache-2.0) for the dory-hv engine.
-#   * Contents/Helpers/dory-vm    — the older Virtualization.framework helper (~100MB), fallback.
 #   * Contents/Helpers/docker, docker-compose, kubectl — host CLIs for clean-Mac Docker/Compose/k8s.
 #   * Contents/Frameworks/libvirglrenderer.dylib, libMoltenVK.dylib — optional experimental
 #                                   Venus/Vulkan renderer payload for in-guest GPU acceleration.
@@ -24,13 +23,10 @@
 #   * Contents/Resources/dory-vm-initfs-<arch>.ext4.lzfse  — LZFSE VM initfs.
 #   * Contents/Resources/dory-agent-linux-<arch>           — guest relay/agent for host AI bridge
 #                                                           and future vsock control features.
-#   * Contents/Resources/dory-engine-rootfs.ext4.lzfse     — optional offline dockerd rootfs when
-#                                                           DORY_ENGINE_ROOTFS is provided, or when
-#                                                           a prepared ~/.dory/hv/rootfs-pristine.ext4 exists.
+#   * Contents/Resources/dory-engine-rootfs-<arch>.ext4.lzfse — offline dockerd rootfs selected by
+#                                                              doryd, including macOS 14 dory-vmm fallback.
 #   Assets are compressed by dory-hv (LZFSE) and decompressed in-process at first launch via Apple's
 #   Compression framework — no external zstd binary or dylib is bundled.
-#   If no engine rootfs is bundled, development builds fetch docker:dind once internally on first
-#   boot; that still requires no host Docker/container install.
 #
 # Set DORY_BUNDLE_LEGACY=1 to additionally inject the heavy offline payload (the docker:dind image
 # tarball + Apple's `container` toolchain) for the legacy SharedVMProvisioner path — adds ~600MB.
@@ -701,18 +697,7 @@ inject_debug_toolbox_into_initfs() {
 
 bundle_doryd_helpers
 
-echo "==> Building + signing the in-process VM engine helper (dory-vm)…"
 PKG="$(dirname "$0")/../Packages/ContainerizationEngine"
-if [ -d "$PKG" ]; then
-  DORY_VM_ENTITLEMENTS="$(mktemp "${TMPDIR:-/tmp}/dory-vm-entitlements.XXXXXX")"
-  cat > "$DORY_VM_ENTITLEMENTS" <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict><key>com.apple.security.virtualization</key><true/></dict></plist>
-PLIST
-  bundle_swiftpm_executable "$PKG" release dory-vmboot "$HELPERS/dory-vm" "$DORY_VM_ENTITLEMENTS"
-  rm -f "$DORY_VM_ENTITLEMENTS"
-fi
 
 echo "==> Building + signing the Hypervisor.framework VM engine (dory-hv)…"
 # dory-hv is Dory's own VMM: elastic memory via free-page reporting, SMP, journaled data disk.
@@ -938,17 +923,27 @@ guest_agent_source_for_arch() {
   return 1
 }
 
-engine_rootfs_source() {
-  if [ -n "${DORY_ENGINE_ROOTFS:-}" ] && [ -f "$DORY_ENGINE_ROOTFS" ]; then
+engine_rootfs_source_for_arch() {
+  local arch="$1" env_name
+  env_name="$(env_for_arch DORY_ENGINE_ROOTFS "$arch")"
+  if [ -n "${!env_name:-}" ] && [ -f "${!env_name}" ]; then
+    printf '%s\n' "${!env_name}"
+    return 0
+  fi
+  if [ "$arch" = "$(host_guest_arch)" ] && [ -n "${DORY_ENGINE_ROOTFS:-}" ] && [ -f "$DORY_ENGINE_ROOTFS" ]; then
     printf '%s\n' "$DORY_ENGINE_ROOTFS"
     return 0
   fi
-  if [ -f "$HOME/.dory/hv/rootfs-pristine.ext4" ]; then
-    printf '%s\n' "$HOME/.dory/hv/rootfs-pristine.ext4"
+  if [ -f "$(dirname "$0")/../guest/out/dory-engine-rootfs-$arch.ext4" ]; then
+    printf '%s\n' "$(dirname "$0")/../guest/out/dory-engine-rootfs-$arch.ext4"
     return 0
   fi
-  if [ -f "$(dirname "$0")/../guest/out/dory-engine-rootfs.ext4" ]; then
-    printf '%s\n' "$(dirname "$0")/../guest/out/dory-engine-rootfs.ext4"
+  if [ -f "$(dirname "$0")/../guest/out/initfs-$arch.ext4" ]; then
+    printf '%s\n' "$(dirname "$0")/../guest/out/initfs-$arch.ext4"
+    return 0
+  fi
+  if [ "$arch" = "$(host_guest_arch)" ] && [ -f "$HOME/.dory/hv/rootfs-pristine.ext4" ]; then
+    printf '%s\n' "$HOME/.dory/hv/rootfs-pristine.ext4"
     return 0
   fi
   return 1
@@ -1069,22 +1064,26 @@ bundle_guest_agent_for_arch() {
   fi
 }
 
+bundle_engine_rootfs_for_arch() {
+  local arch="$1" rootfs_src rootfs_out
+  rootfs_src="$(engine_rootfs_source_for_arch "$arch" || true)"
+  rootfs_out="$RESOURCES/dory-engine-rootfs-$arch.ext4.lzfse"
+  if [ -n "$rootfs_src" ] && [ -f "$rootfs_src" ]; then
+    compress_asset "$rootfs_src" "$rootfs_out"
+    echo "    bundled Resources/$(basename "$rootfs_out") ($(du -h "$rootfs_out" | awk '{print $1}'), from $(du -h "$rootfs_src" | awk '{print $1}'))"
+  else
+    warn_or_fail_missing_bundle_asset "no $arch engine rootfs found; run guest/initfs/build.sh $arch or set $(env_for_arch DORY_ENGINE_ROOTFS "$arch")"
+  fi
+}
+
 echo "==> Bundling VM kernel + initfs assets, compressed (so the engine needs no container install)…"
 for asset_arch in ${DORY_BUNDLE_ARCHES:-arm64 amd64}; do
   bundle_guest_agent_for_arch "$asset_arch"
   bundle_hv_kernel_for_arch "$asset_arch"
   bundle_hv_gpu_kernel_for_arch "$asset_arch"
   bundle_guest_assets_for_arch "$asset_arch"
+  bundle_engine_rootfs_for_arch "$asset_arch"
 done
-
-ENGINE_ROOTFS_SRC="$(engine_rootfs_source || true)"
-if [ -n "$ENGINE_ROOTFS_SRC" ]; then
-  ENGINE_ROOTFS_OUT="$RESOURCES/dory-engine-rootfs.ext4.lzfse"
-  compress_asset "$ENGINE_ROOTFS_SRC" "$ENGINE_ROOTFS_OUT"
-  echo "    bundled Resources/$(basename "$ENGINE_ROOTFS_OUT") ($(du -h "$ENGINE_ROOTFS_OUT" | awk '{print $1}'), from $(du -h "$ENGINE_ROOTFS_SRC" | awk '{print $1}'))"
-else
-  warn_or_fail_missing_bundle_asset "no prepared engine rootfs found; this bundle would fetch docker:dind internally on first boot"
-fi
 
 HOST_GUEST_ARCH="$(native_guest_arch)"
 if [ -f "$RESOURCES/dory-hv-kernel-$HOST_GUEST_ARCH.lzfse" ]; then
@@ -1101,6 +1100,9 @@ if [ -f "$RESOURCES/dory-vm-kernel-$HOST_GUEST_ARCH.lzfse" ]; then
 fi
 if [ -f "$RESOURCES/dory-vm-initfs-$HOST_GUEST_ARCH.ext4.lzfse" ]; then
   ln -sf "dory-vm-initfs-$HOST_GUEST_ARCH.ext4.lzfse" "$RESOURCES/dory-vm-initfs.ext4.lzfse"
+fi
+if [ -f "$RESOURCES/dory-engine-rootfs-$HOST_GUEST_ARCH.ext4.lzfse" ]; then
+  ln -sf "dory-engine-rootfs-$HOST_GUEST_ARCH.ext4.lzfse" "$RESOURCES/dory-engine-rootfs.ext4.lzfse"
 fi
 
 write_doryd_launch_agent
@@ -1119,5 +1121,5 @@ if [ "${DORY_BUNDLE_LEGACY:-0}" = "1" ]; then
 fi
 
 echo "==> Payload injected into $APP"
-echo "    Engine payload ≈ $(du -ch "$RESOURCES"/dory-hv-*.lzfse "$RESOURCES"/dory-vm-*.lzfse "$RESOURCES"/dory-engine-rootfs.ext4.lzfse "$HELPERS"/dory-hv "$HELPERS"/dory-vm "$HELPERS"/docker "$HELPERS"/docker-compose "$HELPERS"/kubectl "$FRAMEWORKS"/*.dylib 2>/dev/null | tail -1 | awk '{print $1}') on disk"
+echo "    Engine payload ≈ $(du -ch "$RESOURCES"/dory-hv-*.lzfse "$RESOURCES"/dory-vm-*.lzfse "$RESOURCES"/dory-engine-rootfs-*.ext4.lzfse "$HELPERS"/dory-hv "$HELPERS"/docker "$HELPERS"/docker-compose "$HELPERS"/kubectl "$FRAMEWORKS"/*.dylib 2>/dev/null | tail -1 | awk '{print $1}') on disk"
 echo "    Re-sign the app bundle before notarization so the payload is sealed."

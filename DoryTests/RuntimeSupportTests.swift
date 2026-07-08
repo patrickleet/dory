@@ -177,17 +177,17 @@ struct RuntimeSupportTests {
     }
 
     @Test func sharedVMHelperDevCandidatesCoverUniversalOutAndHostArchBuilds() {
-        let arm64 = SharedVMProvisioner.helperDevCandidates(named: "dory-vmboot", cwd: "/repo", hostArch: "arm64")
-        let amd64 = SharedVMProvisioner.helperDevCandidates(named: "dory-vmboot", cwd: "/repo", hostArch: "amd64")
+        let arm64 = SharedVMProvisioner.helperDevCandidates(named: "dory-hv", cwd: "/repo", hostArch: "arm64")
+        let amd64 = SharedVMProvisioner.helperDevCandidates(named: "dory-hv", cwd: "/repo", hostArch: "amd64")
 
-        #expect(arm64.contains("/repo/Packages/ContainerizationEngine/.build/out/Products/Debug/dory-vmboot"))
-        #expect(arm64.contains("/repo/Packages/ContainerizationEngine/.build/apple/Products/Debug/dory-vmboot"))
-        #expect(arm64.contains("/repo/Packages/ContainerizationEngine/.build/arm64-apple-macosx/debug/dory-vmboot"))
+        #expect(arm64.contains("/repo/Packages/ContainerizationEngine/.build/out/Products/Debug/dory-hv"))
+        #expect(arm64.contains("/repo/Packages/ContainerizationEngine/.build/apple/Products/Debug/dory-hv"))
+        #expect(arm64.contains("/repo/Packages/ContainerizationEngine/.build/arm64-apple-macosx/debug/dory-hv"))
 
-        #expect(amd64.contains("/repo/Packages/ContainerizationEngine/.build/out/Products/Debug/dory-vmboot"))
-        #expect(amd64.contains("/repo/Packages/ContainerizationEngine/.build/apple/Products/Debug/dory-vmboot"))
-        #expect(amd64.contains("/repo/Packages/ContainerizationEngine/.build/x86_64-apple-macosx/debug/dory-vmboot"))
-        #expect(!amd64.contains("/repo/Packages/ContainerizationEngine/.build/arm64-apple-macosx/debug/dory-vmboot"))
+        #expect(amd64.contains("/repo/Packages/ContainerizationEngine/.build/out/Products/Debug/dory-hv"))
+        #expect(amd64.contains("/repo/Packages/ContainerizationEngine/.build/apple/Products/Debug/dory-hv"))
+        #expect(amd64.contains("/repo/Packages/ContainerizationEngine/.build/x86_64-apple-macosx/debug/dory-hv"))
+        #expect(!amd64.contains("/repo/Packages/ContainerizationEngine/.build/arm64-apple-macosx/debug/dory-hv"))
     }
 
     @Test func sharedVMEmulationInstallerTargetsRequestedArch() throws {

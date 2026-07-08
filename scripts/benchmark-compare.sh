@@ -324,7 +324,7 @@ used_mem() {
 process_rss_bytes() {
   local engine="$1" pattern
   case "$engine" in
-    dory) pattern="${DORY_PROCESS_PATTERN:-Dory|dory-vm|dory-vmboot|containermanagerd}" ;;
+    dory) pattern="${DORY_PROCESS_PATTERN:-Dory|doryd|dory-hv|dory-vmm|gvproxy}" ;;
     orbstack) pattern="${ORBSTACK_PROCESS_PATTERN:-OrbStack}" ;;
     docker-desktop|desktop) pattern="${DOCKER_DESKTOP_PROCESS_PATTERN:-Docker|com.docker}" ;;
     apple|apple-container|container) pattern="${APPLE_CONTAINER_PROCESS_PATTERN:-container-runtime-linux|container-network-vmnet|containerization|com.apple.container}" ;;

@@ -227,16 +227,16 @@ verify_full_bundle() {
   launch_agent="$resources/dev.dory.doryd.plist"
 
   echo "==> Verifying full clean-Mac bundle payload..."
-  for helper in doryd dorydctl dory-vmm dory-network-helper dory-hv dory-vm gvproxy docker docker-compose kubectl dory dory-doctor; do
+  for helper in doryd dorydctl dory-vmm dory-network-helper dory-hv gvproxy docker docker-compose kubectl dory dory-doctor; do
     assert_executable_exists "$helpers/$helper" "bundled helper"
   done
-  for helper in doryd dorydctl dory-vmm dory-network-helper dory-hv dory-vm; do
+  for helper in doryd dorydctl dory-vmm dory-network-helper dory-hv; do
     assert_macho_arches "$helpers/$helper" "$HELPER_ARCHES"
   done
   for helper in gvproxy docker docker-compose kubectl; do
     assert_macho_arches "$helpers/$helper" "$HOST_CLI_ARCHES"
   done
-  for helper in doryd dorydctl dory-vmm dory-network-helper dory-hv dory-vm gvproxy docker docker-compose kubectl dory dory-doctor; do
+  for helper in doryd dorydctl dory-vmm dory-network-helper dory-hv gvproxy docker docker-compose kubectl dory dory-doctor; do
     verify_developer_id_signature "$helpers/$helper"
   done
 
@@ -247,6 +247,7 @@ verify_full_bundle() {
     assert_file_exists "$resources/dory-machine-rootfs-$asset_arch.ext4" "machine rootfs"
     assert_file_exists "$resources/dory-vm-kernel-$asset_arch.lzfse" "compressed VZ kernel"
     assert_file_exists "$resources/dory-vm-initfs-$asset_arch.ext4.lzfse" "compressed VZ initfs"
+    assert_file_exists "$resources/dory-engine-rootfs-$asset_arch.ext4.lzfse" "engine rootfs"
   done
   assert_file_exists "$resources/dory-engine-rootfs.ext4.lzfse" "engine rootfs"
   assert_file_exists "$launch_agent" "bundled launchd plist"
@@ -257,7 +258,7 @@ sign_app() {
   local app="$1"
   echo "==> Signing $(basename "$(dirname "$app")")/Dory.app (Developer ID + hardened runtime)..."
   # NOT --deep: bundle-engine.sh already signed nested helpers with their own entitlements
-  # (dory-hv needs com.apple.security.hypervisor, dory-vm/dory-vmm need virtualization), and --deep
+  # (dory-hv needs com.apple.security.hypervisor, dory-vmm needs virtualization), and --deep
   # would re-sign them without those entitlements.
   codesign --force --options runtime --timestamp --entitlements Dory/Dory.entitlements --sign "$SIGN_IDENTITY" "$app"
 }
@@ -488,7 +489,11 @@ if [ "${DORY_BUNDLE_ENGINE:-1}" = "1" ] && [ "${DORY_BUILD_RUNTIME:-1}" = "1" ] 
   cp "$ARM64_APP/Contents/Helpers/gvproxy" "$RUNTIME_DIR/bin/"
   cp "$ARM64_APP/Contents/Resources/dory-hv-kernel-arm64.lzfse" "$RUNTIME_DIR/share/dory/"
   [ -f "$ARM64_APP/Contents/Resources/dory-agent-linux-arm64" ] && cp "$ARM64_APP/Contents/Resources/dory-agent-linux-arm64" "$RUNTIME_DIR/share/dory/"
-  [ -f "$ARM64_APP/Contents/Resources/dory-engine-rootfs.ext4.lzfse" ] && cp "$ARM64_APP/Contents/Resources/dory-engine-rootfs.ext4.lzfse" "$RUNTIME_DIR/share/dory/"
+  if [ -f "$ARM64_APP/Contents/Resources/dory-engine-rootfs-arm64.ext4.lzfse" ]; then
+    cp "$ARM64_APP/Contents/Resources/dory-engine-rootfs-arm64.ext4.lzfse" "$RUNTIME_DIR/share/dory/dory-engine-rootfs.ext4.lzfse"
+  elif [ -f "$ARM64_APP/Contents/Resources/dory-engine-rootfs.ext4.lzfse" ]; then
+    cp "$ARM64_APP/Contents/Resources/dory-engine-rootfs.ext4.lzfse" "$RUNTIME_DIR/share/dory/"
+  fi
   cp scripts/runtime/dory-engine "$RUNTIME_DIR/dory-engine"
   chmod 0755 "$RUNTIME_DIR/dory-engine"
   cat > "$RUNTIME_DIR/README.md" <<EOF
