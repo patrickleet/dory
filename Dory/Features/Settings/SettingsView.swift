@@ -194,7 +194,7 @@ struct SettingsView: View {
             comparisonRow("Free for commercial use", .yes, .no("$8/user/mo"), .no("Paid for business"), divider: true)
             comparisonRow("Open source", .yes, .no(nil), .no(nil), divider: true)
             comparisonRow("Low memory daemon engine", .yes, .yes, .no(nil), divider: true)
-            comparisonRow("Apple-native virtualization", .yes, .yes, .no(nil), divider: true)
+            comparisonRow("Hypervisor-backed virtualization", .yes, .yes, .no(nil), divider: true)
             comparisonRow("*.local domains + HTTPS", .yes, .yes, .no(nil), divider: true)
             comparisonRow("Drop-in docker & kubectl", .yes, .yes, .yes, divider: true)
             comparisonRow("Kubernetes built-in", .yes, .yes, .yes, divider: true)

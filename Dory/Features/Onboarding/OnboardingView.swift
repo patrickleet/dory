@@ -49,7 +49,7 @@ struct OnboardingView: View {
                 .font(.system(size: 21, weight: .heavy)).foregroundStyle(p.text)
                 .multilineTextAlignment(.center).lineSpacing(2).fixedSize(horizontal: false, vertical: true)
                 .padding(.bottom, 8)
-            Text("A self-contained, Apple-native engine for Docker, Compose, and Kubernetes. One shared VM, a fraction of the RAM — and your tools just work.")
+            Text("A self-contained Mac-native engine for Docker, Compose, and Kubernetes. One shared VM, a fraction of the RAM — and your tools just work.")
                 .font(.system(size: 13)).foregroundStyle(p.text2).multilineTextAlignment(.center).lineSpacing(3)
                 .padding(.bottom, 22)
 
