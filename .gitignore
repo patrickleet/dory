@@ -16,10 +16,12 @@ xcuserdata/
 *.hmap
 *.ipa
 *.pkg
+*.bcsymbolmap
 *.dSYM.zip
 *.dSYM
 *.xcarchive/
 *.xcresult/
+*.xcdistributionlogs/
 *.xctestrun
 TestResults/
 *.app/
@@ -58,10 +60,15 @@ ExportOptions.plist
 
 # Release pipeline output
 release-build*/
+/release/
+/dist/
+/archives/
+/notarization/
 /Dory-*.zip
 /Dory-*.dmg
 /dory-engine-*.tar.gz
 *.notarization-log.json
+*.notary.json
 notarytool-*.json
 *.spctl.log
 *.stapler.log
@@ -82,6 +89,7 @@ guest/.cache/
 .idea/
 .zed/
 .cursor/
+.xcode.env.local
 *.swp
 *.swo
 *~
