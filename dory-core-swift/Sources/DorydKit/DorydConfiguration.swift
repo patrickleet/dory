@@ -28,12 +28,34 @@ public struct DorydEnvironment: Sendable {
             ?? "\(stateDirectory)/agent-vsock-forward.sock"
         let cid = uint32("DORYD_GUEST_CID") ?? 3
 
-        let hvProcess = hvProcessConfiguration(
+        let explicitForward = string("DORYD_AGENT_VSOCK_FORWARD") != nil
+            || string("DORY_AGENT_VSOCK_FORWARD") != nil
+        let hvProcess = rawHVSupported ? hvProcessConfiguration(
             stateDirectory: stateDirectory,
             forwardSocket: forwardSocket
-        )
+        ) : nil
 
-        if hvProcess == nil, string("DORYD_AGENT_VSOCK_FORWARD") == nil, string("DORY_AGENT_VSOCK_FORWARD") == nil {
+        if hvProcess == nil, !explicitForward,
+           let vmmProcess = vmmDockerProcessConfiguration(stateDirectory: stateDirectory) {
+            let dockerdSocket = "\(stateDirectory)/dockerd.sock"
+            let agentSocket = "\(stateDirectory)/agent.sock"
+            return DockerTierConfiguration(
+                home: home,
+                forwardSocketPath: forwardSocket,
+                dockerdSocketPath: dockerdSocket,
+                cid: cid,
+                dockerPort: uint32("DORYD_DOCKER_PORT") ?? 1026,
+                gpuSupported: false,
+                activitySocketPath: string("DORYD_ACTIVITY_SOCK")
+                    ?? "\(stateDirectory)/dataplane-activity.sock",
+                vmmProcess: vmmProcess,
+                agentControl: bool("DORYD_AGENT_CONTROL", default: true)
+                    ? AgentControlConfiguration(directSocketPath: agentSocket)
+                    : nil
+            )
+        }
+
+        if hvProcess == nil, !explicitForward {
             return nil
         }
 
@@ -160,8 +182,8 @@ public struct DorydEnvironment: Sendable {
         }
         let engineRootfs = existingPath(firstOf: ["DORYD_ENGINE_ROOTFS", "DORY_ENGINE_ROOTFS"])
             ?? preparedBundledCompressedResource(
-                named: ["dory-engine-rootfs.ext4"],
-                outputName: "dory-engine-rootfs.ext4",
+                named: ["dory-engine-rootfs-\(hostGuestArch).ext4", "dory-engine-rootfs.ext4"],
+                outputName: "dory-engine-rootfs-\(hostGuestArch).ext4",
                 stateDirectory: stateDirectory
             )
         if let rootfs = engineRootfs {
@@ -193,6 +215,54 @@ public struct DorydEnvironment: Sendable {
         )
     }
 
+    private func vmmDockerProcessConfiguration(stateDirectory: String) -> VmmDockerProcessConfiguration? {
+        guard let helper = executablePath(firstOf: ["DORYD_VMM_HELPER", "DORY_VMM_HELPER"], fallbackCandidates: helperCandidates(named: "dory-vmm")),
+              let kernel = existingPath(firstOf: ["DORYD_VMM_KERNEL", "DORY_VMM_KERNEL"])
+                ?? preparedBundledCompressedResource(
+                    named: ["dory-vm-kernel-\(hostGuestArch)", "dory-vm-kernel"],
+                    outputName: "dory-vm-kernel-\(hostGuestArch)",
+                    stateDirectory: stateDirectory
+                ),
+              let rootfs = existingPath(firstOf: ["DORYD_VMM_ROOTFS", "DORYD_ENGINE_ROOTFS", "DORY_ENGINE_ROOTFS"])
+                ?? preparedPersistentBundledCompressedResource(
+                    named: ["dory-engine-rootfs-\(hostGuestArch).ext4", "dory-engine-rootfs.ext4", "dory-vm-initfs-\(hostGuestArch).ext4"],
+                    outputName: "dory-vz-engine-rootfs-\(hostGuestArch).ext4",
+                    stateDirectory: stateDirectory
+                )
+                ?? preparedPersistentBundledResource(
+                    named: ["dory-machine-rootfs-\(hostGuestArch).ext4", "dory-machine-rootfs.ext4"],
+                    outputName: "dory-vz-engine-rootfs-\(hostGuestArch).ext4",
+                    stateDirectory: stateDirectory
+                ) else {
+            return nil
+        }
+
+        let handoffSocket = "\(stateDirectory)/dory-vmm-docker-handoff.sock"
+        let cmdline = "console=hvc0 root=/dev/vda rw rootwait panic=1 dory.machine_id=docker dory.home=\(home)"
+        var arguments = [
+            "--machine-id", "docker",
+            "--state-dir", stateDirectory,
+            "--kernel", kernel,
+            "--rootfs", rootfs,
+            "--handoff-sock", handoffSocket,
+            "--memory-mb", String(int("DORYD_MEMORY_MB") ?? 2048),
+            "--cpus", String(int("DORYD_CPUS") ?? 4),
+            "--cmdline", cmdline,
+        ]
+        if bool("DORYD_SHARE_HOME", default: true) {
+            arguments.append(contentsOf: ["--share", "home=\(home):\(home):rw"])
+        }
+
+        return VmmDockerProcessConfiguration(
+            executablePath: helper,
+            arguments: arguments,
+            stateDirectory: stateDirectory,
+            handoffSocketPath: handoffSocket,
+            logPath: string("DORYD_VMM_DOCKER_LOG") ?? "\(stateDirectory)/dory-vmm-docker.log",
+            readyTimeoutSeconds: double("DORYD_VMM_DOCKER_READY_TIMEOUT") ?? 90
+        )
+    }
+
     private func shares() -> [String] {
         if let explicit = string("DORYD_SHARES") {
             return explicit.split(separator: ";").map(String.init).filter { !$0.isEmpty }
@@ -203,6 +273,7 @@ public struct DorydEnvironment: Sendable {
 
     private func helperCandidates(named name: String) -> [String] {
         let arch = hostDarwinArch
+        let doryCorePackageRoot = "\(cwd)/dory-core-swift"
         let packageRoot = "\(cwd)/Packages/ContainerizationEngine"
         return [
             bundleHelpersDirectory.map { "\($0)/\(name)" },
@@ -210,6 +281,10 @@ public struct DorydEnvironment: Sendable {
             "\(cwd)/.build/release/\(name)",
             "\(cwd)/.build/\(arch)-apple-macosx/debug/\(name)",
             "\(cwd)/.build/\(arch)-apple-macosx/release/\(name)",
+            "\(doryCorePackageRoot)/.build/debug/\(name)",
+            "\(doryCorePackageRoot)/.build/release/\(name)",
+            "\(doryCorePackageRoot)/.build/\(arch)-apple-macosx/debug/\(name)",
+            "\(doryCorePackageRoot)/.build/\(arch)-apple-macosx/release/\(name)",
             "\(cwd)/Helpers/\(name)",
             "\(cwd)/../Helpers/\(name)",
             "\(packageRoot)/.build/out/Products/Release/\(name)",
@@ -265,6 +340,19 @@ public struct DorydEnvironment: Sendable {
         hostDarwinArch == "x86_64" ? "amd64" : "arm64"
     }
 
+    private var rawHVSupported: Bool {
+        if string("DORYD_RAW_HV_SUPPORTED") != nil {
+            return bool("DORYD_RAW_HV_SUPPORTED", default: true)
+        }
+        if hostDarwinArch == "arm64" {
+            if #available(macOS 15, *) {
+                return true
+            }
+            return false
+        }
+        return true
+    }
+
     private var bundleContentsDirectory: String? {
         guard !executablePath.isEmpty else { return nil }
         let executableURL = URL(fileURLWithPath: executablePath)
@@ -316,6 +404,33 @@ public struct DorydEnvironment: Sendable {
         outputName: String,
         stateDirectory: String
     ) -> String? {
+        preparedBundledCompressedResource(
+            named: names,
+            outputName: outputName,
+            stateDirectory: stateDirectory,
+            refreshIfSourceNewer: true
+        )
+    }
+
+    private func preparedPersistentBundledCompressedResource(
+        named names: [String],
+        outputName: String,
+        stateDirectory: String
+    ) -> String? {
+        preparedBundledCompressedResource(
+            named: names,
+            outputName: outputName,
+            stateDirectory: stateDirectory,
+            refreshIfSourceNewer: false
+        )
+    }
+
+    private func preparedBundledCompressedResource(
+        named names: [String],
+        outputName: String,
+        stateDirectory: String,
+        refreshIfSourceNewer: Bool
+    ) -> String? {
         let directories = [
             bundleResourcesDirectory,
             "\(cwd)/Resources",
@@ -328,19 +443,50 @@ public struct DorydEnvironment: Sendable {
                     .appendingPathComponent(name)
                     .appendingPathExtension("lzfse")
                 guard FileManager.default.fileExists(atPath: source.path) else { continue }
-                return prepareCompressedResource(source: source, outputName: outputName, stateDirectory: stateDirectory)
+                return prepareCompressedResource(
+                    source: source,
+                    outputName: outputName,
+                    stateDirectory: stateDirectory,
+                    refreshIfSourceNewer: refreshIfSourceNewer
+                )
             }
         }
         return nil
     }
 
-    private func prepareCompressedResource(source: URL, outputName: String, stateDirectory: String) -> String? {
+    private func preparedPersistentBundledResource(
+        named names: [String],
+        outputName: String,
+        stateDirectory: String
+    ) -> String? {
+        guard let sourcePath = bundledResource(named: names) else { return nil }
         let directory = URL(fileURLWithPath: stateDirectory)
             .appendingPathComponent("assets", isDirectory: true)
         let output = directory.appendingPathComponent(outputName)
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            if shouldRefreshAsset(source: source, output: output) {
+            if !FileManager.default.fileExists(atPath: output.path) {
+                try FileManager.default.copyItem(atPath: sourcePath, toPath: output.path)
+            }
+            return FileManager.default.fileExists(atPath: output.path) ? output.path : nil
+        } catch {
+            return nil
+        }
+    }
+
+    private func prepareCompressedResource(
+        source: URL,
+        outputName: String,
+        stateDirectory: String,
+        refreshIfSourceNewer: Bool
+    ) -> String? {
+        let directory = URL(fileURLWithPath: stateDirectory)
+            .appendingPathComponent("assets", isDirectory: true)
+        let output = directory.appendingPathComponent(outputName)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            if !FileManager.default.fileExists(atPath: output.path)
+                || (refreshIfSourceNewer && shouldRefreshAsset(source: source, output: output)) {
                 let temporary = directory.appendingPathComponent("\(outputName).partial-\(UUID().uuidString)")
                 do {
                     try DorydLZFSE.decompress(source: source.path, destination: temporary.path)

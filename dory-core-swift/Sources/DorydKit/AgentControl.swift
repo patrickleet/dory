@@ -3,12 +3,20 @@ import DoryCore
 import Foundation
 
 public struct AgentControlConfiguration: Sendable, Equatable {
-    public var forwardSocketPath: String
+    public var forwardSocketPath: String?
+    public var directSocketPath: String?
     public var cid: UInt32
 
     public init(forwardSocketPath: String, cid: UInt32 = 3) {
         self.forwardSocketPath = forwardSocketPath
+        self.directSocketPath = nil
         self.cid = cid
+    }
+
+    public init(directSocketPath: String) {
+        self.forwardSocketPath = nil
+        self.directSocketPath = directSocketPath
+        self.cid = 3
     }
 }
 
@@ -40,8 +48,14 @@ public final class AgentControl: @unchecked Sendable {
     public init(
         configuration: AgentControlConfiguration,
         connector: @escaping Connector = { configuration in
-            try DoryCore.connectAgentControlOverForward(
-                forwardSocketPath: configuration.forwardSocketPath,
+            if let directSocketPath = configuration.directSocketPath {
+                return try LocalAgentControl.connect(socketPath: directSocketPath)
+            }
+            guard let forwardSocketPath = configuration.forwardSocketPath else {
+                throw LocalAgentControlError.missingEndpoint
+            }
+            return try DoryCore.connectAgentControlOverForward(
+                forwardSocketPath: forwardSocketPath,
                 cid: configuration.cid
             )
         }
@@ -125,11 +139,14 @@ public final class AgentControl: @unchecked Sendable {
 }
 
 public enum LocalAgentControlError: Error, Sendable, Equatable, CustomStringConvertible {
+    case missingEndpoint
     case pathTooLong(String)
     case syscall(String, Int32)
 
     public var description: String {
         switch self {
+        case .missingEndpoint:
+            return "agent control endpoint is missing"
         case let .pathTooLong(path):
             return "agent socket path is too long: \(path)"
         case let .syscall(name, code):

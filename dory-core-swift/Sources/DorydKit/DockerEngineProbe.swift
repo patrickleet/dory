@@ -70,6 +70,26 @@ public struct DockerContainerSummary: Decodable, Equatable, Sendable {
 
 public enum DockerEngineProbe {
     public static func containerSummaries(
+        socketPath: String,
+        timeout: TimeInterval = 2
+    ) -> DockerContainerList {
+        do {
+            let response = try request(
+                path: "/containers/json?all=1",
+                socketPath: socketPath,
+                timeout: timeout,
+                maxBytes: 2 * 1024 * 1024
+            )
+            guard (200..<300).contains(response.status) else {
+                return .unavailable("docker returned HTTP \(response.status)")
+            }
+            return .ok(try JSONDecoder().decode([DockerContainerSummary].self, from: response.body))
+        } catch {
+            return .unavailable("\(error)")
+        }
+    }
+
+    public static func containerSummaries(
         forwardSocketPath: String,
         cid: UInt32,
         dockerPort: UInt32,
@@ -90,6 +110,22 @@ public enum DockerEngineProbe {
             return .ok(try JSONDecoder().decode([DockerContainerSummary].self, from: response.body))
         } catch {
             return .unavailable("\(error)")
+        }
+    }
+
+    public static func containerActivity(
+        socketPath: String,
+        timeout: TimeInterval = 2
+    ) -> DockerContainerActivity {
+        switch containerSummaries(socketPath: socketPath, timeout: timeout) {
+        case let .ok(entries):
+            let active = entries.filter { entry in
+                guard let state = entry.state?.lowercased() else { return false }
+                return state == "running" || state == "restarting" || state == "paused"
+            }.count
+            return active > 0 ? .active(active) : .empty
+        case let .unavailable(reason):
+            return .unknown(reason)
         }
     }
 
@@ -117,6 +153,21 @@ public enum DockerEngineProbe {
     }
 
     public static func waitUntilReady(
+        socketPath: String,
+        timeout: TimeInterval = 45,
+        pollInterval: TimeInterval = 0.25
+    ) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if (try? ping(socketPath: socketPath, timeout: min(2, max(0.25, pollInterval * 2)))) == true {
+                return true
+            }
+            Thread.sleep(forTimeInterval: pollInterval)
+        }
+        return false
+    }
+
+    public static func waitUntilReady(
         forwardSocketPath: String,
         cid: UInt32,
         dockerPort: UInt32,
@@ -139,6 +190,19 @@ public enum DockerEngineProbe {
     }
 
     private static func ping(
+        socketPath: String,
+        timeout: TimeInterval
+    ) throws -> Bool {
+        let response = try request(
+            path: "/_ping",
+            socketPath: socketPath,
+            timeout: timeout,
+            maxBytes: 64 * 1024
+        )
+        return (200..<300).contains(response.status)
+    }
+
+    private static func ping(
         forwardSocketPath: String,
         cid: UInt32,
         dockerPort: UInt32,
@@ -153,6 +217,21 @@ public enum DockerEngineProbe {
             maxBytes: 64 * 1024
         )
         return (200..<300).contains(response.status)
+    }
+
+    private static func request(
+        path: String,
+        socketPath: String,
+        timeout: TimeInterval,
+        maxBytes: Int
+    ) throws -> HTTPResponse {
+        let fd = try connectUnix(path: socketPath, timeout: timeout)
+        defer { close(fd) }
+        let request = "GET \(path) HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n"
+        try writeAll(Array(request.utf8), to: fd)
+        shutdown(fd, SHUT_WR)
+        let data = try readHTTPResponseData(from: fd, maxBytes: maxBytes)
+        return try HTTPResponse(data: data)
     }
 
     private static func request(

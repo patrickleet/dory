@@ -92,9 +92,33 @@ pub fn start_dataplane(
         listen_fd,
         std::sync::Arc::new(dory_dataplane::UnixBackend {
             path: dockerd_socket_path.into(),
+            retry_for: None,
         }),
         gpu_supported,
         None,
+    )
+}
+
+/// Plain unix `dockerd` backend with doryd-side activity reporting. This is used by the macOS 14
+/// VZ fallback: the first meaningful Docker request wakes `dory-vmm`, while the backend retries
+/// until that helper publishes its dockerd socket.
+#[uniffi::export]
+pub fn start_dataplane_with_activity(
+    listen_fd: i32,
+    dockerd_socket_path: String,
+    gpu_supported: bool,
+    activity_socket_path: String,
+) -> std::sync::Arc<DoryDataplane> {
+    spawn_dataplane(
+        listen_fd,
+        std::sync::Arc::new(dory_dataplane::UnixBackend {
+            path: dockerd_socket_path.into(),
+            retry_for: Some(std::time::Duration::from_secs(60)),
+        }),
+        gpu_supported,
+        Some(dory_dataplane::serve::ActivityReporter::new(
+            activity_socket_path.into(),
+        )),
     )
 }
 

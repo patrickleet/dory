@@ -22,6 +22,21 @@ public enum DoryCore {
         ))
     }
 
+    /// Start the plain unix docker dataplane and report meaningful docker connection activity to doryd.
+    public static func startDockerDataplane(
+        listenFD: Int32,
+        dockerdSocketPath: String,
+        gpuSupported: Bool,
+        activitySocketPath: String
+    ) -> DoryDataplaneHandle {
+        DoryDataplaneHandle(startDataplaneWithActivity(
+            listenFd: listenFD,
+            dockerdSocketPath: dockerdSocketPath,
+            gpuSupported: gpuSupported,
+            activitySocketPath: activitySocketPath
+        ))
+    }
+
     /// Start the docker-tier dataplane through dory-hv's raw vsock forward socket.
     public static func startDockerForwardDataplane(
         listenFD: Int32,

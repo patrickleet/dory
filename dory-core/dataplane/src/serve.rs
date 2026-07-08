@@ -115,13 +115,15 @@ pub async fn serve_fd<B: Backend>(
 /// `dockerd` reachable directly.
 pub struct UnixBackend {
     pub path: std::path::PathBuf,
+    pub retry_for: Option<Duration>,
 }
 
 impl Backend for UnixBackend {
     type Stream = UnixStream;
     fn connect(&self) -> Pin<Box<dyn Future<Output = std::io::Result<UnixStream>> + Send + '_>> {
         let path = self.path.clone();
-        Box::pin(async move { UnixStream::connect(path).await })
+        let retry_for = self.retry_for;
+        Box::pin(async move { connect_with_optional_retry(path, retry_for).await })
     }
 }
 

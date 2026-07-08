@@ -20,36 +20,67 @@ public struct DockerTierStatus: Sendable {
 public struct DockerTierConfiguration: Sendable {
     public var home: String
     public var forwardSocketPath: String
+    public var dockerdSocketPath: String?
     public var cid: UInt32
     public var dockerPort: UInt32
     public var gpuSupported: Bool
     public var activitySocketPath: String?
     public var hvProcess: HvProcessConfiguration?
+    public var vmmProcess: VmmDockerProcessConfiguration?
     public var agentControl: AgentControlConfiguration?
 
     public init(
         home: String = NSHomeDirectory(),
         forwardSocketPath: String,
+        dockerdSocketPath: String? = nil,
         cid: UInt32 = 3,
         dockerPort: UInt32 = 1026,
         gpuSupported: Bool = false,
         activitySocketPath: String? = nil,
         hvProcess: HvProcessConfiguration? = nil,
+        vmmProcess: VmmDockerProcessConfiguration? = nil,
         agentControl: AgentControlConfiguration? = nil
     ) {
         self.home = home
         self.forwardSocketPath = forwardSocketPath
+        self.dockerdSocketPath = dockerdSocketPath
         self.cid = cid
         self.dockerPort = dockerPort
         self.gpuSupported = gpuSupported
         self.activitySocketPath = activitySocketPath
         self.hvProcess = hvProcess
+        self.vmmProcess = vmmProcess
         self.agentControl = agentControl
+    }
+
+    public var hasManagedHelper: Bool {
+        hvProcess != nil || vmmProcess != nil
     }
 }
 
 public typealias DockerContainerActivityProbe = @Sendable (DockerTierConfiguration) -> DockerContainerActivity
 public typealias DockerReadyWaiter = @Sendable (DockerTierConfiguration, TimeInterval) -> Bool
+
+private protocol DockerManagedProcess: AnyObject, Sendable {
+    var pid: Int32? { get }
+    var isRunning: Bool { get }
+    func start() throws
+    func suspend() -> Bool
+    func resume() -> Bool
+    func stop()
+}
+
+extension HvProcess: DockerManagedProcess {
+    public func stop() {
+        stop(signal: SIGTERM, timeout: 5)
+    }
+}
+
+extension VmmDockerProcess: DockerManagedProcess {
+    public func stop() {
+        stop(signal: SIGTERM, timeout: 5)
+    }
+}
 
 public final class DockerTier: @unchecked Sendable {
     public enum TierError: Error, CustomStringConvertible {
@@ -85,7 +116,7 @@ public final class DockerTier: @unchecked Sendable {
     private let lock = NSLock()
     private var dataplane: DoryDataplaneHandle?
     private var activityServer: DataplaneActivityServer?
-    private var hvProcess: HvProcess?
+    private var helperProcess: (any DockerManagedProcess)?
     private var state: DockerTierState = .stopped
     private var lastError: String?
     private var wakeTask: Task<Void, Never>?
@@ -96,14 +127,20 @@ public final class DockerTier: @unchecked Sendable {
         agentControl injectedAgentControl: AgentControl? = nil,
         portPublisher injectedPortPublisher: PortPublisher? = nil,
         containerActivityProbe: @escaping DockerContainerActivityProbe = { configuration in
-            DockerEngineProbe.containerActivity(
-                forwardSocketPath: configuration.forwardSocketPath,
-                cid: configuration.cid,
-                dockerPort: configuration.dockerPort
-            )
+            if let dockerdSocketPath = configuration.dockerdSocketPath {
+                return DockerEngineProbe.containerActivity(socketPath: dockerdSocketPath)
+            }
+            return DockerEngineProbe.containerActivity(
+                    forwardSocketPath: configuration.forwardSocketPath,
+                    cid: configuration.cid,
+                    dockerPort: configuration.dockerPort
+                )
         },
         dockerReadyWaiter: @escaping DockerReadyWaiter = { configuration, timeout in
-            DockerEngineProbe.waitUntilReady(
+            if let dockerdSocketPath = configuration.dockerdSocketPath {
+                return DockerEngineProbe.waitUntilReady(socketPath: dockerdSocketPath, timeout: timeout)
+            }
+            return DockerEngineProbe.waitUntilReady(
                 forwardSocketPath: configuration.forwardSocketPath,
                 cid: configuration.cid,
                 dockerPort: configuration.dockerPort,
@@ -139,7 +176,7 @@ public final class DockerTier: @unchecked Sendable {
         return DockerTierStatus(
             state: state,
             socketPath: socket.path,
-            hvPID: hvProcess?.pid,
+            hvPID: helperProcess?.pid,
             lastError: lastError
         )
     }
@@ -163,7 +200,7 @@ public final class DockerTier: @unchecked Sendable {
         }
         guard idleController != nil,
               configuration.activitySocketPath != nil,
-              configuration.hvProcess != nil else {
+              configuration.hasManagedHelper else {
             lock.unlock()
             throw TierError.sleepingDataplaneRequiresWakeSupport
         }
@@ -176,7 +213,7 @@ public final class DockerTier: @unchecked Sendable {
             lock.lock()
             dataplane = resources.handle
             activityServer = resources.activityServer
-            hvProcess = nil
+            helperProcess = nil
             state = .sleeping
             wakeTask = nil
             lastError = nil
@@ -211,23 +248,23 @@ public final class DockerTier: @unchecked Sendable {
         lastError = nil
         lock.unlock()
 
-        var startedHv: HvProcess?
+        var startedHelper: (any DockerManagedProcess)?
         do {
-            let hv = configuration.hvProcess.map(HvProcess.init(configuration:))
-            try hv?.start()
-            startedHv = hv
+            let helper = makeManagedProcess()
+            try helper?.start()
+            startedHelper = helper
 
             let resources = try startDataplane()
 
             lock.lock()
-            hvProcess = hv
+            helperProcess = helper
             activityServer = resources.activityServer
             dataplane = resources.handle
             state = .running
             idleController?.setSleeping(false)
             lock.unlock()
         } catch {
-            tearDown(markStopped: false, extraHv: startedHv)
+            tearDown(markStopped: false, extraHelper: startedHelper)
             lock.lock()
             state = .failed
             lastError = "\(error)"
@@ -244,16 +281,23 @@ public final class DockerTier: @unchecked Sendable {
 
     @discardableResult
     public func cleanupStaleHelpers() -> [Int32] {
-        guard let hvConfiguration = configuration.hvProcess,
-              let stateDirectory = HelperProcessJanitor.stateDirectoryArgument(
-                in: ([hvConfiguration.executablePath] + hvConfiguration.arguments).joined(separator: " ")
-              ) else {
-            return []
+        var killed: [Int32] = []
+        if let hvConfiguration = configuration.hvProcess,
+           let stateDirectory = HelperProcessJanitor.stateDirectoryArgument(
+            in: ([hvConfiguration.executablePath] + hvConfiguration.arguments).joined(separator: " ")
+           ) {
+            killed.append(contentsOf: HelperProcessJanitor.terminateStaleHelpers(
+                executablePath: hvConfiguration.executablePath,
+                stateDirectory: stateDirectory
+            ))
         }
-        return HelperProcessJanitor.terminateStaleHelpers(
-            executablePath: hvConfiguration.executablePath,
-            stateDirectory: stateDirectory
-        )
+        if let vmmConfiguration = configuration.vmmProcess {
+            killed.append(contentsOf: HelperProcessJanitor.terminateStaleHelpers(
+                executablePath: vmmConfiguration.executablePath,
+                stateDirectory: vmmConfiguration.stateDirectory
+            ))
+        }
+        return killed
     }
 
     public func sleepForIdle(idleAfter seconds: TimeInterval, now: Date = Date()) -> Bool {
@@ -265,7 +309,7 @@ public final class DockerTier: @unchecked Sendable {
         now: Date,
         activity: DockerContainerActivity
     ) -> Bool {
-        guard let idleController, configuration.hvProcess != nil else {
+        guard let idleController, configuration.hasManagedHelper else {
             return false
         }
 
@@ -281,7 +325,7 @@ public final class DockerTier: @unchecked Sendable {
         }
 
         lock.lock()
-        guard state == .running, let currentHv = hvProcess else {
+        guard state == .running, let currentHelper = helperProcess else {
             lock.unlock()
             idleController.setSleeping(false)
             return false
@@ -299,17 +343,17 @@ public final class DockerTier: @unchecked Sendable {
 
         switch activity {
         case .empty:
-            hvProcess = nil
+            helperProcess = nil
             lastError = nil
             agentControl?.disconnect()
-            currentHv.stop()
+            currentHelper.stop()
             lock.unlock()
             return true
         case .active, .unknown:
             agentControl?.disconnect()
-            guard currentHv.suspend() else {
+            guard currentHelper.suspend() else {
                 state = .running
-                lastError = TierError.suspendFailed(pid: currentHv.pid).description
+                lastError = TierError.suspendFailed(pid: currentHelper.pid).description
                 lock.unlock()
                 idleController.setSleeping(false)
                 return false
@@ -380,11 +424,17 @@ public final class DockerTier: @unchecked Sendable {
         lock.unlock()
         guard currentState == .running else { return [] }
 
-        switch DockerEngineProbe.containerSummaries(
-            forwardSocketPath: configuration.forwardSocketPath,
-            cid: configuration.cid,
-            dockerPort: configuration.dockerPort
-        ) {
+        let summaries: DockerContainerList
+        if let dockerdSocketPath = configuration.dockerdSocketPath {
+            summaries = DockerEngineProbe.containerSummaries(socketPath: dockerdSocketPath)
+        } else {
+            summaries = DockerEngineProbe.containerSummaries(
+                forwardSocketPath: configuration.forwardSocketPath,
+                cid: configuration.cid,
+                dockerPort: configuration.dockerPort
+            )
+        }
+        switch summaries {
         case let .ok(containers):
             var ports = Set<DoryListenPort>()
             for container in containers where container.isRunning {
@@ -409,11 +459,14 @@ public final class DockerTier: @unchecked Sendable {
         lock.unlock()
         switch currentState {
         case .running:
+            if let dockerdSocketPath = configuration.dockerdSocketPath {
+                return DockerEngineProbe.containerSummaries(socketPath: dockerdSocketPath)
+            }
             return DockerEngineProbe.containerSummaries(
-                forwardSocketPath: configuration.forwardSocketPath,
-                cid: configuration.cid,
-                dockerPort: configuration.dockerPort
-            )
+                    forwardSocketPath: configuration.forwardSocketPath,
+                    cid: configuration.cid,
+                    dockerPort: configuration.dockerPort
+                )
         case .failed:
             return .unavailable(currentError ?? "docker tier failed")
         case .stopped, .starting, .sleeping:
@@ -451,7 +504,7 @@ public final class DockerTier: @unchecked Sendable {
             telemetry: telemetry,
             minimumTargetMB: minimumTargetMB,
             maximumTargetMB: maximumTargetMB,
-            canBalloon: configuration.hvProcess != nil
+            canBalloon: false
         )
     }
 
@@ -533,9 +586,9 @@ public final class DockerTier: @unchecked Sendable {
 
         var shouldSyncClock = false
         lock.lock()
-        if state == .sleeping, let currentHv = hvProcess, currentHv.isRunning {
-            guard currentHv.resume() else {
-                lastError = TierError.resumeFailed(pid: currentHv.pid).description
+        if state == .sleeping, let currentHelper = helperProcess, currentHelper.isRunning {
+            guard currentHelper.resume() else {
+                lastError = TierError.resumeFailed(pid: currentHelper.pid).description
                 wakeTask = nil
                 lock.unlock()
                 idleController?.setSleeping(true)
@@ -563,10 +616,10 @@ public final class DockerTier: @unchecked Sendable {
         lock.unlock()
 
         do {
-            let hv = try startFreshHvProcess()
+            let helper = try startFreshManagedProcess()
             lock.lock()
             if dockerReadyWaiter(configuration, 45) {
-                hvProcess = hv
+                helperProcess = helper
                 state = .running
                 lastError = nil
                 wakeTask = nil
@@ -578,11 +631,11 @@ public final class DockerTier: @unchecked Sendable {
                     _ = syncAgentClockAfterWake()
                 }
             } else {
-                hvProcess = nil
+                helperProcess = nil
                 state = .sleeping
                 lastError = TierError.readyTimeout.description
                 wakeTask = nil
-                hv?.stop()
+                helper?.stop()
                 lock.unlock()
                 idleController?.setSleeping(true)
             }
@@ -606,11 +659,20 @@ public final class DockerTier: @unchecked Sendable {
         return result
     }
 
-    private func startFreshHvProcess() throws -> HvProcess? {
-        guard let hvConfiguration = configuration.hvProcess else { return nil }
-        let hv = HvProcess(configuration: hvConfiguration)
-        try hv.start()
-        return hv
+    private func startFreshManagedProcess() throws -> (any DockerManagedProcess)? {
+        let helper = makeManagedProcess()
+        try helper?.start()
+        return helper
+    }
+
+    private func makeManagedProcess() -> (any DockerManagedProcess)? {
+        if let vmmConfiguration = configuration.vmmProcess {
+            return VmmDockerProcess(configuration: vmmConfiguration)
+        }
+        if let hvConfiguration = configuration.hvProcess {
+            return HvProcess(configuration: hvConfiguration)
+        }
+        return nil
     }
 
     private func startActivityServerIfNeeded() throws -> DataplaneActivityServer? {
@@ -632,23 +694,40 @@ public final class DockerTier: @unchecked Sendable {
         do {
             let fd = try socket.bind()
             let handle: DoryDataplaneHandle
-            if let activitySocketPath = configuration.activitySocketPath, idleController != nil {
-                handle = DoryCore.startDockerForwardDataplane(
-                    listenFD: fd,
-                    forwardSocketPath: configuration.forwardSocketPath,
-                    cid: configuration.cid,
-                    port: configuration.dockerPort,
-                    gpuSupported: configuration.gpuSupported,
-                    activitySocketPath: activitySocketPath
-                )
+            if let dockerdSocketPath = configuration.dockerdSocketPath {
+                if let activitySocketPath = configuration.activitySocketPath, idleController != nil {
+                    handle = DoryCore.startDockerDataplane(
+                        listenFD: fd,
+                        dockerdSocketPath: dockerdSocketPath,
+                        gpuSupported: configuration.gpuSupported,
+                        activitySocketPath: activitySocketPath
+                    )
+                } else {
+                    handle = DoryCore.startDockerDataplane(
+                        listenFD: fd,
+                        dockerdSocketPath: dockerdSocketPath,
+                        gpuSupported: configuration.gpuSupported
+                    )
+                }
             } else {
-                handle = DoryCore.startDockerForwardDataplane(
-                    listenFD: fd,
-                    forwardSocketPath: configuration.forwardSocketPath,
-                    cid: configuration.cid,
-                    port: configuration.dockerPort,
-                    gpuSupported: configuration.gpuSupported
-                )
+                if let activitySocketPath = configuration.activitySocketPath, idleController != nil {
+                    handle = DoryCore.startDockerForwardDataplane(
+                        listenFD: fd,
+                        forwardSocketPath: configuration.forwardSocketPath,
+                        cid: configuration.cid,
+                        port: configuration.dockerPort,
+                        gpuSupported: configuration.gpuSupported,
+                        activitySocketPath: activitySocketPath
+                    )
+                } else {
+                    handle = DoryCore.startDockerForwardDataplane(
+                        listenFD: fd,
+                        forwardSocketPath: configuration.forwardSocketPath,
+                        cid: configuration.cid,
+                        port: configuration.dockerPort,
+                        gpuSupported: configuration.gpuSupported
+                    )
+                }
             }
             return DataplaneResources(handle: handle, activityServer: server)
         } catch {
@@ -657,16 +736,16 @@ public final class DockerTier: @unchecked Sendable {
         }
     }
 
-    private func tearDown(markStopped: Bool, extraHv: HvProcess? = nil) {
+    private func tearDown(markStopped: Bool, extraHelper: (any DockerManagedProcess)? = nil) {
         let currentDataplane: DoryDataplaneHandle?
-        let currentHv: HvProcess?
+        let currentHelper: (any DockerManagedProcess)?
         let currentActivityServer: DataplaneActivityServer?
         lock.lock()
         currentDataplane = dataplane
-        currentHv = hvProcess ?? extraHv
+        currentHelper = helperProcess ?? extraHelper
         currentActivityServer = activityServer
         dataplane = nil
-        hvProcess = nil
+        helperProcess = nil
         activityServer = nil
         wakeTask = nil
         if markStopped {
@@ -678,7 +757,7 @@ public final class DockerTier: @unchecked Sendable {
         currentDataplane?.shutdown()
         currentActivityServer?.stop()
         agentControl?.disconnect()
-        currentHv?.stop()
+        currentHelper?.stop()
         unlink(socket.path)
     }
 

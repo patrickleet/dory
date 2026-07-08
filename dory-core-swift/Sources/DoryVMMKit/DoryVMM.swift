@@ -23,6 +23,7 @@ public struct DoryVMMArguments: Sendable, Equatable {
     public var detail = "helper handoff ready"
     public var memoryMB: UInt64 = 2048
     public var cpuCount: Int = 2
+    public var kernelCommandLine: String?
     public var readyTimeoutSeconds: TimeInterval = 60
     public var exitAfterHandoff = false
     public var handoffOnly = false
@@ -87,6 +88,8 @@ public func parseDoryVMMArguments(_ raw: [String]) throws -> DoryVMMArguments {
             parsed.memoryMB = try uint64Value(after: argument, from: raw, index: &index)
         case "--cpus":
             parsed.cpuCount = max(1, Int(try uint64Value(after: argument, from: raw, index: &index)))
+        case "--cmdline":
+            parsed.kernelCommandLine = try value(after: argument, from: raw, index: &index)
         case "--handoff-sock":
             parsed.handoffSocketPath = try value(after: argument, from: raw, index: &index)
         case "--dockerd-sock":
@@ -338,6 +341,7 @@ public enum DoryVMMMain {
                 handoffSocketPath: handoffSocketPath,
                 memoryMB: arguments.memoryMB,
                 cpuCount: arguments.cpuCount,
+                kernelCommandLine: arguments.kernelCommandLine,
                 readyTimeoutSeconds: arguments.readyTimeoutSeconds,
                 shares: arguments.shares
             )
@@ -391,6 +395,7 @@ public enum DoryVMMMain {
         handoffSocketPath: String,
         memoryMB: UInt64,
         cpuCount: Int,
+        kernelCommandLine: String?,
         readyTimeoutSeconds: TimeInterval,
         shares: [DoryMachineShareConfiguration]
     ) throws -> DoryVMMRuntime {
@@ -403,6 +408,7 @@ public enum DoryVMMMain {
             rootfsPath: rootfsPath,
             memoryMB: memoryMB,
             cpuCount: cpuCount,
+            kernelCommandLine: kernelCommandLine,
             shares: shares
         )
         let configuration = try DoryVZConfigurationBuilder.makeConfiguration(spec: spec, serialOutput: serialLog)
