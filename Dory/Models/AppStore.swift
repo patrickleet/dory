@@ -315,16 +315,25 @@ final class AppStore {
         routeDockerCLI = on
         UserDefaults.standard.set(on, forKey: Self.routeDockerKey)
         Task {
-            if on, runtimeKind != .mock {
-                await DockerContext.activate(socketPath: shimSocketPath)
-                HostDockerCLI.install()
-                await detectDockerHostConflict()
+            if on {
+                await configureTerminalDockerCLI()
             } else if !on {
                 DockerContext.deactivateSync()
                 HostDockerCLI.remove()
                 dockerHostConflict = nil
             }
         }
+    }
+
+    @discardableResult
+    private func configureTerminalDockerCLI() async -> Bool {
+        guard routeDockerCLI, runtimeKind != .mock, !isAutomationContext else { return false }
+        let installed = HostDockerCLI.install()
+        if enginePreference == .dory || loadState != .engineOff {
+            await DockerContext.activate(socketPath: shimSocketPath)
+        }
+        await detectDockerHostConflict()
+        return installed
     }
 
     func setOpenLoginsOnMac(_ on: Bool) {
@@ -625,9 +634,11 @@ final class AppStore {
         default:
             await connectPreferredBackend()
         }
-        // With no live engine there is nothing to proxy: don't stand up the shim or, worse, redirect
-        // the user's `docker` CLI at a dead socket. Injected fixture runtimes still wire the shim so
-        // shim tests can drive it.
+        // Terminal integration only needs the bundled CLI and Dory's stable socket path; it should be
+        // installed even while the engine is off/asleep so clean-Mac installs have `docker` on PATH.
+        await configureTerminalDockerCLI()
+        // With no live engine there is nothing to proxy. Injected fixture runtimes still wire the
+        // shim so shim tests can drive it.
         guard runtimeKind == .mock || loadState != .engineOff else { return }
         // Bring up the Docker-compatible socket before ancillary inventory work. Kubernetes and
         // machine discovery can involve external CLIs; they should never delay `docker` readiness.
@@ -637,11 +648,6 @@ final class AppStore {
             startShim()
         }
         startPortForwarding()
-        if routeDockerCLI && runtimeKind != .mock {
-            await DockerContext.activate(socketPath: shimSocketPath)
-            HostDockerCLI.install()
-            await detectDockerHostConflict()
-        }
         startAutoRefresh()
         Task { [weak self] in
             guard let self else { return }
