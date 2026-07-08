@@ -40,6 +40,19 @@ struct AgentModeTests {
         #expect(DoryAppDelegate.isTestHost == true)
     }
 
+    @Test func duplicateInstanceDetectionIgnoresCurrentProcess() {
+        #expect(!DoryAppDelegate.hasOtherInstance(currentProcessIdentifier: 10, candidates: [10]))
+        #expect(DoryAppDelegate.hasOtherInstance(currentProcessIdentifier: 10, candidates: [9, 10]))
+    }
+
+    @Test func staleInstancePIDsIgnoreCurrentAndInvalidCandidates() {
+        #expect(DoryAppDelegate.staleInstancePIDs(currentProcessIdentifier: 10, candidates: [-1, 0, 10, 11, 12]) == [11, 12])
+    }
+
+    @Test func instanceLockPathLivesUnderDoryHome() {
+        #expect(DoryAppDelegate.instanceLockPath(home: "/Users/test") == "/Users/test/.dory/dory-app.lock")
+    }
+
     @Test func windowGateInertUnderTests() {
         #expect(DoryAppDelegate.isTestHost == true)
         let store = AppStore()

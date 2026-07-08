@@ -35,7 +35,7 @@ struct MachinesView: View {
                     .background(p.accentSoft, in: RoundedRectangle(cornerRadius: 20))
                 VStack(spacing: 8) {
                     Text("No Linux machines yet").font(.system(size: 22, weight: .bold)).foregroundStyle(p.text)
-                    Text("Spin up a full Linux distro — Ubuntu, Debian, Fedora, Rocky, openSUSE and more — each with systemd and an instant root shell, running inside Dory's engine.")
+                    Text("Spin up a full isolated Linux VM — Ubuntu, Debian, Fedora, Rocky, openSUSE and more — each with systemd, a persistent disk, an address, and an instant root shell.")
                         .font(.system(size: 13.5)).foregroundStyle(p.text2)
                         .multilineTextAlignment(.center).lineSpacing(4)
                         .frame(maxWidth: 460)
@@ -61,10 +61,10 @@ struct MachinesView: View {
 
     private var featurePills: some View {
         HStack(spacing: 8) {
+            featurePill("Isolated VM", "rectangle.stack.badge.person.crop")
             featurePill("systemd", "gearshape.2")
             featurePill("Root shell", "terminal")
             featurePill("Persistent disk", "internaldrive")
-            featurePill("Apple Silicon", "cpu")
         }
     }
 
@@ -137,14 +137,14 @@ private struct MachineCard: View {
                     .padding(.bottom, 12)
             }
 
-            if let port = machine.sshPort {
+            if let command = store.machineTerminalCommand(machine) {
                 HStack(spacing: 6) {
                     Image(systemName: "terminal").font(.system(size: 11)).foregroundStyle(p.text3)
-                    Text("ssh \(machine.username)@localhost -p \(port)").font(.mono(11)).foregroundStyle(p.text2).lineLimit(1)
+                    Text(command).font(.mono(11)).foregroundStyle(p.text2).lineLimit(1).truncationMode(.middle)
                     Spacer(minLength: 0)
                     Button {
                         NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString("ssh \(machine.username)@localhost -p \(port)", forType: .string)
+                        NSPasteboard.general.setString(command, forType: .string)
                     } label: {
                         Image(systemName: "doc.on.doc").font(.system(size: 10)).foregroundStyle(p.text3)
                     }.buttonStyle(.plain)
@@ -158,7 +158,7 @@ private struct MachineCard: View {
                 actionButton(isRunning ? "stop.fill" : "play.fill", isRunning ? "Stop" : "Start", prominent: !isRunning) {
                     store.toggleMachine(machine)
                 }
-                actionButton("terminal", "Terminal", prominent: false, enabled: isRunning) {
+                actionButton("terminal", "Terminal", prominent: false, enabled: isRunning && store.canOpenMachineTerminal(machine)) {
                     openWindow(value: store.terminalSession(for: machine))
                 }
                 iconButton("trash") { confirmingDelete = true }
@@ -218,7 +218,7 @@ private struct MachineCard: View {
         .menuIndicator(.hidden)
         .frame(width: 22)
         .fixedSize()
-        .disabled(store.isMachineBusy(machine.name))
+        .disabled(store.isMachineBusy(machine.name) || !store.canUseMachineArtifacts(machine))
     }
 
     private var statusPill: some View {
@@ -285,6 +285,7 @@ private struct MachineEditSheet: View {
 
     @State private var cpus = 4
     @State private var memoryGB = 4
+    @State private var address = ""
 
     private struct MountRow: Identifiable, Hashable {
         let id = UUID()
@@ -309,6 +310,7 @@ private struct MachineEditSheet: View {
                 VStack(alignment: .leading, spacing: 18) {
                     warning
                     resourceRow
+                    addressBlock
                     mountsBlock
                     portsBlock
                 }
@@ -317,7 +319,7 @@ private struct MachineEditSheet: View {
             Divider().overlay(p.border)
             footer
         }
-        .frame(width: 540, height: 520)
+        .frame(width: 540, height: 560)
         .background(p.bgWindow)
         .task { await load() }
     }
@@ -326,6 +328,7 @@ private struct MachineEditSheet: View {
         let settings = await store.machineSettings(machine.name)
         cpus = max(1, min(8, settings.cpus ?? 4))
         memoryGB = max(1, min(16, settings.memoryMB.map { $0 / 1024 } ?? 4))
+        address = settings.address ?? machine.ip
         mountRows = settings.mounts.map { MountRow(host: $0.host, guest: $0.guest) }
         portRows = settings.ports.map { PortRow(host: String($0.host), guest: String($0.guest)) }
     }
@@ -337,7 +340,7 @@ private struct MachineEditSheet: View {
                 .background(p.accentSoft, in: RoundedRectangle(cornerRadius: 10))
             VStack(alignment: .leading, spacing: 1) {
                 Text("Edit \(machine.name)").font(.system(size: 15, weight: .bold)).foregroundStyle(p.text)
-                Text("Apply new resources, mounts and ports").font(.system(size: 11.5)).foregroundStyle(p.text3)
+                Text("Apply resources, address, mounts and ports").font(.system(size: 11.5)).foregroundStyle(p.text3)
             }
             Spacer()
         }
@@ -373,6 +376,15 @@ private struct MachineEditSheet: View {
                 .frame(width: 180)
             }
             Spacer(minLength: 0)
+        }
+    }
+
+    private var addressBlock: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionLabel("ADDRESS")
+            fieldInput("\(machine.name).dory.local", text: $address, width: 260)
+            Text("Use a hostname such as \(machine.name).dory.local for terminal access and local DNS.")
+                .font(.system(size: 11)).foregroundStyle(p.text3)
         }
     }
 
@@ -517,7 +529,13 @@ private struct MachineEditSheet: View {
                   host > 0, guest > 0 else { return nil }
             return PortPair(host: host, guest: guest)
         }
-        let settings = MachineSettings(cpus: cpus, memoryMB: memoryGB * 1024, mounts: mounts, ports: ports)
+        let settings = MachineSettings(
+            cpus: cpus,
+            memoryMB: memoryGB * 1024,
+            mounts: mounts,
+            ports: ports,
+            address: address.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
         let target = machine
         store.editMachineTarget = nil
         Task { _ = await store.editMachine(target, settings: settings) }

@@ -283,6 +283,7 @@ struct Machine: Identifiable, Hashable, Sendable {
     var uid: Int? = nil
     var homePath: String? = nil
     var sshPort: Int? = nil
+    var shellSocketPath: String = ""
     var id: String { name }
 
     var badgeColor: Color { Color(hex: badgeHex) }
@@ -406,7 +407,7 @@ enum EnginePreference: String, CaseIterable, Identifiable, Sendable {
 
     var label: String {
         switch self {
-        case .dory: "Dory engine"
+        case .dory: "Dory daemon"
         case .external: "Existing engine"
         case .custom: "Custom socket"
         }
@@ -414,7 +415,7 @@ enum EnginePreference: String, CaseIterable, Identifiable, Sendable {
 
     var summary: String {
         switch self {
-        case .dory: "Dory's bundled engine — memory reclaim, GPU, x86, Kubernetes, machines"
+        case .dory: "doryd-managed engine for Docker, Compose, Kubernetes, networking, and VM machines"
         case .external: "Use a Docker engine already on this Mac (Colima, Docker Desktop, OrbStack, Rancher, Podman)"
         case .custom: "Point Dory at any Docker-compatible unix socket"
         }
@@ -427,7 +428,7 @@ enum SettingsTab: String, CaseIterable, Identifiable, Sendable {
     var label: String {
         switch self {
         case .general: "General"
-        case .engine: "Docker Engine"
+        case .engine: "Engine & Daemon"
         case .resources: "Resources"
         case .autoIdle: "Auto-Idle"
         case .network: "Network"

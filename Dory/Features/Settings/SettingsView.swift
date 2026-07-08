@@ -101,7 +101,7 @@ struct SettingsView: View {
                 .disabled(store.migrationBusy || store.migrationInventory == nil || store.runtimeKind != .sharedVM)
                 .accessibilityIdentifier("migrate-import")
                 if store.migrationInventory != nil && store.runtimeKind != .sharedVM {
-                    Text("Switch to Dory's shared VM (Docker Engine tab) to import.")
+                    Text("Switch to Dory's daemon engine (Engine & Daemon tab) to import.")
                         .font(.system(size: 11.5)).foregroundStyle(p.text3)
                 }
                 if !store.migrationStatus.isEmpty {
@@ -168,7 +168,7 @@ struct SettingsView: View {
             comparisonHeader
             comparisonRow("Free for commercial use", .yes, .no("$8/user/mo"), .no("Paid for business"), divider: true)
             comparisonRow("Open source", .yes, .no(nil), .no(nil), divider: true)
-            comparisonRow("Low memory (one shared VM)", .yes, .yes, .no(nil), divider: true)
+            comparisonRow("Low memory daemon engine", .yes, .yes, .no(nil), divider: true)
             comparisonRow("Apple-native virtualization", .yes, .yes, .no(nil), divider: true)
             comparisonRow("*.local domains + HTTPS", .yes, .yes, .no(nil), divider: true)
             comparisonRow("Drop-in docker & kubectl", .yes, .yes, .yes, divider: true)
@@ -373,11 +373,15 @@ struct SettingsView: View {
         let cores = ProcessInfo.processInfo.processorCount
         let ramGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
         return VStack(alignment: .leading, spacing: 20) {
+            groupLabel("DORY PROCESSES")
+            processMemoryPanel
+
             groupLabel("THIS MAC")
-            resourceMeter("CPU cores", "Engine uses up to 4 of \(cores) cores", min(1, 4.0 / Double(max(cores, 1))))
-            resourceMeter("Memory", String(format: "%.0f GB installed · grows on demand", ramGB), min(1, 4.0 / max(ramGB, 1)))
-            infoPanel("Dory's engine uses up to 4 CPU cores and allocates memory on demand — it reclaims RAM back to macOS when idle instead of holding a fixed reservation, so there are no manual limits to tune.")
+            resourceMeter("CPU cores", "\(cores) logical cores available", 1)
+            resourceMeter("Memory", String(format: "%.0f GB installed", ramGB), 1)
+            infoPanel("Dory tracks the app, doryd, the engine VM, machine VMs, networking helpers, and bundled CLI helpers separately. Auto-Idle is handled by doryd, so the engine VM can sleep when no workload needs it while state remains on disk.")
         }
+        .task { await store.refreshProcessMemory() }
     }
 
     private func resourceMeter(_ label: String, _ value: String, _ fraction: Double) -> some View {
@@ -388,6 +392,90 @@ struct SettingsView: View {
                 Text(value).font(.system(size: 12.5, weight: .bold)).monospacedDigit().foregroundStyle(p.accentText)
             }
             ThinBar(fraction: fraction, tint: p.accent, height: 6)
+        }
+    }
+
+    private var processMemoryPanel: some View {
+        let snapshot = store.processMemorySnapshot
+        return VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(snapshot.totalResidentDisplay)
+                        .font(.system(size: 18, weight: .bold))
+                        .monospacedDigit()
+                        .foregroundStyle(p.accentText)
+                    Text("resident across Dory processes")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(p.text3)
+                }
+                Spacer(minLength: 0)
+                Button {
+                    Task { await store.refreshProcessMemory() }
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(p.text2)
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(p.bgInput, in: RoundedRectangle(cornerRadius: 8))
+                        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(p.border))
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 15).padding(.vertical, 13)
+            if snapshot.groupedRows.isEmpty {
+                Text("No Dory processes found.")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(p.text3)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 15).padding(.vertical, 12)
+                    .overlay(alignment: .top) { Rectangle().fill(p.border).frame(height: 1) }
+            } else {
+                ForEach(snapshot.groupedRows) { row in
+                    memoryRow(row)
+                }
+            }
+            if snapshot.duplicateAppInstanceCount > 0 {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(p.amber)
+                    Text("\(snapshot.duplicateAppInstanceCount) extra Dory app instance\(snapshot.duplicateAppInstanceCount == 1 ? "" : "s") detected.")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(p.amber)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 15).padding(.vertical, 10)
+                .overlay(alignment: .top) { Rectangle().fill(p.border).frame(height: 1) }
+            }
+        }
+        .background(p.bgElevated, in: RoundedRectangle(cornerRadius: 11))
+        .overlay(RoundedRectangle(cornerRadius: 11).strokeBorder(p.border))
+    }
+
+    private func memoryRow(_ row: DoryProcessMemoryRow) -> some View {
+        HStack(spacing: 10) {
+            Circle().fill(processDot(row.role)).frame(width: 7, height: 7)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(row.title).font(.system(size: 12.5, weight: .semibold)).foregroundStyle(p.text)
+                Text(row.subtitle).font(.system(size: 11)).foregroundStyle(p.text3).lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            Text(row.residentDisplay)
+                .font(.system(size: 12, weight: .bold))
+                .monospacedDigit()
+                .foregroundStyle(p.text2)
+        }
+        .padding(.horizontal, 15).padding(.vertical, 10)
+        .overlay(alignment: .top) { Rectangle().fill(p.border).frame(height: 1) }
+    }
+
+    private func processDot(_ role: DoryProcessRole) -> Color {
+        switch role {
+        case .app: p.accentText
+        case .daemon: p.green
+        case .dockerVM, .machineVM: p.amber
+        case .networking: p.accent
+        case .helper: p.text3
         }
     }
 
@@ -404,7 +492,10 @@ struct SettingsView: View {
                     Text(engineDescription(for: kind)).font(.system(size: 11.5)).foregroundStyle(p.text3)
                 }
                 Spacer(minLength: 0)
-                Text("v\(store.engineVersion)").font(.system(size: 12, weight: .bold)).monospacedDigit().foregroundStyle(p.accentText)
+                VStack(alignment: .trailing, spacing: 1) {
+                    Text("v\(store.engineVersion)").font(.system(size: 12, weight: .bold)).monospacedDigit().foregroundStyle(p.accentText)
+                    Text(store.runtimeAuthorityDisplay).font(.system(size: 10.5, weight: .semibold)).foregroundStyle(p.text3)
+                }
             }
             .padding(.horizontal, 15).padding(.vertical, 13)
             .background(p.bgElevated, in: RoundedRectangle(cornerRadius: 11))
@@ -414,16 +505,16 @@ struct SettingsView: View {
             engineBackendCard
                 .padding(.bottom, 22)
 
-            groupLabel("DORY SHARED VM")
+            groupLabel("DORY DAEMON ENGINE")
             VStack(alignment: .leading, spacing: 12) {
-                Text("Run every container in one shared Linux VM — like OrbStack — on Dory's own engine. The app bundles the engine, kernel, networking, Docker CLI, Compose, and kubectl, so it needs no Docker, OrbStack, Colima, Homebrew, or Apple container toolchain on the user's Mac. Memory is returned to macOS as workloads idle. Metal-backed AI services on the Mac are reachable from containers at host.dory.internal on ports 11434, 1234, and 18190. Requires macOS 15 or later on Apple silicon or Intel; installs without bundled engine assets can use a Docker-compatible local engine.")
+                Text("Run containers in Dory's daemon-managed Linux engine VM. The app talks to doryd over launchd/XPC; doryd owns the Docker socket, local networking, wake/sleep, Auto-Idle, and durable engine state. Linux Machines are separate VM machines with their own assigned addresses, not containers inside this engine.")
                     .font(.system(size: 12.5)).foregroundStyle(p.text2).lineSpacing(4)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 HStack(spacing: 8) {
                     Button {
                         Task { await store.useSharedVM() }
                     } label: {
-                        Text(onShared ? "Running on Dory's engine" : "Use Dory's engine")
+                        Text(onShared ? (store.dorydRuntimeActive ? "Managed by doryd" : "Running on Dory's engine") : "Use Dory's daemon")
                             .font(.system(size: 12.5, weight: .semibold))
                             .foregroundStyle(onShared ? p.text2 : .white)
                             .padding(.horizontal, 16).padding(.vertical, 9)
@@ -461,7 +552,7 @@ struct SettingsView: View {
             .overlay(RoundedRectangle(cornerRadius: 11).strokeBorder(p.border))
             .padding(.bottom, 22)
 
-            groupLabel("APPLE CONTAINER")
+            groupLabel("REFERENCE BACKEND")
             appleContainerCard
                 .padding(.bottom, 22)
 
@@ -470,7 +561,7 @@ struct SettingsView: View {
                 VStack(spacing: 0) {
                     toggleRow(
                         "Run Intel (x86/amd64) images",
-                        "Run amd64 images (SQL Server, Oracle, older x86 builds) on Dory's own engine through QEMU emulation — no separate VM, so the memory advantage stays. Emulated x86 is slower than native arm64; leave off when you don't need it to keep the guest lean. Restarts the engine.",
+                        "Run amd64 images (SQL Server, Oracle, older x86 builds) on Dory's daemon engine through QEMU emulation. Emulated x86 is slower than native arm64; leave off when you don't need it to keep the guest lean. Restarts the engine.",
                         isOn: Binding(get: { store.rosettaX86Enabled }, set: { on in Task { await store.setRosettaX86(on) } }),
                         divider: false,
                         disabled: !onShared
@@ -638,7 +729,7 @@ struct SettingsView: View {
     private func engineDescription(for kind: RuntimeKind) -> String {
         switch kind {
         case .docker: "Proxying a host Docker-compatible engine"
-        case .sharedVM: "One shared Linux VM on Dory's own engine"
+        case .sharedVM: store.dorydRuntimeActive ? "Daemon-managed Linux engine VM" : "One shared Linux VM on Dory's own engine"
         case .appleContainer: "Apple container — one micro-VM per container"
         case .mock: "Demo data"
         case .disconnected: "No engine running"
@@ -665,11 +756,50 @@ struct SettingsView: View {
             VStack(spacing: 0) {
                 toggleRow(
                     "Enable *.dory.local domains",
-                    "Give each container an automatic *.dory.local name with local HTTPS. Turn this off if the proxy ports conflict, or if your DNS is managed (MDM / corporate) and can't be pointed at Dory.",
+                    "Let doryd publish automatic *.dory.local names with local HTTPS for containers and machine addresses. Turn this off if proxy ports conflict or managed DNS cannot be pointed at Dory.",
                     isOn: Binding(get: { store.domainsEnabled }, set: { store.applyNetworkingSettings(domainsEnabled: $0) }),
                     divider: false
                 )
             }
+            .background(p.bgElevated, in: RoundedRectangle(cornerRadius: 11))
+            .overlay(RoundedRectangle(cornerRadius: 11).strokeBorder(p.border))
+            .padding(.bottom, 22)
+
+            groupLabel("SYSTEM ACCESS")
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Authorize local domains")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(p.text)
+                        Text("Installs the resolver and macOS port redirects for \(store.domainSuffix), including localhost 80 and 443.")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(p.text3)
+                            .lineLimit(2)
+                    }
+                    Spacer(minLength: 0)
+                    Button {
+                        Task { await store.authorizeLocalNetworking() }
+                    } label: {
+                        Text(store.networkingAuthorizationInFlight ? "Authorizing" : "Authorize")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 13)
+                            .padding(.vertical, 7)
+                            .background(store.dorydRuntimeActive ? p.accent : p.text3, in: RoundedRectangle(cornerRadius: 7))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!store.dorydRuntimeActive || store.networkingAuthorizationInFlight)
+                }
+                if let message = store.networkingAuthorizationMessage, !message.isEmpty {
+                    Text(message)
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(p.text3)
+                        .lineLimit(2)
+                }
+            }
+            .padding(15)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(p.bgElevated, in: RoundedRectangle(cornerRadius: 11))
             .overlay(RoundedRectangle(cornerRadius: 11).strokeBorder(p.border))
             .padding(.bottom, 22)
@@ -679,7 +809,7 @@ struct SettingsView: View {
                 portField("DNS resolver", store: $dnsPortDraft, fallback: AppStore.defaultDNSPort) { store.applyNetworkingSettings(dnsPort: $0) }
                 portField("HTTP proxy", store: $httpPortDraft, fallback: AppStore.defaultHTTPProxyPort) { store.applyNetworkingSettings(httpProxyPort: $0) }
                 portField("HTTPS proxy", store: $httpsPortDraft, fallback: AppStore.defaultHTTPSProxyPort) { store.applyNetworkingSettings(httpsProxyPort: $0) }
-                Text("Change these if the defaults (15353 / 8080 / 8443) collide with other software — 8080 is a common one. Saved on Return; local networking restarts to rebind.")
+                Text("Change these if the defaults (15353 / 8080 / 8443) collide with other software. Saved on Return; doryd local networking restarts to rebind.")
                     .font(.system(size: 11.5)).foregroundStyle(p.text3).lineSpacing(3)
             }
             .padding(15)

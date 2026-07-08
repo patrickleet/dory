@@ -28,6 +28,10 @@ enum TerminalLauncher {
         "docker -H \(shellQuote("unix://\(socketPath)")) \(execArgs)"
     }
 
+    static func machineShellCommand(target: MachineShellTarget) -> String {
+        "\(shellQuote(target.dorydctlPath)) machine shell \(shellQuote(target.machineID))"
+    }
+
     static func openMachineShell(socketPath: String, containerID: String, user: String, shell: String, home: String) {
         open(command: dockerCommand(socketPath: socketPath, execArgs: execArgs(user: user, shell: shell, home: home, container: containerID)))
     }

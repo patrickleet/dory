@@ -11,11 +11,14 @@ struct ContainerTerminalView: NSViewRepresentable {
     var shell: String = "/bin/sh"
     var home: String = "/root"
     var kubeExec: KubeExecTarget? = nil
+    var machineShell: MachineShellTarget? = nil
 
     func makeNSView(context: Context) -> LocalProcessTerminalView {
         let term = LocalProcessTerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 360))
         let exec: String
-        if let kubeExec {
+        if let machineShell {
+            exec = TerminalLauncher.machineShellCommand(target: machineShell)
+        } else if let kubeExec {
             exec = KubeExecCommand.shell(target: kubeExec)
         } else {
             exec = TerminalLauncher.dockerCommand(

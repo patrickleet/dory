@@ -17,6 +17,10 @@ enum HostTools {
         "/opt/homebrew/bin/container", "/usr/local/bin/container", "/usr/bin/container",
     ]) }
 
+    static func dorydctl() -> String? { resolve("dorydctl", systemCandidates: [
+        "\(NSHomeDirectory())/.dory/bin/dorydctl", "/opt/homebrew/bin/dorydctl", "/usr/local/bin/dorydctl",
+    ]) }
+
     private static func resolve(_ name: String, systemCandidates: [String]) -> String? {
         if let bundled = bundledPath(named: name) { return bundled }
         return Shell.find(name, candidates: systemCandidates)

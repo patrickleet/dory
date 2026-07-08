@@ -1,5 +1,10 @@
 import Foundation
 
+struct MachineShellTarget: Hashable, Codable, Sendable {
+    let machineID: String
+    let dorydctlPath: String
+}
+
 struct TerminalSession: Identifiable, Hashable, Codable {
     let id: String
     let title: String
@@ -11,4 +16,5 @@ struct TerminalSession: Identifiable, Hashable, Codable {
     let shell: String
     let home: String
     var kubeExec: KubeExecTarget? = nil
+    var machineShell: MachineShellTarget? = nil
 }

@@ -1,0 +1,1409 @@
+import Foundation
+import Testing
+@testable import Dory
+
+struct DorydClientTests {
+    @MainActor
+    @Test func dorydEngineIsPreferredByDefaultOutsideAutomationAndCanBeDisabled() {
+        #expect(AppStore.dorydEngineEnabled(environment: [:]))
+        #expect(AppStore.dorydEngineEnabled(environment: ["DORY_APP_USE_DORYD": "1"]))
+        #expect(!AppStore.dorydEngineEnabled(environment: ["DORY_APP_USE_DORYD": "0"]))
+        #expect(!AppStore.dorydEngineEnabled(environment: ["DORY_APP_DISABLE_DORYD": "1"]))
+    }
+
+    @Test func doryCLIResolverPrefersBundledHelperOverAuxiliaryExecutable() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("DoryCLI-\(UUID().uuidString).app", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let helpers = root.appendingPathComponent("Contents/Helpers", isDirectory: true)
+        let macOS = root.appendingPathComponent("Contents/MacOS", isDirectory: true)
+        try FileManager.default.createDirectory(at: helpers, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: macOS, withIntermediateDirectories: true)
+
+        let helper = helpers.appendingPathComponent("dory")
+        let appExecutable = macOS.appendingPathComponent("Dory")
+        _ = FileManager.default.createFile(atPath: helper.path, contents: Data("#!/bin/sh\n".utf8))
+        _ = FileManager.default.createFile(atPath: appExecutable.path, contents: Data())
+
+        let resolved = DoryCLI.bundledPath(
+            named: "dory",
+            bundleURL: root,
+            auxiliaryPath: appExecutable.path,
+            isExecutable: { $0 == helper.path || $0 == appExecutable.path }
+        )
+
+        #expect(resolved == helper.path)
+    }
+
+    @Test func healthDiagnosticsUsesDorydHealthAndIdleWithoutLegacyCLIs() async throws {
+        let recorder = HealthDiagnosticsCLIRunRecorder()
+        let healthJSON = """
+        {
+          "results": [
+            {"id":"socket.exists","status":"pass","code":"socket.ok","title":"Socket","detail":"ok"},
+            {"id":"compat.docker","status":"pass","code":"compat.ok","title":"Compatibility","detail":"ok"}
+          ]
+        }
+        """
+        let idleStatus = try JSONDecoder().decode(IdleStatus.self, from: Data(
+            """
+            {"mode":"auto-idle","auto_idle_enabled":true,"can_sleep":true,"sleep_after_minutes":15,"blockers":[],"policy":{"sleepAfterMinutes":15,"keepPublishedPortsAwake":true,"keepKubernetesAwake":true,"keepPinnedProjectsAwake":true,"showWakeNotifications":true}}
+            """.utf8
+        ))
+
+        let snapshot = await HealthDiagnostics.load(
+            active: false,
+            cli: URL(fileURLWithPath: "/tmp/dory"),
+            daemonHealthJSON: { _ in healthJSON },
+            daemonIncidents: { _ in
+                [Incident(at: "2026-07-07T00:00:00Z", type: "engine.start", detail: "started")]
+            },
+            daemonIdleStatus: { idleStatus },
+            daemonIdleHistory: { _ in
+                [IdleHistoryEntry(at: "2026-07-07T00:00:00Z", state: "sleeping", detail: "idle")]
+            },
+            runCLI: { _, arguments, _ in
+                recorder.record(arguments)
+                return (false, "", "unexpected CLI command: \(arguments.joined(separator: " "))")
+            }
+        )
+
+        #expect(snapshot.checks.map(\.id) == ["socket.exists", "compat.docker"])
+        #expect(snapshot.idle?.mode == "auto-idle")
+        #expect(snapshot.history.map(\.state) == ["sleeping"])
+        #expect(snapshot.incidents.map(\.type) == ["engine.start"])
+        #expect(recorder.commands.isEmpty)
+    }
+
+    @MainActor
+    @Test func readsDoctorJSONAndIncidentsOverXPC() async throws {
+        let listener = NSXPCListener.anonymous()
+        let service = FakeDorydService()
+        let delegate = FakeDorydListenerDelegate(service: service)
+        listener.delegate = delegate
+        listener.resume()
+        defer { listener.invalidate() }
+
+        let client = DorydClient(endpoint: listener.endpoint)
+        let version = try await client.protocolVersion()
+        let socketPath = try await client.dorySocketPath()
+        let engineStatus = try await client.engineStatus()
+        let started = try await client.engineStart()
+        let slept = try await client.engineSleep()
+        let woke = try await client.engineWake()
+        let dockerAgentInfo = try await client.dockerAgentInfo()
+        let dockerAgentPorts = try await client.dockerAgentPorts()
+        let dockerAgentTelemetry = try await client.dockerAgentTelemetry()
+        let stopped = try await client.engineStop()
+        let createdMachine = try await client.machineCreate(DorydMachineConfiguration(
+            id: "dev",
+            kernelPath: "/tmp/kernel",
+            rootfsPath: "/tmp/rootfs",
+            memoryMB: 2048,
+            cpuCount: 2,
+            address: "dev.dory.local"
+        ))
+        let startedMachine = try await client.machineStart("dev")
+        let execResult = try await client.machineExec("dev", argv: ["/bin/sh", "-lc", "cargo --version"])
+        let provisionedMachine = try await client.machineProvision("dev", recipe: "rust")
+        let snapshot = try await client.machineSnapshot(
+            "dev",
+            note: "before",
+            createdISO: "2026-07-07T00:00:00Z",
+            snapshotID: "s1"
+        )
+        let snapshots = try await client.machineSnapshots(machineID: "dev")
+        let clonedSnapshot = try await client.machineCloneSnapshot(machineID: "dev", snapshotID: "s1", newID: "dev-copy")
+        let restoredSnapshot = try await client.machineRestoreSnapshot(machineID: "dev", snapshotID: "s1")
+        let exportedSnapshot = try await client.machineExportSnapshot(machineID: "dev", snapshotID: "s1", to: "/tmp/dev.dorymachine")
+        let importedSnapshot = try await client.machineImportSnapshot(from: "/tmp/dev.dorymachine")
+        let deletedSnapshot = try await client.machineDeleteSnapshot(machineID: "dev", snapshotID: "s1")
+        let stoppedMachine = try await client.machineStop("dev")
+        let updatedMachine = try await client.machineUpdate("dev", memoryMB: 4096, cpuCount: 4, address: "work.dory.local")
+        let machines = try await client.machineList()
+        let deletedMachine = try await client.machineDelete("dev")
+        let remoteInfo = try await client.remoteConnect(DorydRemoteMachineConfiguration(
+            id: "vps",
+            host: "vps.example.com",
+            port: 22,
+            user: "dory",
+            privateKeyID: "primary",
+            hostKeyType: "pinned",
+            hostKey: "ssh-ed25519 AAAA fake",
+            knownHostsPath: nil,
+            knownHostsHost: nil,
+            knownHostsPort: nil,
+            endpointType: "unix",
+            endpointPath: "/run/dory/agent.sock",
+            endpointHost: nil,
+            endpointPort: nil,
+            remoteRoot: "/srv/app",
+            build: "test"
+        ))
+        let pushStats = try await client.remotePush(machineID: "vps", localRoot: "/tmp/local")
+        let remoteStatus = try await client.remoteStatus(machineID: "vps")
+        let replacedRoutes = try await client.networkReplaceRoutes([
+            DorydDomainRoute(hostname: "web.dory.local", address: "127.0.0.42", port: 8080)
+        ])
+        let networkStatus = try await client.networkStatus()
+        let networkPlan = try await client.networkAuthorizationPlan()
+        let balloonPlan = try await client.balloonStatus()
+        let reconciledBalloonPlan = try await client.balloonReconcile()
+        let idleStatus = try await client.idleStatus()
+        let idleHistory = try await client.idleHistory(limit: 40)
+        let updatedIdlePolicy = try await client.idleSetPolicy(key: "sleepAfterMinutes", value: "30")
+        let updatedIdleMode = try await client.idleSetMode("manual")
+        let healthJSON = try await client.healthJSON()
+        let health = try JSONDecoder().decode(DoctorReport.self, from: Data(healthJSON.utf8))
+        let doctorJSON = try await client.doctorJSON()
+        let report = try JSONDecoder().decode(DoctorReport.self, from: Data(doctorJSON.utf8))
+        let incidents = try await client.incidents(limit: 40)
+
+        #expect(version == 1)
+        #expect(socketPath == service.socketPath)
+        #expect(engineStatus == DorydEngineStatus(state: "running", detail: "ok"))
+        #expect(started == DorydCommandResult(ok: true, message: ""))
+        #expect(slept == DorydCommandResult(ok: true, message: ""))
+        #expect(woke == DorydCommandResult(ok: true, message: ""))
+        #expect(dockerAgentInfo.agentBuild == "docker-agent")
+        #expect(dockerAgentPorts.ports == [DorydListenPort(protocol: "tcp", port: 8080)])
+        #expect(dockerAgentPorts.added == [DorydListenPort(protocol: "tcp", port: 8080)])
+        #expect(dockerAgentTelemetry.memTotalKB == 2048)
+        #expect(stopped == DorydCommandResult(ok: true, message: ""))
+        #expect(createdMachine.state == "created")
+        #expect(startedMachine.pid == 1234)
+        #expect(startedMachine.agentBuild == "agent-test")
+        #expect(startedMachine.agentSocketPath == "/tmp/agent.sock")
+        #expect(startedMachine.address == "dev.dory.local")
+        #expect(execResult.stdout == "cargo 1.0\n")
+        #expect(execResult.exitCode == 0)
+        #expect(provisionedMachine.recipeID == "rust")
+        #expect(provisionedMachine.verify.stdout == "cargo 1.0\n")
+        #expect(snapshot.id == "s1")
+        #expect(snapshot.machineID == "dev")
+        #expect(snapshots.map(\.id).contains("s1"))
+        #expect(clonedSnapshot.id == "dev-copy")
+        #expect(restoredSnapshot.id == "dev")
+        #expect(exportedSnapshot == DorydCommandResult(ok: true, message: ""))
+        #expect(importedSnapshot.machineID == "dev")
+        #expect(deletedSnapshot == DorydCommandResult(ok: true, message: ""))
+        #expect(stoppedMachine.state == "stopped")
+        #expect(updatedMachine.memoryMB == 4096)
+        #expect(updatedMachine.cpuCount == 4)
+        #expect(updatedMachine.address == "work.dory.local")
+        #expect(machines.map(\.id) == ["dev", "dev-copy"])
+        #expect(deletedMachine == DorydCommandResult(ok: true, message: ""))
+        #expect(remoteInfo.agentBuild == "remote-agent")
+        #expect(pushStats == DorydPushStats(filesSent: 2, bytesSent: 30, filesDeleted: 1))
+        #expect(remoteStatus.telemetry?.memAvailableKB == 512)
+        #expect(replacedRoutes == DorydCommandResult(ok: true, message: ""))
+        #expect(networkStatus.mode == "high-port-dns-http-https-proxy")
+        #expect(networkStatus.httpProxyPort == 18080)
+        #expect(networkStatus.httpProxyRunning)
+        #expect(networkStatus.httpsProxyPort == 18443)
+        #expect(networkStatus.httpsProxyRunning)
+        #expect(networkStatus.routes == [DorydDomainRoute(hostname: "web.dory.local", address: "127.0.0.42", port: 8080)])
+        #expect(networkPlan.suffix == "dory.local")
+        #expect(networkPlan.dnsBindAddress == "127.0.0.1")
+        #expect(networkPlan.dnsPort == 15353)
+        #expect(networkPlan.httpProxyPort == 18080)
+        #expect(networkPlan.httpsProxyPort == 18443)
+        #expect(networkPlan.requests.map(\.kind) == ["resolverFile"])
+        #expect(balloonPlan.host.pressure == "warning")
+        #expect(balloonPlan.applicableTargets.map(\.id) == ["docker"])
+        #expect(reconciledBalloonPlan.host.pressure == "warning")
+        #expect(reconciledBalloonPlan.applicableTargets.map(\.id) == ["docker"])
+        #expect(idleStatus.mode == "auto-idle")
+        #expect(idleHistory.map(\.state) == ["sleeping"])
+        #expect(updatedIdlePolicy.policy?.sleepAfterMinutes == 30)
+        #expect(updatedIdleMode.mode == "manual")
+        #expect(health.results.map(\.id) == ["socket.exists", "machine.local"])
+        #expect(report.results.map(\.id) == ["socket.exists"])
+        #expect(report.results.first?.status == "pass")
+        #expect(incidents == [
+            Incident(at: "2026-07-07T00:00:00Z", type: "engine.start", detail: "started")
+        ])
+    }
+
+    @MainActor
+    @Test func automationDoesNotContactDefaultPreferredDorydWithoutExplicitOptIn() async throws {
+        let listener = NSXPCListener.anonymous()
+        let service = FakeDorydService()
+        let delegate = FakeDorydListenerDelegate(service: service)
+        listener.delegate = delegate
+        listener.resume()
+        defer { listener.invalidate() }
+
+        let store = AppStore(dorydClient: DorydClient(endpoint: listener.endpoint))
+        await store.connectBackend()
+
+        #expect(service.engineStartCount == 0)
+        #expect(store.loadState == .engineOff)
+    }
+
+    @MainActor
+    @Test func appStoreUsesDorydEngineSocketWithoutStartingLegacyShim() async throws {
+        let base = "/tmp/dac-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        let socketPath = base + "/doryd.sock"
+        defer { try? FileManager.default.removeItem(atPath: base) }
+
+        let shim = DockerShim(runtime: MockRuntime())
+        let dockerServer = ShimHTTPServer(socketPath: socketPath) { request in
+            await shim.handle(request)
+        }
+        try dockerServer.start()
+        defer { dockerServer.stop() }
+
+        let listener = NSXPCListener.anonymous()
+        let service = FakeDorydService(socketPath: socketPath)
+        let delegate = FakeDorydListenerDelegate(service: service)
+        listener.delegate = delegate
+        listener.resume()
+        defer { listener.invalidate() }
+
+        let store = AppStore(
+            dorydClient: DorydClient(endpoint: listener.endpoint),
+            useDorydEngine: true
+        )
+        store.routeDockerCLI = false
+
+        await store.connectBackend()
+
+        #expect(service.engineStartCount == 1)
+        #expect(store.runtimeKind == .sharedVM)
+        #expect(store.shimSocketPath == socketPath)
+        #expect(!store.shimRunning)
+        #expect(!store.localNetworkingActiveForTests)
+        #expect(store.loadState == .ready)
+        #expect(!store.containers.isEmpty)
+
+        for _ in 0..<40 {
+            if !service.latestNetworkRoutes.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(service.latestNetworkRoutes.contains {
+            $0.hostname == "web-api.dory.local" && $0.address == "127.0.0.1" && $0.port == 3000
+        })
+    }
+
+    @MainActor
+    @Test func appStoreKeepsDoryPreferenceOnDorydStartFailure() async throws {
+        let listener = NSXPCListener.anonymous()
+        let service = FakeDorydService()
+        service.setEngineStartResult(ok: false, message: "doryd test failure")
+        let delegate = FakeDorydListenerDelegate(service: service)
+        listener.delegate = delegate
+        listener.resume()
+        defer { listener.invalidate() }
+
+        let store = AppStore(
+            dorydClient: DorydClient(endpoint: listener.endpoint),
+            environment: [:]
+        )
+        store.routeDockerCLI = false
+        store.enginePreference = .dory
+
+        await store.connectBackend()
+
+        #expect(service.engineStartCount == 1)
+        #expect(store.loadState == .engineOff)
+        #expect(store.sharedVMStatus == "doryd test failure")
+        #expect(store.runtimeKind == .disconnected)
+        #expect(!store.shimRunning)
+    }
+
+    @MainActor
+    @Test func appStoreRoutesMachineLifecycleToDorydVMs() async throws {
+        let base = "/tmp/dam-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        let socketPath = base + "/doryd.sock"
+        defer { try? FileManager.default.removeItem(atPath: base) }
+
+        let shim = DockerShim(runtime: MockRuntime())
+        let dockerServer = ShimHTTPServer(socketPath: socketPath) { request in
+            await shim.handle(request)
+        }
+        try dockerServer.start()
+        defer { dockerServer.stop() }
+
+        let listener = NSXPCListener.anonymous()
+        let service = FakeDorydService(socketPath: socketPath)
+        let delegate = FakeDorydListenerDelegate(service: service)
+        listener.delegate = delegate
+        listener.resume()
+        defer { listener.invalidate() }
+
+        let store = AppStore(
+            dorydClient: DorydClient(endpoint: listener.endpoint),
+            useDorydEngine: true
+        )
+        store.routeDockerCLI = false
+
+        await store.connectBackend()
+        store.loadMachines()
+        try await waitUntil {
+            store.machines.contains { $0.name == "dev" }
+        }
+
+        var machine = try #require(store.machines.first { $0.name == "dev" })
+        #expect(machine.distro == "Dory VM")
+        #expect(machine.status == .running)
+        #expect(machine.memoryDisplay == "2048 MB")
+        #expect(machine.ip == "dev.dory.local")
+        #expect(machine.containerID.isEmpty)
+        #expect(store.machineTerminalCommand(machine)?.contains("dorydctl") == true)
+        #expect(store.canUseMachineArtifacts(machine))
+
+        let currentSettings = await store.machineSettings(machine.name)
+        #expect(currentSettings.cpus == 2)
+        #expect(currentSettings.memoryMB == 2048)
+        #expect(currentSettings.address == "dev.dory.local")
+
+        store.toggleMachine(machine)
+        try await waitUntil {
+            store.machines.first { $0.name == "dev" }?.status == .stopped
+        }
+        #expect(service.machineStopCount == 1)
+
+        machine = try #require(store.machines.first { $0.name == "dev" })
+        store.toggleMachine(machine)
+        try await waitUntil {
+            store.machines.first { $0.name == "dev" }?.status == .running
+        }
+        #expect(service.machineStartCount == 1)
+
+        machine = try #require(store.machines.first { $0.name == "dev" })
+        let editResult = await store.editMachine(machine, settings: MachineSettings(cpus: 4, memoryMB: 4096, address: "work.dory.local"))
+        #expect(editResult == nil)
+        try await waitUntil {
+            service.machineUpdateCount == 1 && store.machines.first { $0.name == "dev" }?.memoryDisplay == "4096 MB"
+        }
+        #expect((service.latestMachineUpdateConfig?["memoryMB"] as? NSNumber)?.uint64Value == 4096)
+        #expect((service.latestMachineUpdateConfig?["cpuCount"] as? NSNumber)?.intValue == 4)
+        #expect(service.latestMachineUpdateConfig?["address"] as? String == "work.dory.local")
+
+        machine = try #require(store.machines.first { $0.name == "dev" })
+        store.deleteMachine(machine)
+        try await waitUntil {
+            service.machineDeleteCount == 1 && !store.machines.contains { $0.name == "dev" }
+        }
+        #expect(service.machineDeleteCount == 1)
+    }
+
+    @MainActor
+    @Test func appStoreRoutesMachineSnapshotsToDorydVMs() async throws {
+        let base = "/tmp/das-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        let socketPath = base + "/doryd.sock"
+        defer { try? FileManager.default.removeItem(atPath: base) }
+
+        let shim = DockerShim(runtime: MockRuntime())
+        let dockerServer = ShimHTTPServer(socketPath: socketPath) { request in
+            await shim.handle(request)
+        }
+        try dockerServer.start()
+        defer { dockerServer.stop() }
+
+        let listener = NSXPCListener.anonymous()
+        let service = FakeDorydService(socketPath: socketPath)
+        let delegate = FakeDorydListenerDelegate(service: service)
+        listener.delegate = delegate
+        listener.resume()
+        defer { listener.invalidate() }
+
+        let store = AppStore(
+            dorydClient: DorydClient(endpoint: listener.endpoint),
+            useDorydEngine: true
+        )
+        store.routeDockerCLI = false
+
+        await store.connectBackend()
+        store.loadMachines()
+        try await waitUntil {
+            store.machines.contains { $0.name == "dev" }
+        }
+        let machine = try #require(store.machines.first { $0.name == "dev" })
+
+        store.openSnapshots(machine)
+        store.takeSnapshot(machine, note: "before upgrade")
+        try await waitUntil {
+            service.machineSnapshotCount == 1 && store.machineSnapshots.contains { $0.machineName == "dev" }
+        }
+        let snapshot = try #require(store.machineSnapshots.first)
+        #expect(snapshot.note == "before upgrade")
+        #expect(snapshot.imageRef.hasPrefix("doryd://dev/"))
+
+        store.cloneSnapshot(snapshot)
+        try await waitUntil {
+            service.machineCloneSnapshotCount == 1 && store.machines.contains { $0.name.hasPrefix("dev-copy-") }
+        }
+
+        store.restoreSnapshot(snapshot)
+        try await waitUntil {
+            service.machineRestoreSnapshotCount == 1
+        }
+
+        store.deleteSnapshot(snapshot)
+        try await waitUntil {
+            service.machineDeleteSnapshotCount == 1 && !store.machineSnapshots.contains { $0.id == snapshot.id }
+        }
+    }
+
+    @MainActor
+    @Test func appStoreCreatesDorydMachineFromKernelRootfsEnvironment() async throws {
+        let base = "/tmp/damc-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        let socketPath = base + "/doryd.sock"
+        defer { try? FileManager.default.removeItem(atPath: base) }
+
+        let shim = DockerShim(runtime: MockRuntime())
+        let dockerServer = ShimHTTPServer(socketPath: socketPath) { request in
+            await shim.handle(request)
+        }
+        try dockerServer.start()
+        defer { dockerServer.stop() }
+
+        let listener = NSXPCListener.anonymous()
+        let service = FakeDorydService(socketPath: socketPath)
+        let delegate = FakeDorydListenerDelegate(service: service)
+        listener.delegate = delegate
+        listener.resume()
+        defer { listener.invalidate() }
+
+        let store = AppStore(
+            dorydClient: DorydClient(endpoint: listener.endpoint),
+            useDorydEngine: true,
+            environment: [
+                "DORYD_MACHINE_KERNEL": "/vm/Image",
+                "DORYD_MACHINE_ROOTFS": "/vm/rootfs.raw",
+            ]
+        )
+        store.routeDockerCLI = false
+
+        await store.connectBackend()
+        let result = await store.createMachine(
+            image: "not-a-docker-image",
+            name: "vmdev",
+            recipe: DevRecipe.forID("rust"),
+            settings: MachineSettings(cpus: 3, memoryMB: 3072)
+        )
+
+        #expect(result == nil)
+        #expect(service.machineCreateCount == 1)
+        #expect(service.machineStartCount == 1)
+        #expect(service.machineProvisionCount == 1)
+        #expect(service.latestMachineProvisionRecipe == "rust")
+        let config = try #require(service.latestMachineCreateConfig)
+        #expect(config["id"] as? String == "vmdev")
+        #expect(config["kernelPath"] as? String == "/vm/Image")
+        #expect(config["rootfsPath"] as? String == "/vm/rootfs.raw")
+        #expect((config["memoryMB"] as? NSNumber)?.uint64Value == 3072)
+        #expect((config["cpuCount"] as? NSNumber)?.intValue == 3)
+        #expect(config["address"] as? String == "vmdev.dory.local")
+
+        try await waitUntil {
+            store.machines.first { $0.name == "vmdev" }?.status == .running
+        }
+        #expect(store.machineCreated?.name == "vmdev")
+        #expect(store.machineCreationLog.contains("Provisioning Rust"))
+        #expect(store.machineCreationLog.contains("cargo 1.0"))
+    }
+
+    @MainActor
+    @Test func dorydMachineConfigurationRequiresKernelAndRootfsAndUsesSettingsDefaults() {
+        #expect(AppStore.dorydMachineConfiguration(
+            name: "vmdev",
+            settings: .default,
+            environment: ["DORYD_DISABLE_BUNDLED_MACHINE_ASSETS": "1"]
+        ) == nil)
+
+        let config = AppStore.dorydMachineConfiguration(
+            name: "vmdev",
+            settings: MachineSettings(cpus: 3, memoryMB: 3072),
+            environment: [
+                "DORYD_GUEST_KERNEL": "/vm/Image",
+                "DORYD_GUEST_ROOTFS": "/vm/rootfs.raw",
+            ]
+        )
+
+        #expect(config == DorydMachineConfiguration(
+            id: "vmdev",
+            kernelPath: "/vm/Image",
+            rootfsPath: "/vm/rootfs.raw",
+            memoryMB: 3072,
+            cpuCount: 3
+        ))
+    }
+
+    @MainActor
+    @Test func dorydRecipeMappingCoversBuiltInRecipesAndRejectsCustomRecipes() {
+        #expect(AppStore.dorydRecipeID(for: DevRecipe.forID("node")!) == "node")
+        #expect(AppStore.dorydRecipeID(for: DevRecipe.forID("python")!) == "python-ml")
+        #expect(AppStore.dorydRecipeID(for: DevRecipe.forID("go")!) == "go")
+        #expect(AppStore.dorydRecipeID(for: DevRecipe.forID("java")!) == "java")
+        #expect(AppStore.dorydRecipeID(for: DevRecipe.forID("ruby")!) == "ruby")
+        #expect(AppStore.dorydRecipeID(for: DevRecipe.forID("rust")!) == "rust")
+        #expect(AppStore.dorydRecipeID(for: DevRecipe.forID("devops")!) == "devops")
+        #expect(AppStore.dorydRecipeID(for: DevRecipe(id: "custom-abc", display: "Custom", icon: "wrench", install: "true")) == nil)
+    }
+
+    @MainActor
+    @Test func appStoreAutoRefreshDoesNotWakeDorydIdleSleep() async throws {
+        let base = "/tmp/daslp-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        let socketPath = base + "/doryd.sock"
+        defer { try? FileManager.default.removeItem(atPath: base) }
+
+        let shim = DockerShim(runtime: MockRuntime())
+        let dockerServer = ShimHTTPServer(socketPath: socketPath) { request in
+            await shim.handle(request)
+        }
+        try dockerServer.start()
+        defer { dockerServer.stop() }
+
+        let listener = NSXPCListener.anonymous()
+        let service = FakeDorydService(socketPath: socketPath)
+        let delegate = FakeDorydListenerDelegate(service: service)
+        listener.delegate = delegate
+        listener.resume()
+        defer { listener.invalidate() }
+
+        let store = AppStore(
+            dorydClient: DorydClient(endpoint: listener.endpoint),
+            useDorydEngine: true
+        )
+        store.routeDockerCLI = false
+
+        await store.connectBackend()
+        #expect(!store.containers.isEmpty)
+
+        store.containers = []
+        service.setEngineStatus("sleeping", detail: "idle")
+
+        await store.refreshIfIdle()
+
+        #expect(store.engineSleeping)
+        #expect(!store.engineRunning)
+        #expect(store.containers.isEmpty)
+        #expect(service.engineWakeCount == 0)
+    }
+
+    @MainActor
+    @Test func idleSettingsRollbackWhenRequiredDorydIsUnavailable() async throws {
+        let listener = NSXPCListener.anonymous()
+        let service = FakeDorydService()
+        service.setIdleAvailable(false)
+        let delegate = FakeDorydListenerDelegate(service: service)
+        listener.delegate = delegate
+        listener.resume()
+        defer { listener.invalidate() }
+
+        let store = AppStore(
+            dorydClient: DorydClient(endpoint: listener.endpoint),
+            useDorydEngine: true
+        )
+        store.runtimeMode = "manual"
+        store.idlePolicy = IdlePolicy(sleepAfterMinutes: 15)
+
+        await store.setRuntimeMode("auto-idle")
+        await store.setIdleSleepAfter(5)
+
+        #expect(store.runtimeMode == "manual")
+        #expect(store.idlePolicy.sleepAfterMinutes == 15)
+        #expect(store.actionError == "doryd is unavailable; idle policy was not changed.")
+    }
+
+#if DEBUG
+    @MainActor
+    @Test func appStoreDoesNotMakeIdleSleepDecisionForDorydEngine() async throws {
+        let base = "/tmp/dasid-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        let socketPath = base + "/doryd.sock"
+        defer { try? FileManager.default.removeItem(atPath: base) }
+
+        let shim = DockerShim(runtime: MockRuntime())
+        let dockerServer = ShimHTTPServer(socketPath: socketPath) { request in
+            await shim.handle(request)
+        }
+        try dockerServer.start()
+        defer { dockerServer.stop() }
+
+        let listener = NSXPCListener.anonymous()
+        let service = FakeDorydService(socketPath: socketPath)
+        let delegate = FakeDorydListenerDelegate(service: service)
+        listener.delegate = delegate
+        listener.resume()
+        defer { listener.invalidate() }
+
+        let store = AppStore(
+            dorydClient: DorydClient(endpoint: listener.endpoint),
+            useDorydEngine: true
+        )
+        store.routeDockerCLI = false
+
+        await store.connectBackend()
+        store.containers = []
+        store.runtimeMode = "auto-idle"
+        store.idlePolicy = IdlePolicy(sleepAfterMinutes: 1)
+        store.engineSleeping = false
+        store.engineRunning = true
+        store.loadState = .ready
+        store.engineActivity.setLastForTests(Date(timeIntervalSinceNow: -120))
+
+        await store.evaluateIdleSleepForTests()
+
+        #expect(service.engineSleepCount == 0)
+        #expect(!store.engineSleeping)
+    }
+#endif
+}
+
+private final class FakeDorydService: NSObject, DorydControlXPC {
+    let socketPath: String
+    private let lock = NSLock()
+    private var _engineStartCount = 0
+    private var _engineWakeCount = 0
+    private var _engineSleepCount = 0
+    private var _engineState = "running"
+    private var _engineDetail = "ok"
+    private var _engineStartOK = true
+    private var _engineStartMessage = ""
+    private var _idleAvailable = true
+    private var idleMode = "auto-idle"
+    private var idlePolicy: [String: Any] = [
+        "sleepAfterMinutes": 15,
+        "keepPublishedPortsAwake": true,
+        "keepKubernetesAwake": true,
+        "keepPinnedProjectsAwake": true,
+        "showWakeNotifications": true,
+    ]
+    private var networkRouteBatches: [[DorydDomainRoute]] = []
+    private var machines: [String: NSDictionary] = [
+        "dev": FakeDorydService.machineRow(id: "dev", state: "running", pid: 1234, agentBuild: "agent-test", handoffFDCount: 2, address: "dev.dory.local")
+    ]
+    private var _machineStartCount = 0
+    private var _machineStopCount = 0
+    private var _machineDeleteCount = 0
+    private var _machineCreateCount = 0
+    private var _machineUpdateCount = 0
+    private var _machineProvisionCount = 0
+    private var _machineSnapshotCount = 0
+    private var _machineCloneSnapshotCount = 0
+    private var _machineRestoreSnapshotCount = 0
+    private var _machineDeleteSnapshotCount = 0
+    private var _latestMachineCreateConfig: NSDictionary?
+    private var _latestMachineUpdateConfig: NSDictionary?
+    private var _latestMachineProvisionRecipe: String?
+    private var snapshots: [String: [NSDictionary]] = [:]
+    var engineStartCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _engineStartCount
+    }
+    var engineWakeCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _engineWakeCount
+    }
+    var engineSleepCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _engineSleepCount
+    }
+    var machineStartCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _machineStartCount
+    }
+    var machineStopCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _machineStopCount
+    }
+    var machineDeleteCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _machineDeleteCount
+    }
+    var machineCreateCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _machineCreateCount
+    }
+    var machineUpdateCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _machineUpdateCount
+    }
+    var machineProvisionCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _machineProvisionCount
+    }
+    var machineSnapshotCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _machineSnapshotCount
+    }
+    var machineCloneSnapshotCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _machineCloneSnapshotCount
+    }
+    var machineRestoreSnapshotCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _machineRestoreSnapshotCount
+    }
+    var machineDeleteSnapshotCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _machineDeleteSnapshotCount
+    }
+    var latestMachineCreateConfig: NSDictionary? {
+        lock.lock(); defer { lock.unlock() }
+        return _latestMachineCreateConfig
+    }
+    var latestMachineUpdateConfig: NSDictionary? {
+        lock.lock(); defer { lock.unlock() }
+        return _latestMachineUpdateConfig
+    }
+    var latestMachineProvisionRecipe: String? {
+        lock.lock(); defer { lock.unlock() }
+        return _latestMachineProvisionRecipe
+    }
+    var latestNetworkRoutes: [DorydDomainRoute] {
+        lock.lock(); defer { lock.unlock() }
+        return networkRouteBatches.last ?? []
+    }
+
+    init(socketPath: String = "/tmp/doryd-test.sock") {
+        self.socketPath = socketPath
+    }
+
+    func setEngineStatus(_ state: String, detail: String = "ok") {
+        lock.lock()
+        _engineState = state
+        _engineDetail = detail
+        lock.unlock()
+    }
+
+    func setEngineStartResult(ok: Bool, message: String = "") {
+        lock.lock()
+        _engineStartOK = ok
+        _engineStartMessage = message
+        lock.unlock()
+    }
+
+    func setIdleAvailable(_ available: Bool) {
+        lock.lock()
+        _idleAvailable = available
+        lock.unlock()
+    }
+
+    func protocolVersion(reply: @escaping (UInt32) -> Void) {
+        reply(1)
+    }
+
+    func dorySocketPath(reply: @escaping (String) -> Void) {
+        reply(socketPath)
+    }
+
+    func engineStatus(reply: @escaping (String, String) -> Void) {
+        lock.lock()
+        let state = _engineState
+        let detail = _engineDetail
+        lock.unlock()
+        reply(state, detail)
+    }
+
+    func engineStart(reply: @escaping (Bool, String) -> Void) {
+        lock.lock()
+        _engineStartCount += 1
+        let ok = _engineStartOK
+        let message = _engineStartMessage
+        lock.unlock()
+        reply(ok, message)
+    }
+
+    func engineStop(reply: @escaping (Bool, String) -> Void) {
+        reply(true, "")
+    }
+
+    func engineSleep(reply: @escaping (Bool, String) -> Void) {
+        lock.lock(); _engineSleepCount += 1; lock.unlock()
+        reply(true, "")
+    }
+
+    func engineWake(reply: @escaping (Bool, String) -> Void) {
+        lock.lock(); _engineWakeCount += 1; lock.unlock()
+        reply(true, "")
+    }
+
+    func dockerAgentInfo(reply: @escaping (NSDictionary, String) -> Void) {
+        reply(dockerAgentInfo(), "")
+    }
+
+    func dockerAgentPorts(reply: @escaping (NSDictionary, String) -> Void) {
+        let port: NSDictionary = ["protocol": "tcp", "port": 8080]
+        reply([
+            "ports": [port],
+            "added": [port],
+            "removed": [],
+        ] as NSDictionary, "")
+    }
+
+    func dockerAgentTelemetry(reply: @escaping (NSDictionary, String) -> Void) {
+        reply(dockerTelemetry(), "")
+    }
+
+    func machineCreate(_ config: NSDictionary, reply: @escaping (Bool, NSDictionary, String) -> Void) {
+        let id = config["id"] as? String ?? ""
+        let row = Self.machineRow(id: id, state: "created", address: config["address"] as? String)
+        lock.lock()
+        _machineCreateCount += 1
+        _latestMachineCreateConfig = config
+        machines[id] = row
+        lock.unlock()
+        reply(true, row, "")
+    }
+
+    func machineStart(_ machineID: String, reply: @escaping (Bool, NSDictionary, String) -> Void) {
+        lock.lock()
+        let current = machines[machineID]
+        let row = Self.machineRow(
+            id: machineID,
+            state: "running",
+            pid: 1234,
+            agentBuild: "agent-test",
+            handoffFDCount: 2,
+            memoryMB: Self.uint64(current?["memoryMB"]) ?? 2048,
+            cpuCount: Self.int(current?["cpuCount"]) ?? 2,
+            address: current?["address"] as? String
+        )
+        _machineStartCount += 1
+        machines[machineID] = row
+        lock.unlock()
+        reply(true, row, "")
+    }
+
+    func machineStop(_ machineID: String, reply: @escaping (Bool, NSDictionary, String) -> Void) {
+        lock.lock()
+        let current = machines[machineID]
+        let row = Self.machineRow(
+            id: machineID,
+            state: "stopped",
+            memoryMB: Self.uint64(current?["memoryMB"]) ?? 2048,
+            cpuCount: Self.int(current?["cpuCount"]) ?? 2,
+            address: current?["address"] as? String
+        )
+        _machineStopCount += 1
+        machines[machineID] = row
+        lock.unlock()
+        reply(true, row, "")
+    }
+
+    func machineUpdate(_ machineID: String, config: NSDictionary, reply: @escaping (Bool, NSDictionary, String) -> Void) {
+        lock.lock()
+        _machineUpdateCount += 1
+        _latestMachineUpdateConfig = config
+        let current = machines[machineID] ?? Self.machineRow(id: machineID, state: "stopped")
+        let memoryMB = (config["memoryMB"] as? NSNumber)?.uint64Value
+            ?? config["memoryMB"] as? UInt64
+            ?? (current["memoryMB"] as? NSNumber)?.uint64Value
+            ?? current["memoryMB"] as? UInt64
+            ?? 2048
+        let cpuCount = (config["cpuCount"] as? NSNumber)?.intValue
+            ?? config["cpuCount"] as? Int
+            ?? (current["cpuCount"] as? NSNumber)?.intValue
+            ?? current["cpuCount"] as? Int
+            ?? 2
+        let address = config["address"] as? String ?? current["address"] as? String
+        let state = current["state"] as? String ?? "stopped"
+        let row = Self.machineRow(
+            id: machineID,
+            state: state,
+            pid: current["pid"] as? Int32,
+            agentBuild: current["agentBuild"] as? String,
+            handoffFDCount: (current["handoffFDCount"] as? Int) ?? 0,
+            memoryMB: memoryMB,
+            cpuCount: cpuCount,
+            address: address
+        )
+        machines[machineID] = row
+        lock.unlock()
+        reply(true, row, "")
+    }
+
+    func machineDelete(_ machineID: String, reply: @escaping (Bool, String) -> Void) {
+        lock.lock()
+        _machineDeleteCount += 1
+        machines.removeValue(forKey: machineID)
+        lock.unlock()
+        reply(true, "")
+    }
+
+    func machineList(reply: @escaping (NSArray, String) -> Void) {
+        lock.lock()
+        let rows = machines.keys.sorted().compactMap { machines[$0] }
+        lock.unlock()
+        reply(rows as NSArray, "")
+    }
+
+    func machineExec(_ machineID: String, request: NSDictionary, reply: @escaping (Bool, NSDictionary, String) -> Void) {
+        reply(true, Self.execRow(stdout: "cargo 1.0\n"), "")
+    }
+
+    func machineProvision(_ machineID: String, request: NSDictionary, reply: @escaping (Bool, NSDictionary, String) -> Void) {
+        let recipe = request["recipe"] as? String ?? "rust"
+        lock.lock()
+        _machineProvisionCount += 1
+        _latestMachineProvisionRecipe = recipe
+        lock.unlock()
+        reply(true, [
+            "recipeID": recipe,
+            "install": Self.execRow(stdout: "installed \(recipe)\n"),
+            "verify": Self.execRow(stdout: "cargo 1.0\n"),
+        ] as NSDictionary, "")
+    }
+
+    func machineSnapshot(_ machineID: String, request: NSDictionary, reply: @escaping (Bool, NSDictionary, String) -> Void) {
+        let id = request["snapshotID"] as? String ?? "s\(UUID().uuidString.prefix(8).lowercased())"
+        let row = Self.snapshotRow(
+            id: id,
+            machineID: machineID,
+            note: request["note"] as? String ?? "",
+            createdISO: request["createdISO"] as? String ?? "2026-07-07T00:00:00Z"
+        )
+        lock.lock()
+        _machineSnapshotCount += 1
+        snapshots[machineID, default: []].insert(row, at: 0)
+        lock.unlock()
+        reply(true, row, "")
+    }
+
+    func machineSnapshots(_ machineID: String, reply: @escaping (NSArray, String) -> Void) {
+        lock.lock()
+        let rows: [NSDictionary]
+        if machineID.isEmpty {
+            rows = snapshots.keys.sorted().flatMap { snapshots[$0] ?? [] }
+        } else {
+            rows = snapshots[machineID] ?? []
+        }
+        lock.unlock()
+        reply(rows as NSArray, "")
+    }
+
+    func machineCloneSnapshot(
+        _ machineID: String,
+        snapshotID: String,
+        newID: String,
+        reply: @escaping (Bool, NSDictionary, String) -> Void
+    ) {
+        let row = Self.machineRow(id: newID, state: "running", pid: 1234, agentBuild: "agent-test", handoffFDCount: 2)
+        lock.lock()
+        _machineCloneSnapshotCount += 1
+        machines[newID] = row
+        lock.unlock()
+        reply(true, row, "")
+    }
+
+    func machineRestoreSnapshot(_ machineID: String, snapshotID: String, reply: @escaping (Bool, NSDictionary, String) -> Void) {
+        let row = Self.machineRow(id: machineID, state: "running", pid: 1234, agentBuild: "agent-test", handoffFDCount: 2)
+        lock.lock()
+        _machineRestoreSnapshotCount += 1
+        machines[machineID] = row
+        lock.unlock()
+        reply(true, row, "")
+    }
+
+    func machineDeleteSnapshot(_ machineID: String, snapshotID: String, reply: @escaping (Bool, String) -> Void) {
+        lock.lock()
+        _machineDeleteSnapshotCount += 1
+        snapshots[machineID, default: []].removeAll { $0["id"] as? String == snapshotID }
+        lock.unlock()
+        reply(true, "")
+    }
+
+    func machineExportSnapshot(_ machineID: String, snapshotID: String, path: String, reply: @escaping (Bool, String) -> Void) {
+        reply(true, "")
+    }
+
+    func machineImportSnapshot(_ path: String, reply: @escaping (Bool, NSDictionary, String) -> Void) {
+        let row = Self.snapshotRow(
+            id: "imported",
+            machineID: "dev",
+            note: "imported",
+            createdISO: "2026-07-07T00:00:00Z"
+        )
+        lock.lock()
+        snapshots["dev", default: []].insert(row, at: 0)
+        lock.unlock()
+        reply(true, row, "")
+    }
+
+    func remoteConnect(_ config: NSDictionary, reply: @escaping (Bool, NSDictionary, String) -> Void) {
+        reply(true, agentInfo(), "")
+    }
+
+    func remotePush(_ machineID: String, localRoot: String, remoteRoot: String, reply: @escaping (Bool, NSDictionary, String) -> Void) {
+        reply(true, [
+            "filesSent": 2,
+            "bytesSent": 30,
+            "filesDeleted": 1,
+        ], "")
+    }
+
+    func remoteStatus(_ machineID: String, reply: @escaping (NSDictionary, String) -> Void) {
+        reply([
+            "id": machineID,
+            "state": "connected",
+            "lastError": "",
+            "info": agentInfo(),
+            "telemetry": telemetry(),
+        ], "")
+    }
+
+    func networkReplaceRoutes(_ routes: NSArray, reply: @escaping (Bool, String) -> Void) {
+        let decoded = routes.compactMap(Self.domainRoute)
+        guard decoded.count == routes.count else {
+            reply(false, "invalid routes")
+            return
+        }
+        lock.lock(); networkRouteBatches.append(decoded); lock.unlock()
+        reply(true, "")
+    }
+
+    func networkStatus(reply: @escaping (NSDictionary, String) -> Void) {
+        let routes = latestNetworkRoutes.isEmpty
+            ? [DorydDomainRoute(hostname: "web.dory.local", address: "127.0.0.42", port: 8080)]
+            : latestNetworkRoutes
+        reply([
+            "mode": "high-port-dns-http-https-proxy",
+            "suffix": "dory.local",
+            "dnsBindAddress": "127.0.0.1",
+            "dnsPort": 15353,
+            "dnsRunning": true,
+            "httpProxyPort": 18080,
+            "httpProxyRunning": true,
+            "httpsProxyPort": 18443,
+            "httpsProxyRunning": true,
+            "routes": routes.map(Self.dictionary),
+        ] as NSDictionary, "")
+    }
+
+    func networkAuthorizationPlan(reply: @escaping (NSDictionary, String) -> Void) {
+        reply([
+            "degradedMode": "high-port-dns-only",
+            "authorizedMode": "system-resolver-proxy-tls",
+            "suffix": "dory.local",
+            "dnsBindAddress": "127.0.0.1",
+            "dnsPort": 15353,
+            "httpProxyPort": 18080,
+            "httpsProxyPort": 18443,
+            "requests": [
+                [
+                    "id": "resolver.dory.local",
+                    "kind": "resolverFile",
+                    "title": "Install dory.local resolver",
+                    "reason": "Route local domains to doryd.",
+                    "requiresAdmin": true,
+                    "filePath": "/etc/resolver/dory.local",
+                    "fileContents": "nameserver 127.0.0.1\nport 15353\n",
+                    "command": ["/usr/bin/install", "-m", "0644", "<generated>", "/etc/resolver/dory.local"],
+                ],
+            ],
+        ] as NSDictionary, "")
+    }
+
+    func balloonStatus(reply: @escaping (NSDictionary, String) -> Void) {
+        let target: NSDictionary = [
+            "id": "docker",
+            "kind": "docker",
+            "currentTargetMB": 2048,
+            "targetMB": 1536,
+            "reason": "hostWarning",
+            "canApply": true,
+        ]
+        reply([
+            "host": [
+                "totalBytes": 16_000_000_000,
+                "availableBytes": 1_000_000_000,
+                "freeBytes": 500_000_000,
+                "availableRatio": 0.0625,
+                "pressure": "warning",
+            ],
+            "targets": [target],
+            "applicableTargets": [target],
+        ] as NSDictionary, "")
+    }
+
+    func balloonReconcile(reply: @escaping (NSDictionary, String) -> Void) {
+        balloonStatus(reply: reply)
+    }
+
+    func idleStatus(reply: @escaping (NSDictionary, String) -> Void) {
+        guard idleAvailable else {
+            reply([:], "idle unavailable")
+            return
+        }
+        reply(idleStatusDictionary(), "")
+    }
+
+    func idleHistory(_ limit: Int, reply: @escaping (NSArray, String) -> Void) {
+        let rows: [NSDictionary] = [
+            [
+                "at": "2026-07-07T00:00:00Z",
+                "state": "sleeping",
+                "detail": "idle",
+            ] as NSDictionary
+        ]
+        reply(Array(rows.suffix(max(0, limit))) as NSArray, "")
+    }
+
+    func idleSetMode(_ mode: String, reply: @escaping (Bool, NSDictionary, String) -> Void) {
+        guard idleAvailable else {
+            reply(false, [:], "idle unavailable")
+            return
+        }
+        lock.lock()
+        idleMode = mode
+        lock.unlock()
+        reply(true, idleStatusDictionary(), "")
+    }
+
+    func idleSetPolicy(_ key: String, value: String, reply: @escaping (Bool, NSDictionary, String) -> Void) {
+        guard idleAvailable else {
+            reply(false, [:], "idle unavailable")
+            return
+        }
+        lock.lock()
+        switch key {
+        case "sleepAfterMinutes":
+            idlePolicy[key] = Int(value) ?? 15
+        default:
+            idlePolicy[key] = ["1", "true", "yes", "on"].contains(value.lowercased())
+        }
+        lock.unlock()
+        reply(true, idleStatusDictionary(), "")
+    }
+
+    func health(reply: @escaping (NSDictionary, String) -> Void) {
+        reply([
+            "results": [
+                [
+                    "id": "socket.exists",
+                    "status": "pass",
+                    "code": "SOCKET_OK",
+                    "title": "Socket",
+                    "detail": "ok",
+                ],
+                [
+                    "id": "machine.local",
+                    "status": "pass",
+                    "code": "machine.running",
+                    "title": "Local machine running",
+                    "detail": "dev=running",
+                ],
+            ],
+        ] as NSDictionary, "")
+    }
+
+    func doctorJSON(reply: @escaping (String, String) -> Void) {
+        reply(
+            """
+            {"results":[{"id":"socket.exists","status":"pass","code":"SOCKET_OK","title":"Socket","detail":"ok","action":null}]}
+            """,
+            ""
+        )
+    }
+
+    func incidents(_ limit: Int, reply: @escaping (NSArray, String) -> Void) {
+        reply([
+            [
+                "at": "2026-07-07T00:00:00Z",
+                "type": "engine.start",
+                "detail": "started",
+            ]
+        ] as NSArray, "")
+    }
+
+    private func idleStatusDictionary() -> NSDictionary {
+        lock.lock()
+        let mode = idleMode
+        let policy = idlePolicy
+        lock.unlock()
+        return [
+            "generated_at": "2026-07-07T00:00:00Z",
+            "mode": mode,
+            "auto_idle_enabled": mode == "auto-idle" || mode == "battery-saver",
+            "sleep_after_minutes": policy["sleepAfterMinutes"] ?? 15,
+            "can_sleep": true,
+            "blockers": [],
+            "proxy_state": [
+                "available": false,
+                "state": "unknown",
+            ],
+            "policy": policy,
+        ] as NSDictionary
+    }
+
+    private var idleAvailable: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _idleAvailable
+    }
+
+    private func dockerAgentInfo() -> NSDictionary {
+        [
+            "protocolVersion": 1,
+            "kernel": "Linux docker",
+            "agentBuild": "docker-agent",
+            "uptimeSeconds": 11,
+        ]
+    }
+
+    private func dockerTelemetry() -> NSDictionary {
+        [
+            "memTotalKB": 2048,
+            "memAvailableKB": 1024,
+            "psiSomeAvg10": 0.2,
+            "psiFullAvg10": 0.0,
+        ]
+    }
+
+    private func agentInfo() -> NSDictionary {
+        [
+            "protocolVersion": 1,
+            "kernel": "Linux test",
+            "agentBuild": "remote-agent",
+            "uptimeSeconds": 9,
+        ]
+    }
+
+    private func telemetry() -> NSDictionary {
+        [
+            "memTotalKB": 1024,
+            "memAvailableKB": 512,
+            "psiSomeAvg10": 0.1,
+            "psiFullAvg10": 0.0,
+        ]
+    }
+
+    private static func machineRow(
+        id: String,
+        state: String,
+        pid: Int32? = nil,
+        agentBuild: String? = nil,
+        handoffFDCount: Int = 0,
+        memoryMB: UInt64 = 2048,
+        cpuCount: Int = 2,
+        address: String? = nil
+    ) -> NSDictionary {
+        var row: [String: Any] = [
+            "id": id,
+            "state": state,
+            "lastError": "",
+            "handoffFDCount": handoffFDCount,
+            "memoryMB": memoryMB,
+            "cpuCount": cpuCount,
+        ]
+        if let pid { row["pid"] = pid }
+        if let agentBuild {
+            row["agentBuild"] = agentBuild
+            row["handoffSocketPath"] = "/tmp/handoff.sock"
+            row["agentSocketPath"] = "/tmp/agent.sock"
+            row["dockerdSocketPath"] = "/tmp/dockerd.sock"
+            row["shellSocketPath"] = "/tmp/shell.sock"
+        }
+        if let address {
+            row["address"] = address
+        }
+        return row as NSDictionary
+    }
+
+    private static func uint64(_ value: Any?) -> UInt64? {
+        if let number = value as? NSNumber { return number.uint64Value }
+        return value as? UInt64
+    }
+
+    private static func int(_ value: Any?) -> Int? {
+        if let number = value as? NSNumber { return number.intValue }
+        return value as? Int
+    }
+
+    private static func execRow(stdout: String = "", stderr: String = "", exitCode: Int32 = 0) -> NSDictionary {
+        [
+            "exitCode": exitCode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "timedOut": false,
+            "stdoutTruncated": false,
+            "stderrTruncated": false,
+        ] as NSDictionary
+    }
+
+    private static func snapshotRow(id: String, machineID: String, note: String, createdISO: String) -> NSDictionary {
+        [
+            "id": id,
+            "machineID": machineID,
+            "note": note,
+            "createdISO": createdISO,
+            "rootfsPath": "/tmp/\(machineID)-\(id).ext4",
+            "sizeBytes": 1024,
+            "kernelPath": "/tmp/kernel",
+            "memoryMB": 2048,
+            "cpuCount": 2,
+        ] as NSDictionary
+    }
+
+    private static func domainRoute(_ value: Any) -> DorydDomainRoute? {
+        guard let dictionary = value as? NSDictionary,
+              let hostname = dictionary["hostname"] as? String,
+              let address = dictionary["address"] as? String else {
+            return nil
+        }
+        let port: UInt16
+        if let number = dictionary["port"] as? NSNumber {
+            port = number.uint16Value
+        } else if let raw = dictionary["port"] as? UInt16 {
+            port = raw
+        } else {
+            port = 80
+        }
+        return DorydDomainRoute(hostname: hostname, address: address, port: port)
+    }
+
+    private static func dictionary(_ route: DorydDomainRoute) -> NSDictionary {
+        [
+            "hostname": route.hostname,
+            "address": route.address,
+            "port": route.port,
+        ] as NSDictionary
+    }
+}
+
+@MainActor
+private func waitUntil(_ condition: @escaping @MainActor () -> Bool) async throws {
+    for _ in 0..<80 {
+        if condition() { return }
+        try await Task.sleep(for: .milliseconds(50))
+    }
+    #expect(condition())
+}
+
+private final class FakeDorydListenerDelegate: NSObject, NSXPCListenerDelegate {
+    private let service: FakeDorydService
+
+    init(service: FakeDorydService) {
+        self.service = service
+    }
+
+    func listener(
+        _ listener: NSXPCListener,
+        shouldAcceptNewConnection connection: NSXPCConnection
+    ) -> Bool {
+        connection.exportedInterface = NSXPCInterface(with: DorydControlXPC.self)
+        connection.exportedObject = service
+        connection.resume()
+        return true
+    }
+}
+
+private final class HealthDiagnosticsCLIRunRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedCommands: [[String]] = []
+
+    var commands: [[String]] {
+        lock.lock(); defer { lock.unlock() }
+        return recordedCommands
+    }
+
+    func record(_ command: [String]) {
+        lock.lock()
+        recordedCommands.append(command)
+        lock.unlock()
+    }
+}

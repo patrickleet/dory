@@ -17,6 +17,9 @@ final class ShimActivity: @unchecked Sendable {
     func end() { lock.lock(); if _active > 0 { _active -= 1 }; lock.unlock() }
     func touch() { lock.lock(); _last = Date(); lock.unlock() }
     func setSleeping(_ value: Bool) { lock.lock(); _sleeping = value; lock.unlock() }
+#if DEBUG
+    func setLastForTests(_ date: Date) { lock.lock(); _last = date; lock.unlock() }
+#endif
     var isSleeping: Bool { lock.lock(); defer { lock.unlock() }; return _sleeping }
     var snapshot: (active: Int, last: Date) { lock.lock(); defer { lock.unlock() }; return (_active, _last) }
 }

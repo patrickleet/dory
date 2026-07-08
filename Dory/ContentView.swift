@@ -51,9 +51,6 @@ struct RootView: View {
         .animation(.spring(duration: 0.3), value: store.dockerHostConflict)
         .animation(.spring(duration: 0.3), value: store.dockerHostCleaned)
         .task { store.startBackendIfNeeded() }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
-            DockerContext.deactivateSync()
-        }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task { await store.refreshIfIdle() }
         }

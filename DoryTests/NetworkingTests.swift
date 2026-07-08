@@ -94,6 +94,25 @@ struct NetworkingTests {
         #expect(AppStore.machineDNSHosts(machines, suffix: "dory.local") == ["dev.dory.local": "172.17.0.5"])
     }
 
+    @Test func dorydRoutesConvertPublishedPortsAndMachineHosts() {
+        let routes = AppStore.dorydRoutes(
+            containerEndpoints: [
+                "Web.dory.local.": 8080,
+                "too-high.dory.local": 70_000,
+                "zero.dory.local": 0,
+            ],
+            machineHosts: [
+                "dev.dory.local": "172.17.0.5",
+                "bad.dory.local": "not-an-ip",
+            ]
+        )
+
+        #expect(routes == [
+            DorydDomainRoute(hostname: "dev.dory.local", address: "172.17.0.5", port: 80),
+            DorydDomainRoute(hostname: "web.dory.local", address: "127.0.0.1", port: 8080),
+        ])
+    }
+
     @Test func kubeServiceProxyBuildsStableServiceRoutes() {
         #expect(KubeServiceProxy.serviceHost(name: "Web", namespace: "Default", suffix: "dory.local") == "web.default.k8s.dory.local")
         #expect(KubeServiceProxy.serviceProxyPath(name: "web", namespace: "default", port: 8080) == "/api/v1/namespaces/default/services/web:8080/proxy")

@@ -6,7 +6,7 @@ struct AutoIdleView: View {
 
     private let modes: [(id: String, title: String, detail: String)] = [
         ("manual", "Manual", "You start and stop the engine yourself."),
-        ("auto-idle", "Auto-Idle", "Wakes on Docker use, sleeps when nothing needs it."),
+        ("auto-idle", "Auto-Idle", "doryd wakes on Docker use and sleeps when nothing needs it."),
         ("always-on", "Always On", "Engine stays running until you stop it."),
         ("battery-saver", "Battery Saver", "Auto-Idle, but sleeps sooner on battery."),
     ]
@@ -41,7 +41,7 @@ struct AutoIdleView: View {
                               "Do not sleep while a Kubernetes cluster is configured.",
                               key: "keepKubernetesAwake", value: store.idlePolicy.keepKubernetesAwake, divider: true)
                     toggleRow("Show wake notifications",
-                              "Print a line when a sleeping engine is woken by Docker use.",
+                              "Print a line when doryd wakes a sleeping engine for Docker use.",
                               key: "showWakeNotifications", value: store.idlePolicy.showWakeNotifications, divider: false)
                 }
                 .cardSurface(p)
@@ -87,7 +87,7 @@ struct AutoIdleView: View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 1) {
                 Text("Sleep after idle").font(.system(size: 13, weight: .semibold)).foregroundStyle(p.text)
-                Text("How long with no Docker activity before the engine sleeps.")
+                Text("How long with no Docker activity before doryd sleeps the engine.")
                     .font(.system(size: 11.5)).foregroundStyle(p.text3)
             }
             Spacer(minLength: 0)

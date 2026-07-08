@@ -12,6 +12,7 @@ struct HealthView: View {
                         cliMissingCard
                     } else {
                         summaryCard(snapshot)
+                        processMemoryCard
                         recoverySection
                         if let idle = snapshot.idle {
                             autoIdleCard(idle)
@@ -39,6 +40,7 @@ struct HealthView: View {
         }
         .background(p.bgContent)
         .task {
+            await store.refreshProcessMemory()
             let isStale = store.healthSnapshot.map { Date().timeIntervalSince($0.generatedAt) > 20 } ?? true
             if isStale {
                 await store.loadHealth()
@@ -90,6 +92,81 @@ struct HealthView: View {
             }
         }
         .cardStyle(p)
+    }
+
+    private var processMemoryCard: some View {
+        let snapshot = store.processMemorySnapshot
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                Image(systemName: "memorychip")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(p.accentText)
+                    .frame(width: 28, height: 28)
+                    .background(p.accentWeak, in: RoundedRectangle(cornerRadius: 8))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Dory process memory")
+                        .font(.system(size: 13, weight: .semibold)).foregroundStyle(p.text)
+                    Text("\(snapshot.totalResidentDisplay) resident across \(snapshot.rows.count) process\(snapshot.rows.count == 1 ? "" : "es")")
+                        .font(.system(size: 11.5)).foregroundStyle(p.text3)
+                }
+                Spacer(minLength: 0)
+                Button {
+                    Task { await store.refreshProcessMemory() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(p.text3)
+                        .frame(width: 26, height: 24)
+                }
+                .buttonStyle(.plain)
+                .help("Refresh memory")
+            }
+            if snapshot.duplicateAppInstanceCount > 0 {
+                Text("\(snapshot.duplicateAppInstanceCount) extra Dory app instance\(snapshot.duplicateAppInstanceCount == 1 ? "" : "s") detected.")
+                    .font(.system(size: 12, weight: .semibold)).foregroundStyle(p.amber)
+            }
+            if snapshot.sortedRows.isEmpty {
+                Text("No Dory processes found.")
+                    .font(.system(size: 12)).foregroundStyle(p.text3)
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(Array(snapshot.sortedRows.prefix(8).enumerated()), id: \.element.id) { index, row in
+                        if index > 0 {
+                            Divider().overlay(p.border)
+                        }
+                        processMemoryRow(row)
+                    }
+                }
+                .background(p.bgInput, in: RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(p.border))
+            }
+        }
+        .cardStyle(p)
+    }
+
+    private func processMemoryRow(_ row: DoryProcessMemoryRow) -> some View {
+        HStack(spacing: 10) {
+            Circle().fill(processColor(row.role)).frame(width: 8, height: 8)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(row.title).font(.system(size: 12.5, weight: .semibold)).foregroundStyle(p.text)
+                Text(row.subtitle).font(.system(size: 11)).foregroundStyle(p.text3).lineLimit(1)
+            }
+            Spacer(minLength: 0)
+            Text(row.residentDisplay)
+                .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                .foregroundStyle(p.text2)
+        }
+        .padding(.horizontal, 11).padding(.vertical, 8)
+    }
+
+    private func processColor(_ role: DoryProcessRole) -> Color {
+        switch role {
+        case .app: p.accentText
+        case .daemon: p.green
+        case .dockerVM, .machineVM: p.amber
+        case .networking: p.accent
+        case .helper: p.text3
+        }
     }
 
     // MARK: Recovery

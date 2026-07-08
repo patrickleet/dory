@@ -11,6 +11,7 @@ struct DoryApp: App {
         // Writing to a socket whose peer has closed otherwise raises SIGPIPE and kills the process;
         // ignore it so the POSIX write paths return EPIPE and are handled gracefully.
         signal(SIGPIPE, SIG_IGN)
+        DoryAppDelegate.exitDuplicateInstanceIfNeeded()
         let store = AppStore()
         store.startBackendIfNeeded()
         _store = State(initialValue: store)

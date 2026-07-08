@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct DoryCommands: Commands {
@@ -16,6 +17,11 @@ struct DoryCommands: Commands {
                 store.activeSheet = .newContainer
             }
             .keyboardShortcut("n", modifiers: .command)
+            Button("New Machine") {
+                store.section = .machines
+                store.activeSheet = .newMachine
+            }
+            .keyboardShortcut("n", modifiers: [.command, .option])
         }
         CommandGroup(after: .toolbar) {
             Button("Containers") { store.section = .containers }.keyboardShortcut("1", modifiers: .command)
@@ -25,6 +31,7 @@ struct DoryCommands: Commands {
             Button("Compose") { store.section = .compose }.keyboardShortcut("5", modifiers: .command)
             Button("Kubernetes") { store.section = .kubernetes }.keyboardShortcut("6", modifiers: .command)
             Button("Machines") { store.section = .machines }.keyboardShortcut("7", modifiers: .command)
+            Button("Health") { store.section = .health }.keyboardShortcut("8", modifiers: .command)
             Button("Settings") { store.section = .settings }.keyboardShortcut(",", modifiers: .command)
             Button("Filter") { if store.section != .settings { store.filterFocusToken += 1 } }
                 .keyboardShortcut("f", modifiers: .command)
@@ -44,6 +51,11 @@ struct DoryCommands: Commands {
                 .keyboardShortcut("r", modifiers: .command)
         }
         CommandMenu("Runtime") {
+            Button("Open Daemon Health") { openMain(.health) }
+            Button("Process Memory") { openSettings(.resources) }
+            Button("Auto-Idle Settings") { openSettings(.autoIdle) }
+            Divider()
+
             Menu("Running Services") {
                 if runningServices.isEmpty {
                     Button("No running services") {}
@@ -92,6 +104,11 @@ struct DoryCommands: Commands {
             }
 
             Menu("Linux Machines") {
+                Button("New Machine") {
+                    openMain(.machines)
+                    store.activeSheet = .newMachine
+                }
+                Divider()
                 if store.machines.isEmpty {
                     Button("No machines") {}
                         .disabled(true)
@@ -101,6 +118,19 @@ struct DoryCommands: Commands {
                             Button("Open Machines") { openMain(.machines) }
                             Button("Open Terminal") {
                                 openWindow(value: store.terminalSession(for: machine))
+                            }
+                            .disabled(!store.canOpenMachineTerminal(machine))
+                            if let command = store.machineTerminalCommand(machine) {
+                                Button("Copy Terminal Command") {
+                                    copy(command)
+                                }
+                            }
+                            Button("Copy Address") {
+                                copy(machine.ip)
+                            }
+                            Button("Edit Address & Resources") {
+                                openMain(.machines)
+                                store.openMachineEdit(machine)
                             }
                             Divider()
                             Button(machine.status == .running ? "Stop" : "Start") {
@@ -161,6 +191,11 @@ struct DoryCommands: Commands {
         openWindow(id: Self.openDoryWindowID)
     }
 
+    private func openSettings(_ tab: SettingsTab) {
+        store.settingsTab = tab
+        openMain(.settings)
+    }
+
     private func openContainer(_ container: Container, scope: ContainerScope) {
         store.setContainerScope(scope)
         store.section = .containers
@@ -175,5 +210,10 @@ struct DoryCommands: Commands {
 
     private func stopAll() {
         for container in store.containers where container.isRunning { store.toggle(container) }
+    }
+
+    private func copy(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 }

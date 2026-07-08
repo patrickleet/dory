@@ -9,6 +9,7 @@ nonisolated struct MachineSettings: Sendable, Hashable {
     var ports: [PortPair] = []
     var identity: MacIdentity? = nil
     var env: [String: String] = [:]
+    var address: String? = nil
     nonisolated static let `default` = MachineSettings(cpus: nil, memoryMB: nil)
 }
 

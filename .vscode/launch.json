@@ -39,6 +39,46 @@
             "target": "dory-hv",
             "configuration": "release",
             "preLaunchTask": "swift: Build Release dory-hv (Packages/ContainerizationEngine)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Dory}/dory-core-swift",
+            "name": "Debug doryd (dory-core-swift)",
+            "target": "doryd",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug doryd (dory-core-swift)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Dory}/dory-core-swift",
+            "name": "Release doryd (dory-core-swift)",
+            "target": "doryd",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release doryd (dory-core-swift)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Dory}/dory-core-swift",
+            "name": "Debug dory-vmm (dory-core-swift)",
+            "target": "dory-vmm",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug dory-vmm (dory-core-swift)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Dory}/dory-core-swift",
+            "name": "Release dory-vmm (dory-core-swift)",
+            "target": "dory-vmm",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release dory-vmm (dory-core-swift)"
         }
     ]
 }

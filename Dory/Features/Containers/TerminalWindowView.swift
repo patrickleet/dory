@@ -9,7 +9,7 @@ struct TerminalWindowView: View {
             header
             ContainerTerminalView(socketPath: session.socketPath, containerID: session.containerID,
                                   user: session.user, shell: session.shell, home: session.home,
-                                  kubeExec: session.kubeExec)
+                                  kubeExec: session.kubeExec, machineShell: session.machineShell)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(minWidth: 480, minHeight: 300)
@@ -28,7 +28,8 @@ struct TerminalWindowView: View {
             }
             Spacer()
             Button {
-                let command = session.kubeExec.map(KubeExecCommand.shell)
+                let command = session.machineShell.map(TerminalLauncher.machineShellCommand)
+                    ?? session.kubeExec.map(KubeExecCommand.shell)
                     ?? TerminalLauncher.dockerCommand(
                         socketPath: session.socketPath,
                         execArgs: TerminalLauncher.execArgs(user: session.user, shell: session.shell, home: session.home, container: session.containerID)

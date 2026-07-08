@@ -9,9 +9,12 @@ struct MenuBarContentView: View {
     @State private var composeExpanded = true
     @State private var machinesExpanded = true
     @State private var kubernetesExpanded = true
+    @State private var runtimeExpanded = true
+    @State private var memoryExpanded = true
 
     private func refreshPopover() {
         Task {
+            await store.refreshProcessMemory()
             await store.reload()
             store.loadMachines()
             if store.runtimeKind == .sharedVM {
@@ -39,6 +42,11 @@ struct MenuBarContentView: View {
         showMainWindow()
     }
 
+    private func openSettings(_ tab: SettingsTab) {
+        store.settingsTab = tab
+        openSection(.settings)
+    }
+
     private func openContainer(_ container: Container, scope: ContainerScope = .all) {
         store.selectedContainerID = container.id
         store.setContainerScope(scope)
@@ -52,6 +60,7 @@ struct MenuBarContentView: View {
     }
 
     private func openMachineTerminal(_ machine: Machine) {
+        guard store.canOpenMachineTerminal(machine) else { return }
         openWindow(value: store.terminalSession(for: machine))
         closePopover()
         NSApp.activate(ignoringOtherApps: true)
@@ -76,7 +85,7 @@ struct MenuBarContentView: View {
             DoryLogo(size: 28, corner: 8)
             VStack(alignment: .leading, spacing: 1) {
                 Text("Dory").font(.system(size: 13, weight: .bold)).foregroundStyle(p.text)
-                Text("\(store.runningCount) services · \(store.machines.filter { $0.status == .running }.count) machines · \(store.kubernetesReachable ? "k8s ready" : "k8s off")")
+                Text("\(engineSummary) · \(store.processMemorySnapshot.totalResidentDisplay)")
                     .font(.system(size: 11, weight: .semibold)).foregroundStyle(p.green)
             }
             Spacer(minLength: 0)
@@ -119,6 +128,8 @@ struct MenuBarContentView: View {
     private var menuContent: some View {
         ScrollView {
             VStack(spacing: 8) {
+                runtimeSection
+                memorySection
                 servicesSection
                 composeSection
                 machinesSection
@@ -127,6 +138,70 @@ struct MenuBarContentView: View {
             .padding(8)
         }
         .frame(maxHeight: 430)
+    }
+
+    private var engineSummary: String {
+        if store.engineSleeping { return "Engine sleeping" }
+        if store.engineRunning { return "Engine running" }
+        return "Engine off"
+    }
+
+    private var runtimeSection: some View {
+        quickSection(
+            title: "Daemon & Idle",
+            subtitle: "\(store.runtimeAuthorityDisplay) · \(store.runtimeMode)",
+            systemImage: "bolt.horizontal.circle",
+            expanded: $runtimeExpanded,
+            open: { openSection(.health) }
+        ) {
+            quickRow(
+                dot: store.dorydRuntimeActive ? p.green : p.text3,
+                title: "doryd",
+                subtitle: store.runtimeAuthorityDisplay,
+                value: store.dorydRuntimeRequired ? "required" : "optional"
+            ) {
+                rowIcon("stethoscope", "Open Health") { openSection(.health) }
+            }
+            quickRow(
+                dot: store.engineSleeping ? p.amber : (store.engineRunning ? p.green : p.text3),
+                title: "Auto-Idle",
+                subtitle: "Sleep after \(store.idlePolicy.sleepAfterMinutes)m",
+                value: store.runtimeMode
+            ) {
+                rowIcon("gearshape", "Auto-Idle Settings") { openSettings(.autoIdle) }
+            }
+        }
+    }
+
+    private var memorySection: some View {
+        let snapshot = store.processMemorySnapshot
+        return quickSection(
+            title: "Dory Memory",
+            subtitle: "\(snapshot.totalResidentDisplay) resident",
+            systemImage: "memorychip",
+            expanded: $memoryExpanded,
+            open: { openSection(.health) }
+        ) {
+            if snapshot.groupedRows.isEmpty {
+                emptyLine("No Dory processes found")
+            } else {
+                ForEach(snapshot.groupedRows.prefix(5)) { row in
+                    quickRow(
+                        dot: memoryDot(row.role),
+                        title: row.title,
+                        subtitle: row.subtitle,
+                        value: row.residentDisplay
+                    ) {
+                        EmptyView()
+                    }
+                }
+                if snapshot.duplicateAppInstanceCount > 0 {
+                    moreLine("\(snapshot.duplicateAppInstanceCount) extra app instance\(snapshot.duplicateAppInstanceCount == 1 ? "" : "s") detected") {
+                        openSection(.health)
+                    }
+                }
+            }
+        }
     }
 
     private var servicesSection: some View {
@@ -241,7 +316,15 @@ struct MenuBarContentView: View {
                         Menu {
                             Button("Open Machines") { openSection(.machines) }
                             Button("Open Terminal") { openMachineTerminal(machine) }
-                                .disabled(machine.status != .running)
+                                .disabled(machine.status != .running || !store.canOpenMachineTerminal(machine))
+                            if let command = store.machineTerminalCommand(machine) {
+                                Button("Copy Command") { copy(command) }
+                            }
+                            Button("Copy Address") { copy(machine.ip) }
+                            Button("Edit Address") {
+                                store.openMachineEdit(machine)
+                                openSection(.machines)
+                            }
                         } label: {
                             chevronLabel
                         }
@@ -290,6 +373,16 @@ struct MenuBarContentView: View {
                     .buttonStyle(.plain).menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
                 }
             }
+        }
+    }
+
+    private func memoryDot(_ role: DoryProcessRole) -> Color {
+        switch role {
+        case .app: p.accentText
+        case .daemon: p.green
+        case .dockerVM, .machineVM: p.amber
+        case .networking: p.accent
+        case .helper: p.text3
         }
     }
 
@@ -373,6 +466,11 @@ struct MenuBarContentView: View {
         }
         .buttonStyle(.plain)
         .help(label)
+    }
+
+    private func copy(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
     private var chevronLabel: some View {

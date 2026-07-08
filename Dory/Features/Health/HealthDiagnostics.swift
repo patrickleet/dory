@@ -244,31 +244,108 @@ enum DoryCLI {
 
     private static func bundledPath(named name: String) -> String? {
         let fileManager = FileManager.default
-        if let auxiliary = Bundle.main.url(forAuxiliaryExecutable: name)?.path,
-           fileManager.isExecutableFile(atPath: auxiliary) {
-            return auxiliary
-        }
-        let bundleURL = Bundle.main.bundleURL
+        return bundledPath(
+            named: name,
+            bundleURL: Bundle.main.bundleURL,
+            auxiliaryPath: Bundle.main.url(forAuxiliaryExecutable: name)?.path,
+            isExecutable: { fileManager.isExecutableFile(atPath: $0) }
+        )
+    }
+
+    static func bundledPath(
+        named name: String,
+        bundleURL: URL,
+        auxiliaryPath: String?,
+        isExecutable: (String) -> Bool
+    ) -> String? {
         let candidates = [
             bundleURL.appendingPathComponent("Contents/Helpers/\(name)").path,
             bundleURL.appendingPathComponent("Helpers/\(name)").path,
         ]
-        return candidates.first { fileManager.isExecutableFile(atPath: $0) }
+        if let helper = candidates.first(where: isExecutable) {
+            return helper
+        }
+        return auxiliaryPath.flatMap { auxiliary in
+            isExecutable(auxiliary) ? auxiliary : nil
+        }
     }
 }
 
 enum HealthDiagnostics {
     static func load(active: Bool) async -> HealthSnapshot {
-        guard let cli = DoryCLI.url() else {
-            return HealthSnapshot(cliMissing: true)
+        await load(
+            active: active,
+            cli: DoryCLI.url(),
+            daemonHealthJSON: { active in await dorydHealthJSON(active: active) },
+            daemonIncidents: { limit in await dorydIncidents(limit: limit) },
+            daemonIdleStatus: { await dorydIdleStatus() },
+            daemonIdleHistory: { limit in await dorydIdleHistory(limit: limit) },
+            runCLI: { cli, arguments, timeout in await run(cli, arguments, timeout: timeout) }
+        )
+    }
+
+    static func load(
+        active: Bool,
+        cli: URL?,
+        daemonHealthJSON: @Sendable @escaping (Bool) async -> String?,
+        daemonIncidents: @Sendable @escaping (Int) async -> [Incident]?,
+        daemonIdleStatus: @Sendable @escaping () async -> IdleStatus?,
+        daemonIdleHistory: @Sendable @escaping (Int) async -> [IdleHistoryEntry]?,
+        runCLI: @Sendable @escaping (URL, [String], TimeInterval) async -> (ok: Bool, stdout: String, stderr: String)
+    ) async -> HealthSnapshot {
+        async let daemonIncidentsAsync = daemonIncidents(40)
+        async let daemonIdleStatusAsync = daemonIdleStatus()
+        async let daemonIdleHistoryAsync = daemonIdleHistory(40)
+        let daemonDoctor = await daemonHealthJSON(active)
+
+        if let daemonDoctor {
+            var snapshot = HealthSnapshot(activeProbed: active)
+            if let report: DoctorReport = decode(daemonDoctor) {
+                snapshot.checks = report.results
+            } else {
+                snapshot.doctorError = "doryd returned malformed doctor JSON"
+            }
+
+            let daemonIdleStatus = await daemonIdleStatusAsync
+            let daemonIdleHistory = await daemonIdleHistoryAsync
+            if let daemonIdleStatus {
+                snapshot.idle = daemonIdleStatus
+            } else if let cli {
+                let idle = await runCLI(cli, ["idle", "status", "--json"], 90)
+                snapshot.idle = decode(idle.stdout)
+            }
+            if let daemonIdleHistory {
+                snapshot.history = daemonIdleHistory.reversed()
+            } else if let cli {
+                let history = await runCLI(cli, ["idle", "history", "--json", "--limit", "40"], 90)
+                if let rows: [FailableDecodable<IdleHistoryEntry>] = decode(history.stdout) {
+                    snapshot.history = rows.compactMap(\.value).reversed()
+                }
+            }
+            snapshot.incidents = await daemonIncidentsAsync ?? []
+            return snapshot
         }
+
+        guard let cli else {
+            var snapshot = HealthSnapshot(cliMissing: true, activeProbed: active)
+            snapshot.incidents = await daemonIncidentsAsync ?? []
+            return snapshot
+        }
+
         let doctorArgs = active ? ["doctor", "--json", "--active"] : ["doctor", "--json"]
-        async let doctorRun = run(cli, doctorArgs)
-        async let compatRun = run(cli, ["compat", "--json"])
-        async let idleRun = run(cli, ["idle", "status", "--json"])
-        async let historyRun = run(cli, ["idle", "history", "--json", "--limit", "40"])
-        async let incidentsRun = run(cli, ["incidents", "--json", "--limit", "40"])
-        let (doctor, compat, idle, history, incidents) = await (doctorRun, compatRun, idleRun, historyRun, incidentsRun)
+        async let compatRun = runCLI(cli, ["compat", "--json"], 90)
+        async let idleRun = runCLI(cli, ["idle", "status", "--json"], 90)
+        async let historyRun = runCLI(cli, ["idle", "history", "--json", "--limit", "40"], 90)
+        async let incidentsRun = runCLI(cli, ["incidents", "--json", "--limit", "40"], 90)
+        let doctor: (ok: Bool, stdout: String, stderr: String)
+        doctor = await runCLI(cli, doctorArgs, 90)
+        let (compat, idle, history, incidents, daemonIncidents) = await (
+            compatRun,
+            idleRun,
+            historyRun,
+            incidentsRun,
+            daemonIncidentsAsync
+        )
 
         var snapshot = HealthSnapshot(activeProbed: active)
         var checks: [DoctorCheck] = []
@@ -287,16 +364,18 @@ enum HealthDiagnostics {
         if let rows: [FailableDecodable<IdleHistoryEntry>] = decode(history.stdout) {
             snapshot.history = rows.compactMap(\.value).reversed()
         }
-        if let report: IncidentReport = decode(incidents.stdout) {
+        if let daemonIncidents {
+            snapshot.incidents = daemonIncidents
+        } else if let report: IncidentReport = decode(incidents.stdout) {
             snapshot.incidents = report.incidents
         }
         return snapshot
     }
 
     @discardableResult
-    static func runControl(_ arguments: [String]) async -> (ok: Bool, output: String) {
+    static func runControl(_ arguments: [String], timeout: TimeInterval = 90) async -> (ok: Bool, output: String) {
         guard let cli = DoryCLI.url() else { return (false, "Dory CLI not found") }
-        let result = await run(cli, arguments)
+        let result = await run(cli, arguments, timeout: timeout)
         let output = result.stdout.isEmpty ? result.stderr : result.stdout
         return (result.ok, output.trimmingCharacters(in: .whitespacesAndNewlines))
     }
@@ -324,10 +403,18 @@ enum HealthDiagnostics {
                 try? fileManager.removeItem(at: errURL)
                 return (false, "", error.localizedDescription)
             }
-            // Backstop a wedged CLI so the panel cannot spin forever; SIGTERM by pid, then reap.
+            // Backstop a wedged CLI so the panel cannot spin forever; SIGTERM first, then SIGKILL
+            // after a short grace period for commands that ignore or never receive termination.
             let pid = process.processIdentifier
-            let watchdog = DispatchWorkItem { if kill(pid, 0) == 0 { kill(pid, SIGTERM) } }
-            DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
+            let watchdogQueue = DispatchQueue.global(qos: .utility)
+            let watchdog = DispatchWorkItem {
+                guard process.isRunning else { return }
+                process.terminate()
+                watchdogQueue.asyncAfter(deadline: .now() + 2) {
+                    if process.isRunning { kill(pid, SIGKILL) }
+                }
+            }
+            watchdogQueue.asyncAfter(deadline: .now() + timeout, execute: watchdog)
             let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
             watchdog.cancel()
@@ -341,6 +428,27 @@ enum HealthDiagnostics {
             }
             return (process.terminationStatus == 0, stdout, stderr)
         }.value
+    }
+
+    private static func dorydHealthJSON(active: Bool) async -> String? {
+        guard !active else { return nil }
+        let client = DorydClient()
+        if let health = try? await client.healthJSON() {
+            return health
+        }
+        return try? await client.doctorJSON()
+    }
+
+    private static func dorydIncidents(limit: Int) async -> [Incident]? {
+        try? await DorydClient().incidents(limit: limit)
+    }
+
+    private static func dorydIdleStatus() async -> IdleStatus? {
+        try? await DorydClient().idleStatus()
+    }
+
+    private static func dorydIdleHistory(limit: Int) async -> [IdleHistoryEntry]? {
+        try? await DorydClient().idleHistory(limit: limit)
     }
 
     private static func childEnvironment() -> [String: String] {
