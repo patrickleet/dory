@@ -147,7 +147,12 @@ struct DorydClientTests {
         let pushStats = try await client.remotePush(machineID: "vps", localRoot: "/tmp/local")
         let remoteStatus = try await client.remoteStatus(machineID: "vps")
         let replacedRoutes = try await client.networkReplaceRoutes([
-            DorydDomainRoute(hostname: "web.dory.local", address: "127.0.0.42", port: 8080)
+            DorydDomainRoute(
+                hostname: "web.default.k8s.dory.local",
+                address: "127.0.0.1",
+                port: 18_001,
+                pathPrefix: "/api/v1/namespaces/default/services/web:80/proxy"
+            ),
         ])
         let networkStatus = try await client.networkStatus()
         let networkPlan = try await client.networkAuthorizationPlan()
@@ -209,7 +214,14 @@ struct DorydClientTests {
         #expect(networkStatus.httpProxyRunning)
         #expect(networkStatus.httpsProxyPort == 18443)
         #expect(networkStatus.httpsProxyRunning)
-        #expect(networkStatus.routes == [DorydDomainRoute(hostname: "web.dory.local", address: "127.0.0.42", port: 8080)])
+        #expect(networkStatus.routes == [
+            DorydDomainRoute(
+                hostname: "web.default.k8s.dory.local",
+                address: "127.0.0.1",
+                port: 18_001,
+                pathPrefix: "/api/v1/namespaces/default/services/web:80/proxy"
+            ),
+        ])
         #expect(networkPlan.suffix == "dory.local")
         #expect(networkPlan.dnsBindAddress == "127.0.0.1")
         #expect(networkPlan.dnsPort == 15353)
@@ -286,14 +298,7 @@ struct DorydClientTests {
         #expect(!store.localNetworkingActiveForTests)
         #expect(store.loadState == .ready)
         #expect(!store.containers.isEmpty)
-
-        for _ in 0..<40 {
-            if !service.latestNetworkRoutes.isEmpty { break }
-            try await Task.sleep(for: .milliseconds(50))
-        }
-        #expect(service.latestNetworkRoutes.contains {
-            $0.hostname == "web-api.dory.local" && $0.address == "127.0.0.1" && $0.port == 3000
-        })
+        #expect(service.latestNetworkRoutes.isEmpty)
     }
 
     @MainActor
@@ -1455,15 +1460,20 @@ private final class FakeDorydService: NSObject, DorydControlXPC {
         } else {
             port = 80
         }
-        return DorydDomainRoute(hostname: hostname, address: address, port: port)
+        let pathPrefix = dictionary["pathPrefix"] as? String ?? ""
+        return DorydDomainRoute(hostname: hostname, address: address, port: port, pathPrefix: pathPrefix)
     }
 
     private static func dictionary(_ route: DorydDomainRoute) -> NSDictionary {
-        [
+        var dictionary: [String: Any] = [
             "hostname": route.hostname,
             "address": route.address,
             "port": route.port,
-        ] as NSDictionary
+        ]
+        if !route.pathPrefix.isEmpty {
+            dictionary["pathPrefix"] = route.pathPrefix
+        }
+        return dictionary as NSDictionary
     }
 }
 

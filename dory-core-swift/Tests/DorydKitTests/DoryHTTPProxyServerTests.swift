@@ -53,6 +53,40 @@ final class DoryHTTPProxyServerTests: XCTestCase {
         let request = Data("GET / HTTP/1.1\r\nHost: Web.Dory.Local:8080\r\n\r\n".utf8)
         XCTAssertEqual(DoryHTTPProxyServer.hostHeader(request), "web.dory.local")
     }
+
+    func testRewriteRequestPrependsPathPrefix() {
+        let request = Data("GET /healthz HTTP/1.1\r\nHost: web.default.k8s.dory.local\r\n\r\n".utf8)
+        let rewritten = DoryHTTPProxyServer.rewriteRequest(
+            request,
+            pathPrefix: "/api/v1/namespaces/default/services/web:80/proxy"
+        )
+        let text = String(data: rewritten, encoding: .utf8) ?? ""
+        XCTAssertTrue(text.hasPrefix("GET /api/v1/namespaces/default/services/web:80/proxy/healthz HTTP/1.1\r\n"))
+        XCTAssertTrue(text.contains("Host: web.default.k8s.dory.local"))
+    }
+
+    func testPathPrefixRouteRewritesBeforeProxying() throws {
+        let backend = TinyHTTPBackend(responseBody: "hello from kube proxy")
+        try backend.start()
+        defer { backend.stop() }
+
+        let proxy = DoryHTTPProxyServer(port: 0, routes: [
+            DomainRoute(
+                hostname: "web.default.k8s.dory.local",
+                address: "127.0.0.1",
+                port: backend.port,
+                pathPrefix: "/api/v1/namespaces/default/services/web:80/proxy"
+            ),
+        ])
+        try proxy.start()
+        defer { proxy.stop() }
+
+        let response = try sendHTTP(port: proxy.port, host: "web.default.k8s.dory.local", path: "/healthz")
+
+        XCTAssertTrue(response.contains("HTTP/1.1 200 OK"))
+        XCTAssertTrue(response.contains("hello from kube proxy"))
+        XCTAssertTrue(backend.lastRequest.hasPrefix("GET /api/v1/namespaces/default/services/web:80/proxy/healthz HTTP/1.1\r\n"))
+    }
 }
 
 private final class TinyHTTPBackend: @unchecked Sendable {
@@ -154,7 +188,7 @@ private enum ProxyTestError: Error {
     case shortRead
 }
 
-private func sendHTTP(port: UInt16, host: String) throws -> String {
+private func sendHTTP(port: UInt16, host: String, path: String = "/") throws -> String {
     let fd = socket(AF_INET, SOCK_STREAM, 0)
     guard fd >= 0 else { throw ProxyTestError.syscall("socket", errno) }
     defer { close(fd) }
@@ -171,7 +205,7 @@ private func sendHTTP(port: UInt16, host: String) throws -> String {
         }
     }
     guard connected == 0 else { throw ProxyTestError.syscall("connect", errno) }
-    let request = "GET / HTTP/1.1\r\nHost: \(host)\r\nConnection: close\r\n\r\n"
+    let request = "GET \(path) HTTP/1.1\r\nHost: \(host)\r\nConnection: close\r\n\r\n"
     _ = request.withCString { pointer in
         write(fd, pointer, strlen(pointer))
     }

@@ -113,6 +113,31 @@ final class NetworkRouteReconcilerTests: XCTestCase {
         ])
     }
 
+    func testIncludesAdditionalRoutesWithPathPrefixes() {
+        let routes = NetworkRouteReconciler.routes(
+            containers: .ok([]),
+            machines: [],
+            suffix: "dory.local",
+            additionalRoutes: [
+                DomainRoute(
+                    hostname: "web.default.k8s.dory.local",
+                    address: "127.0.0.1",
+                    port: 18_001,
+                    pathPrefix: "/api/v1/namespaces/default/services/web:80/proxy"
+                ),
+            ]
+        )
+
+        XCTAssertEqual(routes, [
+            DomainRoute(
+                hostname: "web.default.k8s.dory.local",
+                address: "127.0.0.1",
+                port: 18_001,
+                pathPrefix: "/api/v1/namespaces/default/services/web:80/proxy"
+            ),
+        ])
+    }
+
     private func containers(_ json: String) throws -> [DockerContainerSummary] {
         try JSONDecoder().decode([DockerContainerSummary].self, from: Data(json.utf8))
     }

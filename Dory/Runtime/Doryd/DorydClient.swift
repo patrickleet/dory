@@ -229,13 +229,18 @@ nonisolated struct DorydDomainRoute: Sendable, Equatable {
     var hostname: String
     var address: String
     var port: UInt16 = 80
+    var pathPrefix: String = ""
 
     var xpcDictionary: NSDictionary {
-        [
+        var dictionary: [String: Any] = [
             "hostname": hostname,
             "address": address,
             "port": port,
         ]
+        if !pathPrefix.isEmpty {
+            dictionary["pathPrefix"] = pathPrefix
+        }
+        return dictionary as NSDictionary
     }
 }
 
@@ -1153,7 +1158,12 @@ nonisolated final class DorydClient: @unchecked Sendable {
               let address = dictionary["address"] as? String else {
             return nil
         }
-        return DorydDomainRoute(hostname: hostname, address: address, port: uint16(dictionary["port"]) ?? 80)
+        return DorydDomainRoute(
+            hostname: hostname,
+            address: address,
+            port: uint16(dictionary["port"]) ?? 80,
+            pathPrefix: nonEmptyString(dictionary["pathPrefix"]) ?? ""
+        )
     }
 
     nonisolated private static func networkStatus(from dictionary: NSDictionary) -> DorydNetworkingStatus? {

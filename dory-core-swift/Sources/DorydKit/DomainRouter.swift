@@ -4,11 +4,13 @@ public struct DomainRoute: Sendable, Equatable, Hashable {
     public var hostname: String
     public var address: String
     public var port: UInt16
+    public var pathPrefix: String
 
-    public init(hostname: String, address: String, port: UInt16 = 80) {
+    public init(hostname: String, address: String, port: UInt16 = 80, pathPrefix: String = "") {
         self.hostname = hostname
         self.address = address
         self.port = port
+        self.pathPrefix = pathPrefix
     }
 }
 

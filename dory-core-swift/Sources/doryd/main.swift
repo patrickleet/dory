@@ -53,6 +53,9 @@ let machineManager = dorydEnvironment.machineManagerConfiguration().map { Machin
 let remoteManager = RemoteMachineManager()
 let networkingConfiguration = dorydEnvironment.networkingConfiguration()
 let networkingController = networkingConfiguration.map(NetworkingController.init(configuration:))
+let kubernetesRouteProvider = networkingController.map { _ in
+    KubernetesServiceRouteProvider(configuration: dorydEnvironment.kubernetesServiceRouteProviderConfiguration())
+}
 let incidentPath = env["DORY_INCIDENTS"] ?? "\(dorydEnvironment.home)/.dory/incidents.jsonl"
 let incidentWriter = IncidentWriter(path: incidentPath)
 let networkRouteReconciler = networkingController.map { controller in
@@ -64,6 +67,9 @@ let networkRouteReconciler = networkingController.map { controller in
         },
         machineProvider: {
             machineManager?.list() ?? []
+        },
+        additionalRouteProvider: { suffix in
+            kubernetesRouteProvider?.routes(suffix: suffix) ?? []
         },
         interval: dorydEnvironment.networkRouteReconcileIntervalSeconds
     )
@@ -147,6 +153,7 @@ private let shutdownCoordinator = DorydShutdownCoordinator(
     idleSleepScheduler: idleSleepScheduler,
     wakeCoordinator: wakeCoordinator,
     networkRouteReconciler: networkRouteReconciler,
+    kubernetesRouteProvider: kubernetesRouteProvider,
     networkingController: networkingController,
     dockerTier: dockerTier,
     machineManager: machineManager,
@@ -193,6 +200,7 @@ private final class DorydShutdownCoordinator {
     private let idleSleepScheduler: IdleSleepScheduler?
     private let wakeCoordinator: HostWakeCoordinator
     private let networkRouteReconciler: NetworkRouteReconciler?
+    private let kubernetesRouteProvider: KubernetesServiceRouteProvider?
     private let networkingController: NetworkingController?
     private let dockerTier: DockerTier?
     private let machineManager: MachineManager?
@@ -206,6 +214,7 @@ private final class DorydShutdownCoordinator {
         idleSleepScheduler: IdleSleepScheduler?,
         wakeCoordinator: HostWakeCoordinator,
         networkRouteReconciler: NetworkRouteReconciler?,
+        kubernetesRouteProvider: KubernetesServiceRouteProvider?,
         networkingController: NetworkingController?,
         dockerTier: DockerTier?,
         machineManager: MachineManager?,
@@ -216,6 +225,7 @@ private final class DorydShutdownCoordinator {
         self.idleSleepScheduler = idleSleepScheduler
         self.wakeCoordinator = wakeCoordinator
         self.networkRouteReconciler = networkRouteReconciler
+        self.kubernetesRouteProvider = kubernetesRouteProvider
         self.networkingController = networkingController
         self.dockerTier = dockerTier
         self.machineManager = machineManager
@@ -237,6 +247,7 @@ private final class DorydShutdownCoordinator {
         idleSleepScheduler?.stop()
         wakeCoordinator.stop()
         networkRouteReconciler?.stop()
+        kubernetesRouteProvider?.stop()
         networkingController?.stop()
         remoteManager.disconnectAll()
         machineManager?.stopAll()

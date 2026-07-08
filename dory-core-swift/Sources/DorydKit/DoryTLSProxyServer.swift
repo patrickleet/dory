@@ -161,8 +161,9 @@ public final class DoryTLSProxyServer: @unchecked Sendable {
             writeBadGateway(client, body: "Dory: no backend for that domain\n")
             return
         }
+        let request = route.pathPrefix.isEmpty ? head : DoryHTTPProxyServer.rewriteRequest(head, pathPrefix: route.pathPrefix)
         guard let upstreamFD = DoryTCP.connect(host: route.address, port: route.port),
-              (try? DoryTCP.writeAll(upstreamFD, head)) != nil else {
+              (try? DoryTCP.writeAll(upstreamFD, request)) != nil else {
             writeBadGateway(client, body: "Dory: backend unavailable\n")
             return
         }

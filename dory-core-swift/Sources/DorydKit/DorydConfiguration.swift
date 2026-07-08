@@ -96,6 +96,27 @@ public struct DorydEnvironment: Sendable {
         max(1, double("DORYD_NETWORK_ROUTE_RECONCILE_SECONDS") ?? 5)
     }
 
+    public func kubernetesServiceRouteProviderConfiguration() -> KubernetesServiceRouteProviderConfiguration {
+        KubernetesServiceRouteProviderConfiguration(
+            home: home,
+            kubectlPath: hostToolPath(named: "kubectl"),
+            kubeconfigPath: string("DORYD_KUBECONFIG")
+                ?? string("DORY_KUBECONFIG")
+                ?? "\(home)/.kube/dory-config",
+            proxyPort: uint16("DORYD_KUBE_PROXY_PORT") ?? 18_001
+        )
+    }
+
+    public func hostToolPath(named name: String) -> String? {
+        let envName = name.uppercased().replacingOccurrences(of: "-", with: "_")
+        let explicitKeys = ["DORYD_\(envName)_BIN", "DORY_\(envName)_BIN"]
+        if let explicit = executablePath(firstOf: explicitKeys, fallbackCandidates: []) {
+            return explicit
+        }
+        let candidates = ["\(home)/.dory/bin/\(name)"] + helperCandidates(named: name)
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
     public func machineManagerConfiguration() -> MachineManagerConfiguration? {
         guard let helper = executablePath(firstOf: ["DORYD_VMM_HELPER", "DORY_VMM_HELPER"], fallbackCandidates: helperCandidates(named: "dory-vmm")) else {
             return nil

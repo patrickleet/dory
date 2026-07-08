@@ -163,7 +163,8 @@ public final class DoryHTTPProxyServer: @unchecked Sendable {
             writeBadGateway(client, body: "Dory: backend unavailable\n")
             return
         }
-        guard (try? DoryTCP.writeAll(upstream, buffer)) != nil else {
+        let request = route.pathPrefix.isEmpty ? buffer : Self.rewriteRequest(buffer, pathPrefix: route.pathPrefix)
+        guard (try? DoryTCP.writeAll(upstream, request)) != nil else {
             shutdown(upstream, SHUT_RDWR)
             close(upstream)
             writeBadGateway(client, body: "Dory: backend unavailable\n")
@@ -209,6 +210,25 @@ public final class DoryHTTPProxyServer: @unchecked Sendable {
             return value.split(separator: ":").first.map(String.init) ?? value
         }
         return nil
+    }
+
+    public static func rewriteRequest(_ data: Data, pathPrefix: String) -> Data {
+        guard !pathPrefix.isEmpty,
+              let range = headerRange(in: data) else {
+            return data
+        }
+        let head = data.subdata(in: data.startIndex..<range.lowerBound)
+        let rest = data.subdata(in: range.lowerBound..<data.endIndex)
+        guard let text = String(data: head, encoding: .utf8) else { return data }
+        var lines = text.components(separatedBy: "\r\n")
+        guard !lines.isEmpty else { return data }
+        let parts = lines[0].split(separator: " ", maxSplits: 2, omittingEmptySubsequences: false)
+        guard parts.count >= 3 else { return data }
+        let path = String(parts[1])
+        lines[0] = "\(parts[0]) \(pathPrefix)\(path) \(parts[2])"
+        var output = Data(lines.joined(separator: "\r\n").utf8)
+        output.append(rest)
+        return output
     }
 
     public static func isLoopbackHost(_ host: String) -> Bool {

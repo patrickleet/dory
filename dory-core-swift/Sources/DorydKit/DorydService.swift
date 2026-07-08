@@ -825,16 +825,24 @@ private extension DomainRoute {
         guard let address = dictionary["address"] as? String, IPv4Address(address) != nil else {
             throw XPCNetworkRouteError.invalid("address")
         }
-        self.init(hostname: hostname, address: address)
-        self.port = try dictionary.optionalUInt16("port") ?? 80
+        self.init(
+            hostname: hostname,
+            address: address,
+            port: try dictionary.optionalUInt16("port") ?? 80,
+            pathPrefix: dictionary.optionalString("pathPrefix") ?? ""
+        )
     }
 
     var xpcDictionary: NSDictionary {
-        [
+        var dictionary: [String: Any] = [
             "hostname": hostname,
             "address": address,
             "port": port,
         ]
+        if !pathPrefix.isEmpty {
+            dictionary["pathPrefix"] = pathPrefix
+        }
+        return dictionary as NSDictionary
     }
 }
 

@@ -1393,8 +1393,8 @@ final class AppStore {
             return
         }
         let host = KubeServiceProxy.serviceHost(name: service.name, namespace: service.namespace, suffix: domainSuffix)
-        let domainAvailable = domainTable.backend(for: host) != nil
-        if !domainAvailable { ensureKubeProxy() }
+        let domainAvailable = runtimeOwnedByDoryd ? domainsEnabled : domainTable.backend(for: host) != nil
+        if !runtimeOwnedByDoryd && !domainAvailable { ensureKubeProxy() }
         if let url = KubeServiceProxy.browserURL(
             name: service.name,
             namespace: service.namespace,

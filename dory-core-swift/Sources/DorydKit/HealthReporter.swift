@@ -240,7 +240,7 @@ public final class HealthReporter: @unchecked Sendable {
                     code: "docker.cli_missing",
                     title: "Docker CLI missing",
                     detail: "No docker executable found in PATH or DORY_DOCKER_BIN.",
-                    action: "doryd normally repairs Dory terminal integration automatically; run `dory install` as recovery or set DORY_DOCKER_BIN."
+                    action: "doryd repairs Dory terminal integration automatically while it is running; restart Dory/doryd, or use `dory install` only as manual recovery."
                 ),
             ]
         }
@@ -321,7 +321,7 @@ public final class HealthReporter: @unchecked Sendable {
                 code: "docker.compose_missing",
                 title: "Docker Compose plugin not available",
                 detail: compact(compose.stderr.isEmpty ? compose.stdout : compose.stderr),
-                action: "doryd normally installs the bundled Compose plugin automatically; run `dory install` as recovery."
+                action: "doryd installs the bundled Compose plugin automatically while it is running; restart Dory/doryd, or use `dory install` only as manual recovery."
             ))
         }
 

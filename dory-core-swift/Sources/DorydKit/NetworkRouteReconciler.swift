@@ -3,11 +3,13 @@ import Foundation
 public final class NetworkRouteReconciler: @unchecked Sendable {
     public typealias ContainerProvider = @Sendable () -> DockerContainerList
     public typealias MachineProvider = @Sendable () -> [DoryMachineStatus]
+    public typealias AdditionalRouteProvider = @Sendable (_ suffix: String) -> [DomainRoute]
 
     private let networkingController: NetworkingController
     private let suffix: String
     private let containerProvider: ContainerProvider
     private let machineProvider: MachineProvider
+    private let additionalRouteProvider: AdditionalRouteProvider
     private let interval: TimeInterval
     private let queue = DispatchQueue(label: "dev.dory.doryd.network-routes")
     private var timer: DispatchSourceTimer?
@@ -17,12 +19,14 @@ public final class NetworkRouteReconciler: @unchecked Sendable {
         suffix: String,
         containerProvider: @escaping ContainerProvider,
         machineProvider: @escaping MachineProvider,
+        additionalRouteProvider: @escaping AdditionalRouteProvider = { _ in [] },
         interval: TimeInterval = 5
     ) {
         self.networkingController = networkingController
         self.suffix = suffix
         self.containerProvider = containerProvider
         self.machineProvider = machineProvider
+        self.additionalRouteProvider = additionalRouteProvider
         self.interval = max(1, interval)
     }
 
@@ -31,7 +35,8 @@ public final class NetworkRouteReconciler: @unchecked Sendable {
         let routes = Self.routes(
             containers: containerProvider(),
             machines: machineProvider(),
-            suffix: suffix
+            suffix: suffix,
+            additionalRoutes: additionalRouteProvider(suffix)
         )
         networkingController.replaceRoutes(routes)
         return routes
@@ -60,7 +65,8 @@ public final class NetworkRouteReconciler: @unchecked Sendable {
     public static func routes(
         containers containerList: DockerContainerList,
         machines: [DoryMachineStatus],
-        suffix rawSuffix: String
+        suffix rawSuffix: String,
+        additionalRoutes: [DomainRoute] = []
     ) -> [DomainRoute] {
         let suffix = DomainRouter.normalize(rawSuffix).trimmingCharacters(in: CharacterSet(charactersIn: "."))
         var routes: [String: DomainRoute] = [:]
@@ -91,6 +97,17 @@ public final class NetworkRouteReconciler: @unchecked Sendable {
             }
             let hostname = DomainRouter.normalize("\(machine.id).\(suffix)")
             routes[hostname] = DomainRoute(hostname: hostname, address: address, port: 80)
+        }
+
+        for route in additionalRoutes {
+            let hostname = DomainRouter.normalize(route.hostname)
+            guard IPv4Address(route.address) != nil else { continue }
+            routes[hostname] = DomainRoute(
+                hostname: hostname,
+                address: route.address,
+                port: route.port,
+                pathPrefix: route.pathPrefix
+            )
         }
 
         return routes.values.sorted {
