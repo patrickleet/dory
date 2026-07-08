@@ -566,12 +566,15 @@ find_toolbox_binary() {
 }
 
 write_doryd_launch_agent() {
-  local plist doryd vmm hv gvproxy
+  local plist doryd vmm hv gvproxy log_dir log_path
   plist="$RESOURCES/dev.dory.doryd.plist"
   doryd="$HELPERS/doryd"
   vmm="$HELPERS/dory-vmm"
   hv="$HELPERS/dory-hv"
   gvproxy="$HELPERS/gvproxy"
+  log_dir="$HOME/.dory"
+  log_path="$log_dir/doryd.log"
+  mkdir -p "$log_dir"
   cat > "$plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -614,9 +617,9 @@ write_doryd_launch_agent() {
     <key>ProcessType</key>
     <string>Interactive</string>
     <key>StandardOutPath</key>
-    <string>/tmp/doryd.log</string>
+    <string>$log_path</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/doryd.log</string>
+    <string>$log_path</string>
 </dict>
 </plist>
 PLIST

@@ -19,7 +19,9 @@
     <true/>
     <key>ProcessType</key>
     <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>__DORYD_LOG_PATH__</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/doryd.log</string>
+    <string>__DORYD_LOG_PATH__</string>
 </dict>
 </plist>

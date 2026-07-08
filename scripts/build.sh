@@ -357,7 +357,7 @@ sign_debug_apps() {
 }
 
 write_doryd_launch_agent() {
-  local app resources helpers plist doryd vmm hv gvproxy kernel rootfs amd64
+  local app resources helpers plist doryd vmm hv gvproxy kernel rootfs amd64 log_dir log_path
   app="$1"
   resources="$app/Contents/Resources"
   helpers="$app/Contents/Helpers"
@@ -374,7 +374,9 @@ write_doryd_launch_agent() {
   else
     rootfs="$resources/dory-machine-rootfs-amd64.ext4"
   fi
-  mkdir -p "$resources"
+  log_dir="$HOME/.dory"
+  log_path="$log_dir/doryd.log"
+  mkdir -p "$resources" "$log_dir"
   cat > "$plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -425,9 +427,9 @@ write_doryd_launch_agent() {
     <key>ProcessType</key>
     <string>Interactive</string>
     <key>StandardOutPath</key>
-    <string>/tmp/doryd.log</string>
+    <string>$log_path</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/doryd.log</string>
+    <string>$log_path</string>
 </dict>
 </plist>
 PLIST

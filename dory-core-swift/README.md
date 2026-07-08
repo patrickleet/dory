@@ -28,11 +28,13 @@ sudo cp .build/release/doryd /usr/local/bin/doryd
 codesign --force -s - /usr/local/bin/doryd
 
 # 2. load the LaunchAgent
-cp launchd/dev.dory.doryd.plist ~/Library/LaunchAgents/
+mkdir -p ~/.dory ~/Library/LaunchAgents
+sed "s#__DORYD_LOG_PATH__#$HOME/.dory/doryd.log#g" \
+  launchd/dev.dory.doryd.plist > ~/Library/LaunchAgents/dev.dory.doryd.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.dory.doryd.plist
 
 # 3. confirm it is up
-tail /tmp/doryd.log
+tail ~/.dory/doryd.log
 ls -l ~/.dory/dory.sock
 
 # 4. uninstall
