@@ -49,7 +49,10 @@ assert "machine exec NAME --json" in commands["machine"]["notes"]
 assert commands["mcp"]["status"] == "available"
 assert commands["mcp"]["transport"] == "stdio"
 assert "dory.machine_exec" in commands["mcp"]["tools"]
-assert commands["sandbox"]["status"] == "planned"
+assert "dory.sandbox_run" in commands["mcp"]["tools"]
+assert commands["sandbox"]["status"] == "preview"
+assert commands["sandbox"]["hostFileSharingDefault"] == "none"
+assert commands["sandbox"]["scopedMounts"] is False
 assert data["recommendedRecoveryLoop"]
 '
 
@@ -94,13 +97,26 @@ elif [ "$1" = "engine" ] && [ "$2" = "sleep" ]; then
   printf '{"ok":true,"message":"sleep requested"}\n'
 elif [ "$1" = "engine" ] && [ "$2" = "wake" ]; then
   printf '{"ok":true,"message":"wake requested"}\n'
+elif [ "$1" = "machine" ] && [ "$2" = "create" ]; then
+  printf '{"id":"%s","state":"created"}\n' "$3"
+elif [ "$1" = "machine" ] && [ "$2" = "start" ]; then
+  printf '{"id":"%s","state":"running"}\n' "$3"
+elif [ "$1" = "machine" ] && [ "$2" = "stop" ]; then
+  printf '{"id":"%s","state":"stopped"}\n' "$3"
+elif [ "$1" = "machine" ] && [ "$2" = "delete" ]; then
+  printf '{"ok":true,"message":"deleted"}\n'
 elif [ "$1" = "machine" ] && [ "$2" = "exec" ]; then
-  test "$3" = "dev"
+  machine="$3"
   test "$4" = "--json"
   test "$5" = "--"
   test "$6" = "/bin/echo"
-  test "$7" = "ok"
-  printf '{"schema":"dev.dory.machine.exec","version":1,"machine":"dev","argv":["/bin/echo","ok"],"exitCode":0,"stdout":"ok\\n","stderr":"","stdoutBase64":"b2sK","stderrBase64":"","timedOut":false,"stdoutTruncated":false,"stderrTruncated":false}\n'
+  if [ "$machine" = "dev" ]; then
+    test "$7" = "ok"
+    printf '{"schema":"dev.dory.machine.exec","version":1,"machine":"dev","argv":["/bin/echo","ok"],"exitCode":0,"stdout":"ok\\n","stderr":"","stdoutBase64":"b2sK","stderrBase64":"","timedOut":false,"stdoutTruncated":false,"stderrTruncated":false}\n'
+  else
+    test "$7" = "isolated"
+    printf '{"schema":"dev.dory.machine.exec","version":1,"machine":"%s","argv":["/bin/echo","isolated"],"exitCode":0,"stdout":"isolated\\n","stderr":"","stdoutBase64":"aXNvbGF0ZWQK","stderrBase64":"","timedOut":false,"stdoutTruncated":false,"stderrTruncated":false}\n' "$machine"
+  fi
 else
   echo "unexpected args: $*" >&2
   exit 64
@@ -124,6 +140,30 @@ assert data["schema"] == "dev.dory.machine.exec"
 assert data["machine"] == "dev"
 assert data["argv"] == ["/bin/echo", "ok"]
 assert data["stdout"] == "ok\n"
+'
+touch "$TMP_HOME/kernel" "$TMP_HOME/rootfs.ext4"
+DORYDCTL_BIN="$TMP_HOME/fake-dorydctl" DORY_SANDBOX_KERNEL="$TMP_HOME/kernel" DORY_SANDBOX_ROOTFS="$TMP_HOME/rootfs.ext4" \
+  scripts/dory sandbox run --json --name agenttest -- /bin/echo isolated | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["schema"] == "dev.dory.sandbox.run"
+assert data["sandbox"] == "agenttest"
+assert data["isolation"] == "dedicated-vm"
+assert data["hostFileSharing"] == "none"
+assert data["mounts"] == []
+assert data["cleanup"]["stopped"] is True
+assert data["cleanup"]["deleted"] is True
+assert data["exec"]["stdout"] == "isolated\n"
+'
+set +e
+sandbox_mount_json="$(DORYDCTL_BIN="$TMP_HOME/fake-dorydctl" DORY_SANDBOX_KERNEL="$TMP_HOME/kernel" DORY_SANDBOX_ROOTFS="$TMP_HOME/rootfs.ext4" scripts/dory sandbox run --json --mount "$PWD" -- /bin/true 2>/dev/null)"
+sandbox_mount_rc=$?
+set -e
+test "$sandbox_mount_rc" -eq 2
+printf '%s' "$sandbox_mount_json" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["code"] == "sandbox.mounts_unavailable"
 '
 
 mkdir -p "$TMP_HOME/.dory"
@@ -320,6 +360,7 @@ scripts/dory help | grep -q "dory cleanup"
 scripts/dory help | grep -q "dory compat"
 scripts/dory help | grep -q "dory agent guide"
 scripts/dory help | grep -q "dory mcp serve"
+scripts/dory help | grep -q "dory sandbox run"
 scripts/dory help | grep -q "dory wait engine"
 scripts/dory help | grep -q "dory events"
 
@@ -337,6 +378,7 @@ assert "tools" in lines[0]["result"]["capabilities"]
 tools = {item["name"]: item for item in lines[1]["result"]["tools"]}
 assert "dory.agent_guide" in tools
 assert "dory.machine_exec" in tools
+assert "dory.sandbox_run" in tools
 '
 
 mcp_guide="$(printf '%s\n%s\n' \

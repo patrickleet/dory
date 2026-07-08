@@ -117,6 +117,8 @@ dory — Dory CLI
                                Emit a versioned CLI capability map for coding agents
   dory mcp serve [--read-only]
                                Serve Dory tools over stdio MCP for Claude/Cursor-style clients
+  dory sandbox run [--json] [--keep] [--name NAME] -- <command...>
+                               Run a command in a dedicated Linux VM with no host sharing by default
   dory wait engine|container|machine [NAME] --until STATE --timeout N [--json]
                                Wait for a runtime state without hand-written polling loops
   dory events [--json] [--follow] [--limit N]
@@ -849,6 +851,176 @@ machine_cmd() {
   legacy_machine_cmd "$@"
 }
 
+sandbox_usage() {
+  echo "usage: dory sandbox run [--json] [--keep] [--name NAME] [--memory-mb N] [--cpus N] [--kernel PATH] [--rootfs PATH] -- <command...>" >&2
+}
+
+first_file() {
+  local cand
+  for cand in "$@"; do
+    [ -n "$cand" ] && [ -f "$cand" ] && { printf '%s\n' "$cand"; return 0; }
+  done
+  return 1
+}
+
+sandbox_default_kernel() {
+  local arch repo
+  arch="$(host_guest_arch)"
+  repo="$(cd "$DORY_SCRIPT_DIR/.." >/dev/null 2>&1 && pwd || true)"
+  first_file \
+    "${DORY_SANDBOX_KERNEL:-}" \
+    "${DORYD_MACHINE_KERNEL:-}" \
+    "${DORYD_GUEST_KERNEL:-}" \
+    "$DORY_SCRIPT_DIR/../Resources/dory-hv-kernel-$arch" \
+    "$DORY_SCRIPT_DIR/../Resources/dory-hv-kernel" \
+    "$repo/guest/out/Image" \
+    "$repo/guest/out/bzImage-x86"
+}
+
+sandbox_default_rootfs() {
+  local arch repo
+  arch="$(host_guest_arch)"
+  repo="$(cd "$DORY_SCRIPT_DIR/.." >/dev/null 2>&1 && pwd || true)"
+  first_file \
+    "${DORY_SANDBOX_ROOTFS:-}" \
+    "${DORYD_MACHINE_ROOTFS:-}" \
+    "${DORYD_GUEST_ROOTFS:-}" \
+    "$DORY_SCRIPT_DIR/../Resources/dory-machine-rootfs-$arch.ext4" \
+    "$DORY_SCRIPT_DIR/../Resources/dory-machine-rootfs.ext4" \
+    "$repo/guest/out/initfs-$arch.ext4"
+}
+
+sandbox_error_json() {
+  python3 - "$1" "$2" <<'PY'
+import json
+import sys
+print(json.dumps({
+    "schema": "dev.dory.sandbox.error",
+    "version": 1,
+    "code": sys.argv[1],
+    "message": sys.argv[2],
+}, separators=(",", ":"), sort_keys=True))
+PY
+}
+
+sandbox_emit_run_result() {
+  local name="$1" kept="$2" exit_code="$3" json="$4" tmp="$5"
+  python3 - "$name" "$kept" "$exit_code" "$json" "$tmp" <<'PY'
+import json
+import pathlib
+import sys
+
+name, kept, exit_code, as_json, tmp = sys.argv[1:6]
+root = pathlib.Path(tmp)
+
+def read_json(name: str, default):
+    path = root / name
+    try:
+        return json.loads(path.read_text(encoding="utf-8") or "null")
+    except Exception:
+        return default
+
+exec_result = read_json("exec.json", {})
+cleanup = {
+    "stopped": (root / "stop.json").exists(),
+    "deleted": (root / "delete.json").exists(),
+}
+result = {
+    "schema": "dev.dory.sandbox.run",
+    "version": 1,
+    "sandbox": name,
+    "machine": name,
+    "isolation": "dedicated-vm",
+    "hostFileSharing": "none",
+    "mounts": [],
+    "kept": kept == "1",
+    "exitCode": int(exit_code),
+    "exec": exec_result,
+    "cleanup": cleanup,
+}
+if as_json == "1":
+    print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+else:
+    stdout = exec_result.get("stdout", "")
+    stderr = exec_result.get("stderr", "")
+    if stdout:
+        print(stdout, end="")
+    if stderr:
+        print(stderr, end="", file=sys.stderr)
+PY
+}
+
+sandbox_run_cmd() {
+  local ctl name="" keep=0 json=0 memory=2048 cpus=2 kernel="" rootfs="" tmp exec_rc=0 created=0
+  local mounts=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --json) json=1; shift ;;
+      --keep) keep=1; shift ;;
+      --name) name="${2:?--name requires a value}"; shift 2 ;;
+      --memory-mb) memory="${2:?--memory-mb requires a value}"; shift 2 ;;
+      --cpus) cpus="${2:?--cpus requires a value}"; shift 2 ;;
+      --kernel) kernel="${2:?--kernel requires a value}"; shift 2 ;;
+      --rootfs) rootfs="${2:?--rootfs requires a value}"; shift 2 ;;
+      --mount) mounts+=("${2:?--mount requires a path}"); shift 2 ;;
+      --) shift; break ;;
+      -h|--help) sandbox_usage; return 0 ;;
+      --*) echo "unknown sandbox option: $1" >&2; sandbox_usage; exit 2 ;;
+      *) break ;;
+    esac
+  done
+  [ "$#" -gt 0 ] || { sandbox_usage; exit 2; }
+  if [ "${#mounts[@]}" -gt 0 ]; then
+    local msg="scoped sandbox mounts are not wired yet; this preview runs with no host file sharing"
+    if [ "$json" -eq 1 ]; then sandbox_error_json "sandbox.mounts_unavailable" "$msg"; fi
+    echo "$msg" >&2
+    exit 2
+  fi
+  [[ "$memory" =~ ^[0-9]+$ ]] && [ "$memory" -gt 0 ] || { echo "invalid --memory-mb: $memory" >&2; exit 2; }
+  [[ "$cpus" =~ ^[0-9]+$ ]] && [ "$cpus" -gt 0 ] || { echo "invalid --cpus: $cpus" >&2; exit 2; }
+
+  ctl="$(dorydctl_bin 2>/dev/null)" || { echo "dorydctl not found; build/install doryd before using sandboxes" >&2; exit 1; }
+  [ -n "$name" ] || name="dory-sandbox-$(date +%Y%m%d%H%M%S)-$RANDOM"
+  [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || { echo "invalid sandbox name: $name" >&2; exit 2; }
+  kernel="${kernel:-$(sandbox_default_kernel || true)}"
+  rootfs="${rootfs:-$(sandbox_default_rootfs || true)}"
+  [ -n "$kernel" ] && [ -f "$kernel" ] || { echo "sandbox kernel not found; set DORY_SANDBOX_KERNEL or build guest assets" >&2; exit 1; }
+  [ -n "$rootfs" ] && [ -f "$rootfs" ] || { echo "sandbox rootfs not found; set DORY_SANDBOX_ROOTFS or build guest assets" >&2; exit 1; }
+
+  tmp="$(mktemp -d -t dory-sandbox.XXXXXX)"
+  if ! "$ctl" --timeout 120 machine create "$name" --kernel "$kernel" --rootfs "$rootfs" --memory-mb "$memory" --cpus "$cpus" > "$tmp/create.json"; then
+    rm -rf "$tmp"
+    exit 1
+  fi
+  created=1
+  if ! "$ctl" --timeout 120 machine start "$name" > "$tmp/start.json"; then
+    [ "$keep" -eq 1 ] || "$ctl" --timeout 30 machine delete "$name" > "$tmp/delete.json" 2>/dev/null || true
+    rm -rf "$tmp"
+    exit 1
+  fi
+
+  set +e
+  "$ctl" --timeout 900 machine exec "$name" --json -- "$@" > "$tmp/exec.json"
+  exec_rc=$?
+  set -e
+
+  if [ "$keep" -eq 0 ] && [ "$created" -eq 1 ]; then
+    "$ctl" --timeout 60 machine stop "$name" > "$tmp/stop.json" 2>/dev/null || true
+    "$ctl" --timeout 60 machine delete "$name" > "$tmp/delete.json" 2>/dev/null || true
+  fi
+  sandbox_emit_run_result "$name" "$keep" "$exec_rc" "$json" "$tmp"
+  rm -rf "$tmp"
+  exit "$exec_rc"
+}
+
+sandbox_cmd() {
+  case "${1:-run}" in
+    run) shift || true; sandbox_run_cmd "$@" ;;
+    -h|--help|help) sandbox_usage; return 0 ;;
+    *) echo "usage: dory sandbox run [options] -- <command...>" >&2; exit 2 ;;
+  esac
+}
+
 agent_rpc() {
   local sock="$1" method="$2" payload="$3"
   [ -n "$sock" ] && [ -S "$sock" ] || { echo "set DORY_AGENT_SOCK to a dory agent bridge socket" >&2; return 2; }
@@ -1564,6 +1736,24 @@ TOOLS: list[dict[str, Any]] = [
         "annotations": {"readOnlyHint": False, "destructiveHint": True},
     },
     {
+        "name": "dory.sandbox_run",
+        "title": "Dory Sandbox Run",
+        "description": "Run a command in a dedicated Dory sandbox VM. Deletes the sandbox by default.",
+        "inputSchema": schema_object({
+            "name": {"type": "string", "description": "Optional sandbox name."},
+            "command": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "description": "Command argv to execute.",
+            },
+            "keep": {"type": "boolean", "description": "Keep the sandbox machine after the command exits."},
+            "memoryMB": {"type": "integer", "minimum": 1},
+            "cpus": {"type": "integer", "minimum": 1},
+        }, ["command"]),
+        "annotations": {"readOnlyHint": False, "destructiveHint": True},
+    },
+    {
         "name": "dory.wait",
         "title": "Dory Wait",
         "description": "Wait for an engine, container, or machine state using Dory's wait primitive.",
@@ -1712,6 +1902,27 @@ def call_tool(name: str, arguments: Any) -> dict[str, Any]:
         command.extend(["--output-limit-bytes", str(output_limit)])
         command.extend(["--", *command_value])
         return tool_result(run_cli(command, timeout=max(10, timeout_seconds + 15)))
+    if name == "dory.sandbox_run":
+        if READ_ONLY:
+            return tool_error("dory.sandbox_run is disabled because this MCP server is running in read-only mode")
+        command_value = args.get("command")
+        if not isinstance(command_value, list) or not command_value or not all(isinstance(item, str) for item in command_value):
+            raise ToolExecutionError("command must be a non-empty array of strings")
+        command = ["sandbox", "run", "--json"]
+        sandbox_name = string_arg(args, "name")
+        if sandbox_name:
+            command.extend(["--name", sandbox_name])
+        keep = args.get("keep", False)
+        if not isinstance(keep, bool):
+            raise ToolExecutionError("keep must be a boolean")
+        if keep:
+            command.append("--keep")
+        if "memoryMB" in args:
+            command.extend(["--memory-mb", str(int_arg(args, "memoryMB", 2048, 1, 1_048_576))])
+        if "cpus" in args:
+            command.extend(["--cpus", str(int_arg(args, "cpus", 2, 1, 1024))])
+        command.extend(["--", *command_value])
+        return tool_result(run_cli(command, timeout=1800))
     if name == "dory.wait":
         target_kind = string_arg(args, "targetKind", required=True)
         if target_kind not in ("engine", "container", "machine"):
@@ -1963,11 +2174,14 @@ data = {
         },
         {
             "id": "sandbox",
-            "status": "planned",
-            "invoke": "dory sandbox run --mount ./project <agent>",
+            "status": "preview",
+            "invoke": "dory sandbox run [--json] [--keep] -- <command>",
             "json": True,
             "safeForAutomation": True,
-            "notes": "Future per-agent isolated VM/container with scoped mounts and TTL cleanup.",
+            "isolation": "dedicated doryd Linux VM per run",
+            "hostFileSharingDefault": "none",
+            "scopedMounts": False,
+            "notes": "Preview: runs commands in a dedicated VM and deletes it by default. Scoped --mount is intentionally rejected until VZ shared-directory support lands.",
         },
         {
             "id": "mcp",
@@ -1977,7 +2191,7 @@ data = {
             "safeForAutomation": True,
             "transport": "stdio",
             "protocolVersion": "2025-11-25",
-            "tools": ["dory.agent_guide", "dory.doctor", "dory.compat", "dory.engine_status", "dory.machine_list", "dory.machine_exec", "dory.wait", "dory.events"],
+            "tools": ["dory.agent_guide", "dory.doctor", "dory.compat", "dory.engine_status", "dory.machine_list", "dory.machine_exec", "dory.sandbox_run", "dory.wait", "dory.events"],
             "notes": "Thin stdio MCP server over the CLI command core. Launch with --read-only to block machine exec.",
         },
     ],
@@ -2003,7 +2217,7 @@ Run read-only checks first; use `--apply` only for explicit repair/cleanup write
 Available agent-native primitive: `dory wait`.
 Available agent-native primitive: `dory events --follow --json`.
 Available agent-native primitive: `dory mcp serve [--read-only]`.
-Planned agent-native primitive: `dory sandbox`.
+Preview agent-native primitive: `dory sandbox run [--json] -- CMD` (dedicated VM, no host sharing; scoped mounts pending).
 EOF
 }
 
@@ -2052,6 +2266,7 @@ case "${1:-help}" in
   engine)         shift; engine_cmd "$@" ;;
   agent)          shift; agent_cmd "$@" ;;
   mcp)            shift; mcp_cmd "$@" ;;
+  sandbox)        shift; sandbox_cmd "$@" ;;
   wait)           shift; wait_cmd "$@" ;;
   events)         shift; events_cmd "$@" ;;
   bundle)         shift; doctor_cmd bundle "$@" ;;
