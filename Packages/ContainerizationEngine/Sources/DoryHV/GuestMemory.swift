@@ -1,6 +1,28 @@
 import Darwin
+import Foundation
 import Hypervisor
 import Synchronization
+
+public final class ByteCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: UInt64
+
+    public init(_ value: UInt64 = 0) {
+        self.value = value
+    }
+
+    public func add(_ amount: UInt64) {
+        lock.lock()
+        value &+= amount
+        lock.unlock()
+    }
+
+    public func load() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
 
 /// The VM's RAM: one anonymous mmap region in OUR address space, mapped into the guest at a fixed
 /// physical base. Owning the pages is the entire point of dory-hv: reclaim is madvise on this
@@ -10,8 +32,8 @@ public final class GuestMemory: @unchecked Sendable {
     public let guestBase: UInt64
     public let size: UInt64
     public let hostBase: UnsafeMutableRawPointer
-    public let releasedBytes = Atomic<UInt64>(0)
-    public let restoredBytes = Atomic<UInt64>(0)
+    public let releasedBytes = ByteCounter()
+    public let restoredBytes = ByteCounter()
 
     static let pageSize: UInt64 = HostPage.size
     private let releasedPages: Mutex<[Bool]>
@@ -58,7 +80,7 @@ public final class GuestMemory: @unchecked Sendable {
             guard hv_vm_unmap(guestAddress, Int(length)) == HV_SUCCESS else { return false }
             _ = madvise(host, Int(length), MADV_FREE_REUSABLE)
             for page in first..<min(first + count, pages.count) { pages[page] = true }
-            releasedBytes.add(length, ordering: .relaxed)
+            releasedBytes.add(length)
             return true
         }
     }
@@ -87,7 +109,7 @@ public final class GuestMemory: @unchecked Sendable {
                 return false
             }
             pages[index] = false
-            restoredBytes.add(Self.pageSize, ordering: .relaxed)
+            restoredBytes.add(Self.pageSize)
             return true
         }
     }

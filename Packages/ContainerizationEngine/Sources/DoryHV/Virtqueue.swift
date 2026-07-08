@@ -161,7 +161,7 @@ public final class Virtqueue {
         try memory.write(UInt32(chain.head), at: usedRing + 4 + slot * 8)
         try memory.write(UInt32(written), at: usedRing + 8 + slot * 8)
         usedIndex &+= 1
-        atomicMemoryFence(ordering: .releasing)  // used entries visible before the index publish
+        OSMemoryBarrier()  // used entries visible before the index publish
         try memory.write(usedIndex, at: usedRing + 2)
         let availFlags = try memory.read(UInt16.self, at: availRing)
         return availFlags & 1 == 0  // VRING_AVAIL_F_NO_INTERRUPT

@@ -1,9 +1,5 @@
-import Containerization
-import ContainerizationEXT4
-import ContainerizationOCI
 import DoryHV
 import Foundation
-import SystemPackage
 
 /// `dory-hv engine`: the production mode SharedVMProvisioner spawns. Owns the full lifecycle:
 /// pulls docker:dind once, boots the VMM with networking, and publishes the Docker API at the
@@ -139,17 +135,17 @@ enum EngineMode {
         // Both one-time artifacts are built at a temp path and atomically renamed into place, so an
         // interrupted first run leaves no half-written file that the fileExists guard would then
         // treat as complete forever.
+        guard let bundledRootfs = configuration.bundledRootfs,
+              FileManager.default.fileExists(atPath: bundledRootfs) else {
+            throw VMError.invalidConfiguration("dory-hv engine requires a bundled engine rootfs for offline macOS 14 runtime support")
+        }
+
         if !FileManager.default.fileExists(atPath: pristineRootfs) {
             let temporary = pristineRootfs + ".partial"
             try? FileManager.default.removeItem(atPath: temporary)
-            if let bundled = configuration.bundledRootfs, FileManager.default.fileExists(atPath: bundled) {
-                // Offline build: the engine image ships in the app, no network on first launch.
-                note("first run: installing bundled engine rootfs (one-time, offline)…")
-                try FileManager.default.copyItem(atPath: bundled, toPath: temporary)
-            } else {
-                note("first run: fetching engine image (one-time)…")
-                try await prepareEngineDisk(at: temporary, stateDirectory: state)
-            }
+            // Offline build: the engine image ships in the app, no network on first launch.
+            note("first run: installing bundled engine rootfs (one-time, offline)…")
+            try FileManager.default.copyItem(atPath: bundledRootfs, toPath: temporary)
             try fsyncFile(temporary)
             try FileManager.default.moveItem(atPath: temporary, toPath: pristineRootfs)
         }
@@ -157,21 +153,15 @@ enum EngineMode {
         try FileManager.default.copyItem(atPath: pristineRootfs, toPath: bootRootfs)
 
         if !FileManager.default.fileExists(atPath: dataDisk) {
-            note("first run: creating journaled docker data disk…")
+            note("first run: creating docker data disk…")
             let temporary = dataDisk + ".partial"
             try? FileManager.default.removeItem(atPath: temporary)
-            let formatter = try EXT4.Formatter(
-                FilePath(temporary),
-                minDiskSize: 16 * 1024 * 1024 * 1024,
-                journal: EXT4.JournalConfig.default
-            )
-            try formatter.close()
+            try createSparseFile(at: temporary, size: 16 * 1024 * 1024 * 1024)
             try fsyncFile(temporary)
             try FileManager.default.moveItem(atPath: temporary, toPath: dataDisk)
         }
 
-        let bootScriptDisk = state + "/boot-script.ext4"
-        try makeBootScriptDisk(at: bootScriptDisk, script: guestBootScript(
+        let bootConfigShare = try writeBootConfiguration(stateDirectory: state, script: guestBootScript(
             shares: configuration.shares,
             gpuMode: configuration.gpuMode,
             amd64Emulation: configuration.amd64Emulation
@@ -188,7 +178,6 @@ enum EngineMode {
         var backends: [VirtioDeviceBackend] = []
         backends.append(try VirtioBlk(path: bootRootfs, identity: "dory-rootfs"))
         backends.append(try VirtioBlk(path: dataDisk, identity: "dory-data"))
-        backends.append(try VirtioBlk(path: bootScriptDisk, identity: "dory-bootscript"))
         backends.append(VirtioRng())
         backends.append(VirtioBalloon(memory: machine.memory) { note($0) })
         var daxSlot: UInt64 = 0
@@ -211,6 +200,7 @@ enum EngineMode {
         let vsock = VirtioVsock(guestCID: 3)
         backends.append(vsock)
         HostAIBridge(log: { note($0) }).attach(to: vsock)
+        backends.append(try bootConfigShare.makeBackend())
         for share in configuration.shares {
             let daxBase = share.dax ? GuestLayout.daxWindowBase + daxSlot * DaxWindow.defaultSize : nil
             if share.dax { daxSlot += 1 }
@@ -339,8 +329,8 @@ enum EngineMode {
         let gauge = DispatchSource.makeTimerSource(queue: .global())
         gauge.schedule(deadline: .now() + 60, repeating: 60)
         gauge.setEventHandler {
-            let released = memory.releasedBytes.load(ordering: .relaxed)
-            let restored = memory.restoredBytes.load(ordering: .relaxed)
+            let released = memory.releasedBytes.load()
+            let restored = memory.restoredBytes.load()
             note("reclaim gauge: released \(released >> 20)MiB, restored \(restored >> 20)MiB, net \(Int64(bitPattern: released &- restored) / 1_048_576)MiB")
         }
         gauge.resume()
@@ -393,11 +383,30 @@ enum EngineMode {
         }
     }
 
-    private static func prepareEngineDisk(at path: String, stateDirectory: String) async throws {
-        let store = try ImageStore(path: URL(fileURLWithPath: stateDirectory + "/content"))
-        let image = try await store.get(reference: "docker.io/library/docker:dind", pull: true)
-        _ = try await EXT4Unpacker(blockSizeInBytes: 8 * 1024 * 1024 * 1024)
-            .unpack(image, for: Platform(arch: hostLinuxArch(), os: "linux"), at: URL(fileURLWithPath: path))
+    private static func createSparseFile(at path: String, size: Int64) throws {
+        let descriptor = open(path, O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR)
+        guard descriptor >= 0 else {
+            throw VMError.invalidConfiguration("cannot create \(path): errno \(errno)")
+        }
+        defer { close(descriptor) }
+        guard ftruncate(descriptor, off_t(size)) == 0 else {
+            throw VMError.invalidConfiguration("cannot size \(path): errno \(errno)")
+        }
+    }
+
+    private static func writeBootConfiguration(stateDirectory: String, script: String) throws -> VirtioFSShareConfiguration {
+        let directory = stateDirectory + "/boot-config"
+        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        let path = directory + "/boot.sh"
+        let temporary = path + ".partial"
+        try? FileManager.default.removeItem(atPath: temporary)
+        try Data(script.utf8).write(to: URL(fileURLWithPath: temporary), options: .atomic)
+        guard chmod(temporary, S_IRUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH) == 0 else {
+            throw VMError.invalidConfiguration("cannot chmod \(temporary): errno \(errno)")
+        }
+        try? FileManager.default.removeItem(atPath: path)
+        try FileManager.default.moveItem(atPath: temporary, toPath: path)
+        return try VirtioFSShareConfiguration(tag: "dorycfg", path: directory, readOnly: true)
     }
 
     /// Guest boot: mounts (docker state on the journaled /dev/vdb), DHCP through gvproxy,
@@ -420,10 +429,9 @@ enum EngineMode {
             "mkdir -p /dev/pts",
             "mount -t devpts devpts /dev/pts",
             "mkdir -p /var/lib/docker",
-            // Fail hard if the persistent data disk will not mount: never let dockerd write to the
-            // throwaway rootfs, which the next boot destroys (silent total data loss). Powering off
-            // surfaces the failure to the host, which falls back to another engine.
-            "mount -t ext4 /dev/vdb /var/lib/docker || { echo DATA-DISK-MOUNT-FAILED; sync; poweroff -f; }",
+            // First boot receives a sparse blank disk from the host. Format it inside the guest so
+            // the macOS 14 helper does not need Apple's macOS 15-only EXT4 formatter.
+            "mount -t ext4 /dev/vdb /var/lib/docker || { echo DATA-DISK-FORMAT; mkfs.ext4 -F /dev/vdb >/var/log/dory-data-mkfs.log 2>&1 && mount -t ext4 /dev/vdb /var/lib/docker; } || { echo DATA-DISK-MOUNT-FAILED; sync; poweroff -f; }",
             "ip link set lo up",
             "ip link set eth0 up",
             "udhcpc -i eth0 -q >/dev/null 2>&1",
@@ -499,20 +507,7 @@ enum EngineMode {
         #else
         let console = "console=ttyS0 earlyprintk=serial,ttyS0,115200"
         #endif
-        return "\(console) root=/dev/vda rw panic=0 init=/bin/sh -- -c \"mkdir -p /mnt && mount -t ext4 /dev/vdc /mnt && exec /bin/sh /mnt/boot.sh\""
-    }
-
-    private static func makeBootScriptDisk(at path: String, script: String) throws {
-        try? FileManager.default.removeItem(atPath: path)
-        let temporary = path + ".partial"
-        try? FileManager.default.removeItem(atPath: temporary)
-        let formatter = try EXT4.Formatter(FilePath(temporary), minDiskSize: 1 * 1024 * 1024)
-        let stream = InputStream(data: Data(script.utf8))
-        stream.open()
-        defer { stream.close() }
-        try formatter.create(path: FilePath("/boot.sh"), mode: EXT4.Inode.Mode(.S_IFREG, 0o755), buf: stream)
-        try formatter.close()
-        try FileManager.default.moveItem(atPath: temporary, toPath: path)
+        return "\(console) root=/dev/vda rw panic=0 init=/sbin/init"
     }
 
     private static func attachPlatformDevices(to machine: Machine) {

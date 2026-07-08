@@ -133,6 +133,23 @@ install_docker_static() {
   rm -rf "$tmp"
 }
 
+extract_apk() {
+  local apk="$1" dest="$2"
+  tar -xzf "$apk" -C "$dest" \
+    --exclude '.SIGN*' \
+    --exclude '.PKGINFO' \
+    --exclude '.post-*' \
+    --exclude '.pre-*'
+}
+
+install_ext4_tools() {
+  local arch="$1" dest="$2" pkg apk
+  for pkg in libeconf libuuid libcom_err libblkid e2fsprogs-libs e2fsprogs; do
+    apk="$(fetch_pin "${pkg}_${arch}")"
+    extract_apk "$apk" "$dest"
+  done
+}
+
 write_runtime_files() {
   local rootfs="$1" arch="$2" agent="$OUT_DIR/dory-agent-$arch"
   mkdir -p "$rootfs"/{dev,proc,sys,run,tmp,var/log,var/run,var/lib/docker,usr/bin,usr/local/bin,etc,sbin}
@@ -165,6 +182,7 @@ build_arch() {
   mke2fs="$(find_mke2fs)" || { echo "mke2fs not found; install e2fsprogs or Android platform-tools" >&2; exit 1; }
 
   extract_tar "$alpine_tar" "$rootfs"
+  install_ext4_tools "$arch" "$rootfs"
   install_docker_static "$docker_tar" "$rootfs"
   write_runtime_files "$rootfs" "$arch"
 
