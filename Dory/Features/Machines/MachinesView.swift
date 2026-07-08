@@ -152,6 +152,11 @@ private struct MachineCard: View {
                 .padding(.bottom, 12)
             }
 
+            if !machine.mounts.isEmpty {
+                mountsSummary
+                    .padding(.bottom, 12)
+            }
+
             Divider().overlay(p.border)
 
             HStack(spacing: 8) {
@@ -239,6 +244,31 @@ private struct MachineCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    private var mountsSummary: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "folder").font(.system(size: 10)).foregroundStyle(p.text3)
+                Text("MOUNTED FOLDERS").font(.system(size: 10, weight: .semibold)).foregroundStyle(p.text3).tracking(0.4)
+            }
+            ForEach(Array(machine.mounts.prefix(2)).indices, id: \.self) { index in
+                let mount = machine.mounts[index]
+                HStack(spacing: 6) {
+                    Text(mount.host).font(.mono(10.5)).foregroundStyle(p.text2).lineLimit(1).truncationMode(.head)
+                    Image(systemName: "arrow.right").font(.system(size: 8)).foregroundStyle(p.text3)
+                    Text(mount.guest).font(.mono(10.5, weight: .semibold)).foregroundStyle(p.text).lineLimit(1).truncationMode(.middle)
+                    if mount.readOnly {
+                        Image(systemName: "lock").font(.system(size: 9)).foregroundStyle(p.text3)
+                    }
+                }
+            }
+            if machine.mounts.count > 2 {
+                Text("+ \(machine.mounts.count - 2) more")
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(p.text3)
+            }
+        }
+    }
+
     private func actionButton(_ systemImage: String, _ title: String, prominent: Bool, enabled: Bool = true, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 6) {
@@ -291,6 +321,7 @@ private struct MachineEditSheet: View {
         let id = UUID()
         var host = ""
         var guest = ""
+        var readOnly = false
     }
 
     private struct PortRow: Identifiable, Hashable {
@@ -329,7 +360,7 @@ private struct MachineEditSheet: View {
         cpus = max(1, min(8, settings.cpus ?? 4))
         memoryGB = max(1, min(16, settings.memoryMB.map { $0 / 1024 } ?? 4))
         address = settings.address ?? machine.ip
-        mountRows = settings.mounts.map { MountRow(host: $0.host, guest: $0.guest) }
+        mountRows = settings.mounts.map { MountRow(host: $0.host, guest: $0.guest, readOnly: $0.readOnly) }
         portRows = settings.ports.map { PortRow(host: String($0.host), guest: String($0.guest)) }
     }
 
@@ -412,6 +443,7 @@ private struct MachineEditSheet: View {
                     .buttonStyle(.plain)
                     Image(systemName: "arrow.right").font(.system(size: 10)).foregroundStyle(p.text3)
                     fieldInput("/guest/path", text: $row.guest, width: 150)
+                    modeButton(readOnly: $row.readOnly)
                     removeButton { mountRows.removeAll { $0.id == row.id } }
                 }
             }
@@ -502,6 +534,21 @@ private struct MachineEditSheet: View {
         .buttonStyle(.plain)
     }
 
+    private func modeButton(readOnly: Binding<Bool>) -> some View {
+        Button {
+            readOnly.wrappedValue.toggle()
+        } label: {
+            Image(systemName: readOnly.wrappedValue ? "lock" : "lock.open")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(readOnly.wrappedValue ? p.amber : p.text3)
+                .frame(width: 26, height: 26)
+                .background(p.bgInput, in: RoundedRectangle(cornerRadius: 7))
+                .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(p.border))
+        }
+        .buttonStyle(.plain)
+        .help(readOnly.wrappedValue ? "Read-only" : "Read-write")
+    }
+
     private func chooseMountHost(for id: UUID) {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
@@ -521,7 +568,7 @@ private struct MachineEditSheet: View {
             let host = row.host.trimmingCharacters(in: .whitespaces)
             let guest = row.guest.trimmingCharacters(in: .whitespaces)
             guard !host.isEmpty, !guest.isEmpty else { return nil }
-            return MountPair(host: host, guest: guest)
+            return MountPair(host: host, guest: guest, readOnly: row.readOnly)
         }
         let ports = portRows.compactMap { row -> PortPair? in
             guard let host = Int(row.host.trimmingCharacters(in: .whitespaces)),

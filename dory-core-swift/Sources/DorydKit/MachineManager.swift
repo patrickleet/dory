@@ -338,7 +338,8 @@ public final class MachineManager: @unchecked Sendable {
             state: .created,
             address: preparedMachine.address,
             memoryMB: preparedMachine.memoryMB,
-            cpuCount: preparedMachine.cpuCount
+            cpuCount: preparedMachine.cpuCount,
+            shares: preparedMachine.shares
         )
     }
 
@@ -450,7 +451,9 @@ public final class MachineManager: @unchecked Sendable {
         memoryMB: UInt64? = nil,
         cpuCount: Int? = nil,
         address: String? = nil,
-        updatesAddress: Bool = false
+        updatesAddress: Bool = false,
+        shares: [DoryMachineShareConfiguration]? = nil,
+        updatesShares: Bool = false
     ) throws -> DoryMachineStatus {
         if let memoryMB, memoryMB == 0 {
             throw MachineManagerError.persistence("memoryMB must be positive")
@@ -458,8 +461,11 @@ public final class MachineManager: @unchecked Sendable {
         if let cpuCount, cpuCount <= 0 {
             throw MachineManagerError.persistence("cpuCount must be positive")
         }
+        if let shares {
+            try Self.validateShares(shares)
+        }
         let normalizedAddress = try Self.normalizedAddress(address)
-        let needsRestart = memoryMB != nil || cpuCount != nil
+        let needsRestart = memoryMB != nil || cpuCount != nil || updatesShares
         let (current, wasRunning) = try configurationAndRunningState(id: id)
         if wasRunning && needsRestart {
             _ = try stop(id: id)
@@ -473,6 +479,9 @@ public final class MachineManager: @unchecked Sendable {
         }
         if updatesAddress {
             updated.address = normalizedAddress
+        }
+        if updatesShares {
+            updated.shares = shares ?? []
         }
         do {
             try persist(updated)

@@ -140,7 +140,10 @@ final class MachineManagerTests: XCTestCase {
 
     func testUpdatePersistsMachineResourcesAndRestartsRunningMachine() throws {
         let base = "/tmp/dory-machine-update-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        let share = "\(base)-share"
+        try FileManager.default.createDirectory(atPath: share, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(atPath: base) }
+        defer { try? FileManager.default.removeItem(atPath: share) }
         let manager = MachineManager(configuration: MachineManagerConfiguration(
             vmmExecutablePath: "/bin/sleep",
             stateDirectory: base,
@@ -160,12 +163,25 @@ final class MachineManagerTests: XCTestCase {
         ))
         _ = try manager.start(id: "dev")
 
-        let updated = try manager.update(id: "dev", memoryMB: 4096, cpuCount: 4, address: "Workstation.Dory.Local", updatesAddress: true)
+        let updated = try manager.update(
+            id: "dev",
+            memoryMB: 4096,
+            cpuCount: 4,
+            address: "Workstation.Dory.Local",
+            updatesAddress: true,
+            shares: [
+                DoryMachineShareConfiguration(tag: "src", hostPath: share, guestPath: "/workspace/src"),
+            ],
+            updatesShares: true
+        )
 
         XCTAssertEqual(updated.state, .running)
         XCTAssertEqual(updated.memoryMB, 4096)
         XCTAssertEqual(updated.cpuCount, 4)
         XCTAssertEqual(updated.address, "workstation.dory.local")
+        XCTAssertEqual(updated.shares, [
+            DoryMachineShareConfiguration(tag: "src", hostPath: share, guestPath: "/workspace/src"),
+        ])
         let stored = try JSONDecoder().decode(
             DoryMachineConfiguration.self,
             from: Data(contentsOf: URL(fileURLWithPath: "\(base)/dev/machine.json"))
@@ -173,6 +189,9 @@ final class MachineManagerTests: XCTestCase {
         XCTAssertEqual(stored.memoryMB, 4096)
         XCTAssertEqual(stored.cpuCount, 4)
         XCTAssertEqual(stored.address, "workstation.dory.local")
+        XCTAssertEqual(stored.shares, [
+            DoryMachineShareConfiguration(tag: "src", hostPath: share, guestPath: "/workspace/src"),
+        ])
     }
 
     func testCreateClonesRootfsIntoPerMachineStateDirectory() throws {

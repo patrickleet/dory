@@ -228,7 +228,9 @@ public final class DorydService: NSObject, DorydControl {
                 memoryMB: update.memoryMB,
                 cpuCount: update.cpuCount,
                 address: update.address,
-                updatesAddress: update.updatesAddress
+                updatesAddress: update.updatesAddress,
+                shares: update.shares,
+                updatesShares: update.updatesShares
             )
             incidentWriter?.record(type: "machine.update", detail: machineID)
             reply(true, status.xpcDictionary, "")
@@ -737,16 +739,20 @@ private struct MachineUpdateRequest {
     var cpuCount: Int?
     var address: String?
     var updatesAddress: Bool
+    var shares: [DoryMachineShareConfiguration]?
+    var updatesShares: Bool
 
     init(xpcDictionary dictionary: NSDictionary) throws {
         self.memoryMB = try dictionary.optionalUInt64("memoryMB")
         self.cpuCount = try dictionary.optionalInt("cpuCount")
         self.address = dictionary.optionalString("address")
         self.updatesAddress = dictionary["address"] != nil
+        self.shares = dictionary["shares"] == nil ? nil : try dictionary.optionalMachineShares("shares")
+        self.updatesShares = dictionary["shares"] != nil
         if let address, address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             throw XPCRemoteConfigError.invalid("address")
         }
-        if memoryMB == nil, cpuCount == nil, !updatesAddress {
+        if memoryMB == nil, cpuCount == nil, !updatesAddress, !updatesShares {
             throw XPCRemoteConfigError.invalid("config")
         }
     }

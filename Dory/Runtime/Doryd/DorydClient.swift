@@ -56,6 +56,22 @@ nonisolated struct DorydCommandResult: Sendable, Equatable {
     var message: String
 }
 
+nonisolated struct DorydMachineShareConfiguration: Sendable, Equatable {
+    var tag: String
+    var hostPath: String
+    var guestPath: String
+    var readOnly: Bool
+
+    var xpcDictionary: NSDictionary {
+        [
+            "tag": tag,
+            "hostPath": hostPath,
+            "guestPath": guestPath,
+            "readOnly": readOnly,
+        ]
+    }
+}
+
 nonisolated struct DorydMachineConfiguration: Sendable, Equatable {
     var id: String
     var kernelPath: String
@@ -63,6 +79,7 @@ nonisolated struct DorydMachineConfiguration: Sendable, Equatable {
     var memoryMB: UInt64
     var cpuCount: Int
     var address: String? = nil
+    var shares: [DorydMachineShareConfiguration] = []
 
     var xpcDictionary: NSDictionary {
         var dictionary: [String: Any] = [
@@ -74,6 +91,9 @@ nonisolated struct DorydMachineConfiguration: Sendable, Equatable {
         ]
         if let address {
             dictionary["address"] = address
+        }
+        if !shares.isEmpty {
+            dictionary["shares"] = shares.map(\.xpcDictionary)
         }
         return dictionary as NSDictionary
     }
@@ -95,6 +115,7 @@ nonisolated struct DorydMachineStatus: Sendable, Equatable {
     var memoryMB: UInt64?
     var currentBalloonTargetMB: UInt64? = nil
     var cpuCount: Int?
+    var shares: [DorydMachineShareConfiguration] = []
 }
 
 nonisolated struct DorydMachineExecResult: Sendable, Equatable {
@@ -514,7 +535,13 @@ nonisolated final class DorydClient: @unchecked Sendable {
         }
     }
 
-    func machineUpdate(_ machineID: String, memoryMB: UInt64? = nil, cpuCount: Int? = nil, address: String? = nil) async throws -> DorydMachineStatus {
+    func machineUpdate(
+        _ machineID: String,
+        memoryMB: UInt64? = nil,
+        cpuCount: Int? = nil,
+        address: String? = nil,
+        shares: [DorydMachineShareConfiguration]? = nil
+    ) async throws -> DorydMachineStatus {
         var config: [String: Any] = [:]
         if let memoryMB {
             config["memoryMB"] = memoryMB
@@ -524,6 +551,9 @@ nonisolated final class DorydClient: @unchecked Sendable {
         }
         if let address {
             config["address"] = address
+        }
+        if let shares {
+            config["shares"] = shares.map(\.xpcDictionary)
         }
         return try await withTimeout(atLeast: 120).statusCommand { proxy, reply in
             proxy.machineUpdate(machineID, config: config as NSDictionary, reply: reply)
@@ -936,8 +966,36 @@ nonisolated final class DorydClient: @unchecked Sendable {
             handoffFDCount: int(dictionary["handoffFDCount"]) ?? 0,
             memoryMB: uint64(dictionary["memoryMB"]),
             currentBalloonTargetMB: uint64(dictionary["currentBalloonTargetMB"]),
-            cpuCount: int(dictionary["cpuCount"])
+            cpuCount: int(dictionary["cpuCount"]),
+            shares: machineShares(from: dictionary["shares"])
         )
+    }
+
+    nonisolated private static func machineShares(from value: Any?) -> [DorydMachineShareConfiguration] {
+        let rows: [NSDictionary]
+        if let swiftRows = value as? [NSDictionary] {
+            rows = swiftRows
+        } else if let nsRows = value as? NSArray {
+            rows = nsRows.compactMap { $0 as? NSDictionary }
+        } else {
+            return []
+        }
+        return rows.compactMap { row in
+            guard let tag = row["tag"] as? String,
+                  let hostPath = row["hostPath"] as? String,
+                  let guestPath = row["guestPath"] as? String else {
+                return nil
+            }
+            let readOnly = (row["readOnly"] as? Bool)
+                ?? (row["readOnly"] as? NSNumber)?.boolValue
+                ?? ((row["mode"] as? String) == "ro")
+            return DorydMachineShareConfiguration(
+                tag: tag,
+                hostPath: hostPath,
+                guestPath: guestPath,
+                readOnly: readOnly
+            )
+        }
     }
 
     nonisolated private static func machineStatuses(from rows: NSArray) -> [DorydMachineStatus]? {

@@ -777,6 +777,8 @@ final class DorydServiceTests: XCTestCase {
 
     func testMachineLifecycleOverXPC() throws {
         let base = "/tmp/doryd-service-machine-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        let share = "\(base)-share"
+        try FileManager.default.createDirectory(atPath: share, withIntermediateDirectories: true)
         let manager = MachineManager(configuration: MachineManagerConfiguration(
             vmmExecutablePath: "/bin/sleep",
             stateDirectory: base,
@@ -787,6 +789,7 @@ final class DorydServiceTests: XCTestCase {
         defer {
             try? manager.delete(id: "dev")
             try? FileManager.default.removeItem(atPath: base)
+            try? FileManager.default.removeItem(atPath: share)
         }
         let service = DorydService(
             socketPath: "/tmp/doryd-test.sock",
@@ -850,12 +853,24 @@ final class DorydServiceTests: XCTestCase {
             "memoryMB": UInt64(4096),
             "cpuCount": 4,
             "address": "work.dory.local",
+            "shares": [
+                [
+                    "tag": "src",
+                    "hostPath": share,
+                    "guestPath": "/workspace/src",
+                    "readOnly": true,
+                ] as NSDictionary,
+            ],
         ]) { ok, body, message in
             XCTAssertTrue(ok, message)
             XCTAssertEqual(body["state"] as? String, "stopped")
             XCTAssertEqual((body["memoryMB"] as? NSNumber)?.uint64Value, 4096)
             XCTAssertEqual((body["cpuCount"] as? NSNumber)?.intValue, 4)
             XCTAssertEqual(body["address"] as? String, "work.dory.local")
+            let shares = body["shares"] as? [NSDictionary]
+            XCTAssertEqual(shares?.first?["hostPath"] as? String, share)
+            XCTAssertEqual(shares?.first?["guestPath"] as? String, "/workspace/src")
+            XCTAssertEqual(shares?.first?["readOnly"] as? Bool, true)
             update.fulfill()
         }
         wait(for: [update], timeout: 5)

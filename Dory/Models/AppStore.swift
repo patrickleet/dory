@@ -2578,6 +2578,7 @@ final class AppStore {
                 return MachineSettings(
                     cpus: status.cpuCount,
                     memoryMB: status.memoryMB.flatMap { Int(exactly: $0) },
+                    mounts: status.shares.map(Self.mountPair(fromDoryd:)),
                     address: status.address
                 )
             } catch {
@@ -2666,8 +2667,27 @@ final class AppStore {
             recipe: "doryd",
             username: "root",
             loginShell: "/bin/sh",
-            shellSocketPath: status.shellSocketPath ?? ""
+            shellSocketPath: status.shellSocketPath ?? "",
+            mounts: status.shares.map(Self.mountPair(fromDoryd:))
         )
+    }
+
+    nonisolated private static func mountPair(fromDoryd share: DorydMachineShareConfiguration) -> MountPair {
+        MountPair(host: share.hostPath, guest: share.guestPath, readOnly: share.readOnly)
+    }
+
+    nonisolated private static func dorydShares(from mounts: [MountPair]) -> [DorydMachineShareConfiguration] {
+        mounts.enumerated().compactMap { index, mount in
+            let host = mount.host.trimmingCharacters(in: .whitespacesAndNewlines)
+            let guest = mount.guest.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !host.isEmpty, !guest.isEmpty else { return nil }
+            return DorydMachineShareConfiguration(
+                tag: "doryapp\(index)",
+                hostPath: host,
+                guestPath: guest,
+                readOnly: mount.readOnly
+            )
+        }
     }
 
     func machineTerminalCommand(_ machine: Machine) -> String? {
@@ -2927,7 +2947,8 @@ final class AppStore {
             rootfsPath: rootfs,
             memoryMB: max(1, memoryMB),
             cpuCount: max(1, cpuCount),
-            address: address
+            address: address,
+            shares: dorydShares(from: settings.mounts)
         )
     }
 
@@ -3080,7 +3101,13 @@ final class AppStore {
                 let address = Self.trimmedNonEmpty(settings.address)
                     ?? current?.address
                     ?? Self.defaultMachineAddress(name: machine.name, suffix: domainSuffix)
-                _ = try await dorydClient.machineUpdate(machine.name, memoryMB: memory, cpuCount: cpus, address: address)
+                _ = try await dorydClient.machineUpdate(
+                    machine.name,
+                    memoryMB: memory,
+                    cpuCount: cpus,
+                    address: address,
+                    shares: Self.dorydShares(from: settings.mounts)
+                )
                 appendMachineCreationLog("Settings applied to doryd VM definition.")
                 activeSheet = nil
                 await refreshMachines()

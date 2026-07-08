@@ -284,6 +284,7 @@ struct Machine: Identifiable, Hashable, Sendable {
     var homePath: String? = nil
     var sshPort: Int? = nil
     var shellSocketPath: String = ""
+    var mounts: [MountPair] = []
     var id: String { name }
 
     var badgeColor: Color { Color(hex: badgeHex) }
