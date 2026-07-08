@@ -12,13 +12,15 @@ against Docker Desktop, OrbStack, and Apple Container where those engines are pr
 | Metric | Why it matters | Harness |
 |---|---|---|
 | Idle memory | Shows the cost users feel when a container runtime is sitting in the background. | `--metrics memory` |
+| CPU workload | Shows runtime/startup/scheduling overhead for the same repeated CPU-bound task. | `--metrics cpu` |
 | Container-to-container network | Shows the shared-VM bridge path that real Compose stacks use. | `--metrics network` |
 | Bind-mount filesystem | Shows the host-to-VM path used by editors, hot reload, and local source mounts. | `--metrics fs` |
 
 Every run writes:
 
-- `machine-spec.tsv`: Mac model, memory, CPU, macOS build, Docker client, and Apple Container CLI.
-- `memory.tsv`, `network.tsv`, `filesystem.tsv`: raw per-metric data.
+- `machine-spec.tsv`: Mac model, memory, CPU, macOS build, Docker client, Apple Container CLI,
+  and the released Dory.app identity when `--dory-app` is used.
+- `memory.tsv`, `cpu.tsv`, `network.tsv`, `filesystem.tsv`: raw per-metric data.
 - `status.tsv`: pass, fail, and skip reasons per engine.
 - `summary.json`: machine-readable aggregate for GitHub Actions artifacts.
 
@@ -43,16 +45,18 @@ have the nested virtualization needed for this benchmark.
 # Audit the work before touching any engine:
 scripts/benchmark-compare.sh \
   --engines dory,orbstack,docker-desktop,apple-container \
-  --metrics memory,network,fs \
+  --metrics memory,cpu,network,fs \
   --dry-run
 
-# Live cross-engine run:
+# Live cross-engine run against the installed release app:
 BENCH_WORKDIR="$PWD/.benchmark-results" \
 scripts/benchmark-compare.sh \
+  --dory-app /Applications/Dory.app \
   --engines dory,orbstack,docker-desktop,apple-container \
-  --metrics memory,network,fs \
+  --metrics memory,cpu,network,fs \
   --memory-count 3 \
   --runs 3 \
+  --cpu-mb 256 \
   --fs-files 2000
 ```
 
@@ -60,7 +64,10 @@ For a Dory-only release candidate smoke:
 
 ```sh
 BENCH_WORKDIR="$PWD/.benchmark-results" \
-scripts/benchmark-compare.sh --engines dory --metrics memory,network,fs
+scripts/benchmark-compare.sh \
+  --dory-app /Applications/Dory.app \
+  --engines dory \
+  --metrics memory,cpu,network,fs
 ```
 
 ## GitHub Workflow

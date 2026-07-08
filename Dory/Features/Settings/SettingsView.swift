@@ -358,7 +358,7 @@ struct SettingsView: View {
 
     private func localToolIcon(_ id: String) -> String {
         switch id {
-        case "doctor": "stethoscope"
+        case "support-bundle": "stethoscope"
         case "agent-guide": "curlybraces.square"
         case "mcp": "point.3.connected.trianglepath.dotted"
         case "sandbox": "shippingbox.and.arrow.backward"

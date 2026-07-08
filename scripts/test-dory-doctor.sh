@@ -38,6 +38,8 @@ assert data["defaults"]["socket"] == os.environ["DORY_SOCK"]
 commands = {item["id"]: item for item in data["commands"]}
 assert commands["doctor"]["status"] == "available"
 assert commands["doctor"]["json"] is True
+assert commands["support"]["status"] == "available"
+assert commands["support"]["redacted"] is True
 assert commands["repair"]["dryRun"] is True
 assert commands["wait"]["status"] == "available"
 assert "machine" in commands["wait"]["targets"]
@@ -430,7 +432,30 @@ with zipfile.ZipFile(data["bundle"]) as zf:
     assert "doctor.json" in zf.namelist()
 '
 
+support_json="$(scripts/dory support bundle --json "$TMP_HOME/dory-support.zip")"
+printf '%s' "$support_json" | python3 -c '
+import json, os, sys, zipfile
+data = json.load(sys.stdin)
+assert data["schema"] == "dev.dory.support.bundle"
+assert data["redacted"] is True
+assert data["path"].endswith("dory-support.zip")
+assert os.path.exists(data["path"])
+with zipfile.ZipFile(data["path"]) as zf:
+    assert "doctor.json" in zf.namelist()
+'
+
+logs_json="$(scripts/dory logs collect --json "$TMP_HOME/dory-logs.zip")"
+printf '%s' "$logs_json" | python3 -c '
+import json, os, sys
+data = json.load(sys.stdin)
+assert data["schema"] == "dev.dory.support.bundle"
+assert data["path"].endswith("dory-logs.zip")
+assert os.path.exists(data["path"])
+'
+
 scripts/dory help | grep -q "dory doctor"
+scripts/dory help | grep -q "dory support bundle"
+scripts/dory help | grep -q "dory logs collect"
 scripts/dory help | grep -q "dory idle proxy"
 scripts/dory help | grep -q "dory idle proxy-status"
 scripts/dory help | grep -q "dory cleanup"

@@ -7,7 +7,7 @@ struct LocalDorydCapabilityTests {
         let capabilities = AppStore.localDorydCapabilityCatalog
         let ids = capabilities.map(\.id)
 
-        #expect(Set(ids) == ["doctor", "agent-guide", "mcp", "sandbox", "wait", "events"])
+        #expect(Set(ids) == ["support-bundle", "agent-guide", "mcp", "sandbox", "wait", "events"])
         #expect(ids.count == Set(ids).count)
 
         for capability in capabilities {
@@ -19,7 +19,10 @@ struct LocalDorydCapabilityTests {
         }
 
         let stableIDs = Set(capabilities.filter { $0.status == "Stable" }.map(\.id))
-        #expect(stableIDs == ["doctor", "agent-guide", "mcp", "wait", "events"])
+        #expect(stableIDs == ["support-bundle", "agent-guide", "mcp", "wait", "events"])
+
+        let support = try #require(capabilities.first { $0.id == "support-bundle" })
+        #expect(support.command == "dory support bundle")
 
         let sandbox = try #require(capabilities.first { $0.id == "sandbox" })
         #expect(sandbox.status == "Preview")

@@ -20,7 +20,11 @@
 #                    cross-VM tax here that a shared-engine design avoids. Skips cleanly if the
 #                    iperf3 image cannot be pulled.
 #
-#   3. BIND-MOUNT FS Run a file-heavy workload (create BENCH_FS_FILES small files) twice: once writing
+#   3. CPU WORKLOAD  Run the same CPU-bound sha256 workload in each engine and report median wall
+#                    time. This is not a synthetic "engine score"; it catches runtime overhead,
+#                    startup overhead, and CPU scheduling differences for a simple replicated task.
+#
+#   4. BIND-MOUNT FS Run a file-heavy workload (create BENCH_FS_FILES small files) twice: once writing
 #                    into a HOST bind mount (crosses the VM<->host filesystem boundary) and once
 #                    writing into a plain in-container path (no host mount). Report both wall times
 #                    and the host/in-container ratio -- the ratio is the VM-boundary tax, independent
@@ -37,7 +41,8 @@
 # Examples:
 #   scripts/benchmark-compare.sh --engines dory
 #   scripts/benchmark-compare.sh --engines dory,orbstack,apple-container --memory-count 4 --runs 5
-#   scripts/benchmark-compare.sh --engines dory --metrics memory,fs
+#   scripts/benchmark-compare.sh --engines dory --metrics memory,cpu,fs
+#   scripts/benchmark-compare.sh --dory-app /Applications/Dory.app --engines dory,orbstack,docker-desktop
 #   scripts/benchmark-compare.sh --dry-run --engines dory,orbstack,docker-desktop,apple-container
 #
 # Environment knobs:
@@ -48,7 +53,9 @@
 #                                                    arm64 on Apple silicon, amd64 on Intel; prefer
 #                                                    multi-arch images such as taoyou/iperf3-alpine)
 #   BENCH_WORKDIR                                   results root (default ~/.dory-benchmark)
-#   BENCH_SETTLE, BENCH_MEMORY_COUNT, BENCH_RUNS, BENCH_FS_FILES
+#   DORY_BENCH_APP                                  path to released Dory.app to launch/record
+#   DORY_BENCH_APP_WAIT                             seconds to wait for Dory's socket (default 90)
+#   BENCH_SETTLE, BENCH_MEMORY_COUNT, BENCH_RUNS, BENCH_CPU_MB, BENCH_FS_FILES
 #   *_PROCESS_PATTERN                               override per-engine host-process match
 set -u
 
@@ -58,14 +65,17 @@ set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENGINES="${ENGINES:-dory,orbstack,docker-desktop,apple-container}"
-METRICS="${METRICS:-memory,network,fs}"
+METRICS="${METRICS:-memory,cpu,network,fs}"
 ALPINE_IMAGE="${BENCH_ALPINE_IMAGE:-alpine:latest}"
 IPERF_IMAGE="${BENCH_IPERF_IMAGE:-taoyou/iperf3-alpine:latest}"
 MEMORY_COUNT="${BENCH_MEMORY_COUNT:-3}"
 RUNS="${BENCH_RUNS:-3}"
+CPU_MB="${BENCH_CPU_MB:-256}"
 FS_FILES="${BENCH_FS_FILES:-2000}"
 SETTLE="${BENCH_SETTLE:-8}"
 CONTAINER_BIN="${BENCH_CONTAINER_BIN:-$(command -v container 2>/dev/null || echo /opt/homebrew/bin/container)}"
+DORY_BENCH_APP="${DORY_BENCH_APP:-}"
+DORY_BENCH_APP_WAIT="${DORY_BENCH_APP_WAIT:-90}"
 DRY_RUN="${DRY_RUN:-0}"
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -75,6 +85,7 @@ WORKDIR="$WORKROOT/$RUN_ID"
 MEMORY_TSV="$WORKDIR/memory.tsv"
 NETWORK_TSV="$WORKDIR/network.tsv"
 FS_TSV="$WORKDIR/filesystem.tsv"
+CPU_TSV="$WORKDIR/cpu.tsv"
 STATUS_TSV="$WORKDIR/status.tsv"
 SUMMARY_JSON="$WORKDIR/summary.json"
 MACHINE_SPEC="$WORKDIR/machine-spec.tsv"
@@ -94,11 +105,14 @@ Usage: scripts/benchmark-compare.sh [options]
 
 Options:
   --engines LIST       Comma-separated: dory,orbstack,docker-desktop,apple-container (default: all)
-  --metrics LIST       Comma-separated subset of: memory,network,fs (default: all)
+  --metrics LIST       Comma-separated subset of: memory,cpu,network,fs (default: all)
   --memory-count N     Idle containers for the memory metric (default: $MEMORY_COUNT)
   --runs N             Repetitions per timed metric; median reported (default: $RUNS)
+  --cpu-mb N           MiB streamed through sha256sum for the CPU metric (default: $CPU_MB)
   --fs-files N         Files created by the filesystem workload (default: $FS_FILES)
   --settle SECONDS     Settle window around memory samples (default: $SETTLE)
+  --dory-app PATH      Launch and record this released Dory.app before Dory metrics
+  --dory-app-wait N    Seconds to wait for the Dory socket after launching --dory-app (default: $DORY_BENCH_APP_WAIT)
   --dry-run            Print the commands each metric would run; take no measurements
   -h, --help           Show this help
 EOF
@@ -110,8 +124,11 @@ while [ "$#" -gt 0 ]; do
     --metrics) METRICS="${2:-}"; shift 2 ;;
     --memory-count) MEMORY_COUNT="${2:-}"; shift 2 ;;
     --runs) RUNS="${2:-}"; shift 2 ;;
+    --cpu-mb) CPU_MB="${2:-}"; shift 2 ;;
     --fs-files) FS_FILES="${2:-}"; shift 2 ;;
     --settle) SETTLE="${2:-}"; shift 2 ;;
+    --dory-app) DORY_BENCH_APP="${2:-}"; shift 2 ;;
+    --dory-app-wait) DORY_BENCH_APP_WAIT="${2:-}"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage; exit 2 ;;
@@ -212,6 +229,40 @@ engine_available() {
   command -v docker >/dev/null 2>&1 || return 1
   sock="$(engine_socket "$engine")"
   [ -n "$sock" ] && [ -S "$sock" ]
+}
+
+dory_app_version_value() {
+  local key="$1"
+  [ -n "$DORY_BENCH_APP" ] || { echo ""; return; }
+  /usr/bin/defaults read "$DORY_BENCH_APP/Contents/Info" "$key" 2>/dev/null || echo ""
+}
+
+prepare_dory_release_app() {
+  [ "$CURRENT_ENGINE" = "dory" ] || return 0
+  [ -n "$DORY_BENCH_APP" ] || return 0
+  if [ "$DRY_RUN" = "1" ]; then
+    printf '    [dry-run] open %s and wait up to %ss for %s\n' "$DORY_BENCH_APP" "$DORY_BENCH_APP_WAIT" "$ENGINE_SOCK"
+    return 0
+  fi
+  [ -d "$DORY_BENCH_APP" ] || {
+    record_status SKIP "$CURRENT_ENGINE" "all metrics" "Dory app not found: $DORY_BENCH_APP"
+    return 1
+  }
+  /usr/bin/open "$DORY_BENCH_APP" >/dev/null 2>&1 || {
+    record_status FAIL "$CURRENT_ENGINE" "all metrics" "could not launch Dory app: $DORY_BENCH_APP"
+    return 1
+  }
+  local waited=0
+  while [ "$waited" -lt "$DORY_BENCH_APP_WAIT" ]; do
+    if [ -S "$ENGINE_SOCK" ] && docker -H "unix://$ENGINE_SOCK" version >/dev/null 2>&1; then
+      record_status PASS "$CURRENT_ENGINE" "release-app" "using $(dory_app_version_value CFBundleShortVersionString) ($(dory_app_version_value CFBundleVersion)) at $DORY_BENCH_APP"
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  record_status SKIP "$CURRENT_ENGINE" "all metrics" "Dory app did not expose a Docker socket at $ENGINE_SOCK within ${DORY_BENCH_APP_WAIT}s"
+  return 1
 }
 
 # --------------------------------------------------------------------------------------------------
@@ -317,6 +368,13 @@ capture_machine_spec() {
     printf 'uname\t%s\n' "$(uname -mrs 2>/dev/null || echo unknown)"
     printf 'docker.client\t%s\n' "$(docker version --format '{{.Client.Version}}' 2>/dev/null || echo none)"
     printf 'container.cli\t%s\n' "$( ("$CONTAINER_BIN" --version 2>/dev/null | head -1) || echo none)"
+    if [ -n "$DORY_BENCH_APP" ]; then
+      printf 'dory.app.path\t%s\n' "$DORY_BENCH_APP"
+      printf 'dory.app.version\t%s\n' "$(dory_app_version_value CFBundleShortVersionString)"
+      printf 'dory.app.build\t%s\n' "$(dory_app_version_value CFBundleVersion)"
+      printf 'dory.app.bundleIdentifier\t%s\n' "$(dory_app_version_value CFBundleIdentifier)"
+      printf 'dory.app.codesign\t%s\n' "$(codesign -dv "$DORY_BENCH_APP" 2>&1 | tr '\n\t' '  ' | sed 's/  */ /g' | cut -c 1-500)"
+    fi
   } > "$MACHINE_SPEC"
 }
 
@@ -437,7 +495,94 @@ metric_memory_apple() {
 }
 
 # --------------------------------------------------------------------------------------------------
-# Metric 2: container-to-container network throughput
+# Metric 2: CPU-bound workload
+# --------------------------------------------------------------------------------------------------
+
+cpu_workload_cmd() {
+  printf 'dd if=/dev/zero bs=1M count=%s 2>/dev/null | sha256sum >/dev/null' "$CPU_MB"
+}
+
+time_docker_cpu() {
+  local cmd
+  cmd="$(cpu_workload_cmd)"
+  { time docker_e run --rm --label "$LABEL_KEY=$RUN_ID" \
+      "$ALPINE_IMAGE" sh -c "$cmd" >/dev/null 2>&1 ; } 2>&1 | parse_real_seconds
+}
+
+time_apple_cpu() {
+  local cmd
+  cmd="$(cpu_workload_cmd)"
+  { time "$CONTAINER_BIN" run --rm --name "$PREFIX-cpu-$RANDOM" \
+      "$ALPINE_IMAGE" sh -c "$cmd" >/dev/null 2>&1 ; } 2>&1 | parse_real_seconds
+}
+
+metric_cpu() {
+  local engine="$CURRENT_ENGINE"
+  if is_apple_container "$engine"; then
+    metric_cpu_apple
+  else
+    metric_cpu_docker
+  fi
+}
+
+metric_cpu_docker() {
+  local engine="$CURRENT_ENGINE"
+  if ! ensure_image_docker "$ALPINE_IMAGE"; then
+    record_status SKIP "$engine" "cpu" "cannot pull $ALPINE_IMAGE"
+    return
+  fi
+  if [ "$DRY_RUN" = "1" ]; then
+    printf '    [dry-run] time CPU sha256 workload x%s (%s MiB each)\n' "$RUNS" "$CPU_MB"
+    docker_er run --rm --label "$LABEL_KEY=$RUN_ID" "$ALPINE_IMAGE" sh -c "$(cpu_workload_cmd)"
+    record_status PASS "$engine" "cpu" "dry-run"
+    return
+  fi
+  local run_i samples="" t med
+  for run_i in $(seq 1 "$RUNS"); do
+    t="$(time_docker_cpu)"
+    [ -n "$t" ] && samples="$samples $t"
+  done
+  cleanup_docker_engine
+  if [ -z "$samples" ]; then
+    record_status FAIL "$engine" "cpu" "no timing samples captured"
+    return
+  fi
+  # shellcheck disable=SC2086
+  med="$(median $samples)"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$engine" "$ALPINE_IMAGE" "$RUNS" "$CPU_MB" "$med" "$(sanitize "$samples")" >> "$CPU_TSV"
+  record_status PASS "$engine" "cpu" "median=${med}s over $RUNS run(s), ${CPU_MB} MiB"
+}
+
+metric_cpu_apple() {
+  local engine="$CURRENT_ENGINE"
+  if ! ensure_image_apple "$ALPINE_IMAGE"; then
+    record_status SKIP "$engine" "cpu" "cannot pull $ALPINE_IMAGE"
+    return
+  fi
+  if [ "$DRY_RUN" = "1" ]; then
+    printf '    [dry-run] time apple CPU sha256 workload x%s (%s MiB each)\n' "$RUNS" "$CPU_MB"
+    container_c run --rm "$ALPINE_IMAGE" sh -c "$(cpu_workload_cmd)"
+    record_status PASS "$engine" "cpu" "dry-run"
+    return
+  fi
+  local run_i samples="" t med
+  for run_i in $(seq 1 "$RUNS"); do
+    t="$(time_apple_cpu)"
+    [ -n "$t" ] && samples="$samples $t"
+  done
+  cleanup_apple_container
+  if [ -z "$samples" ]; then
+    record_status FAIL "$engine" "cpu" "no timing samples captured"
+    return
+  fi
+  # shellcheck disable=SC2086
+  med="$(median $samples)"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$engine" "$ALPINE_IMAGE" "$RUNS" "$CPU_MB" "$med" "$(sanitize "$samples")" >> "$CPU_TSV"
+  record_status PASS "$engine" "cpu" "median=${med}s over $RUNS run(s), ${CPU_MB} MiB"
+}
+
+# --------------------------------------------------------------------------------------------------
+# Metric 3: container-to-container network throughput
 # --------------------------------------------------------------------------------------------------
 
 metric_network() {
@@ -492,7 +637,7 @@ metric_network() {
 }
 
 # --------------------------------------------------------------------------------------------------
-# Metric 3: bind-mount filesystem vs in-container filesystem
+# Metric 4: bind-mount filesystem vs in-container filesystem
 # --------------------------------------------------------------------------------------------------
 
 # Workload: create FS_FILES tiny files in $target, timed with `time`, wall seconds parsed from stderr.
@@ -640,6 +785,10 @@ run_engine() {
     note "$(engine_label "$CURRENT_ENGINE") ($ENGINE_SOCK)"
   fi
 
+  if ! prepare_dory_release_app; then
+    return
+  fi
+
   if ! engine_available "$CURRENT_ENGINE"; then
     if is_apple_container "$CURRENT_ENGINE"; then
       record_status SKIP "$CURRENT_ENGINE" "all metrics" "container CLI not found: $CONTAINER_BIN"
@@ -652,6 +801,7 @@ run_engine() {
   cleanup_engine
 
   if metric_enabled memory; then metric_memory; else record_status SKIP "$CURRENT_ENGINE" "memory" "disabled via --metrics"; fi
+  if metric_enabled cpu; then metric_cpu; else record_status SKIP "$CURRENT_ENGINE" "cpu" "disabled via --metrics"; fi
   if metric_enabled network; then metric_network; else record_status SKIP "$CURRENT_ENGINE" "network" "disabled via --metrics"; fi
   if metric_enabled fs; then metric_fs; else record_status SKIP "$CURRENT_ENGINE" "fs" "disabled via --metrics"; fi
 
@@ -697,6 +847,12 @@ print_table() {
     awk -F'\t' 'NR>1 { printf "  %-16s %14s %14s\n", $1, $5, $7 }' "$MEMORY_TSV"
     echo ""
   fi
+  if metric_enabled cpu && [ -s "$CPU_TSV" ]; then
+    echo "CPU WORKLOAD ($CPU_MB MiB sha256, median of $RUNS)"
+    printf '  %-16s %14s\n' "engine" "seconds"
+    awk -F'\t' 'NR>1 { printf "  %-16s %14s\n", $1, $5 }' "$CPU_TSV"
+    echo ""
+  fi
   if metric_enabled network && [ -s "$NETWORK_TSV" ]; then
     echo "CONTAINER-TO-CONTAINER NETWORK (iperf3, median of $RUNS)"
     printf '  %-16s %14s\n' "engine" "Gbps"
@@ -712,8 +868,9 @@ print_table() {
 }
 
 write_summary() {
-  local mem_json net_json fs_json status_json
+  local mem_json cpu_json net_json fs_json status_json
   mem_json="$(tsv_to_json_array "$MEMORY_TSV")"
+  cpu_json="$(tsv_to_json_array "$CPU_TSV")"
   net_json="$(tsv_to_json_array "$NETWORK_TSV")"
   fs_json="$(tsv_to_json_array "$FS_TSV")"
   status_json="$(tsv_to_json_array "$STATUS_TSV")"
@@ -725,17 +882,20 @@ write_summary() {
   "dryRun": $( [ "$DRY_RUN" = "1" ] && echo true || echo false ),
   "memoryCount": $MEMORY_COUNT,
   "runs": $RUNS,
+  "cpuMB": $CPU_MB,
   "fsFiles": $FS_FILES,
   "settle": $SETTLE,
   "pass": $PASS_COUNT,
   "fail": $FAIL_COUNT,
   "skip": $SKIP_COUNT,
   "memory": $mem_json,
+  "cpu": $cpu_json,
   "network": $net_json,
   "filesystem": $fs_json,
   "status": $status_json,
   "files": {
     "memory": "$MEMORY_TSV",
+    "cpu": "$CPU_TSV",
     "network": "$NETWORK_TSV",
     "filesystem": "$FS_TSV",
     "status": "$STATUS_TSV",
@@ -752,6 +912,7 @@ EOF
 mkdir -p "$WORKDIR"
 printf 'status\tengine\tmetric\tdetail\n' > "$STATUS_TSV"
 printf 'engine\tcontainers\timage\tsystem_delta_bytes\tsystem_delta_mb\tprocess_delta_bytes\tprocess_delta_mb\n' > "$MEMORY_TSV"
+printf 'engine\timage\truns\tworkload_mib\tmedian_seconds\tsamples_seconds\n' > "$CPU_TSV"
 printf 'engine\timage\truns\tmedian_gbps\tsamples_gbps\n' > "$NETWORK_TSV"
 printf 'engine\tfiles\truns\tbind_seconds\tincontainer_seconds\tratio\n' > "$FS_TSV"
 

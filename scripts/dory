@@ -85,6 +85,10 @@ dory — Dory CLI
   dory doctor [--json] [--active] [--bundle [PATH]] [--diff]
                                Diagnose socket, CLI, network, mounts, disk, memory, and helpers
                                (--diff shows what changed since the last healthy run)
+  dory support bundle [--json] [--active] [PATH]
+                               Write one redacted support zip and print the path for GitHub issues
+  dory logs collect [--json] [--active] [PATH]
+                               Alias for support bundle; no screenshots needed
   dory network [--json] [--active] [--probe HOST[:PORT]]
   dory network --save-probe HOST[:PORT] | --list-probes | --remove-probe HOST[:PORT]
                                Diagnose DNS, registry, proxy, ports, and *.dory.local routing
@@ -1355,6 +1359,68 @@ doctor_cmd() {
   exec "$helper" "$@"
 }
 
+support_usage() {
+  echo "usage: dory support bundle [--json] [--active] [PATH]" >&2
+}
+
+support_bundle_json() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+print(json.dumps({
+    "schema": "dev.dory.support.bundle",
+    "version": 1,
+    "path": path,
+    "redacted": True,
+    "share": "Attach this zip to your GitHub issue instead of screenshots.",
+}, separators=(",", ":"), sort_keys=True))
+PY
+}
+
+support_cmd() {
+  local action="${1:-bundle}" json=0 active=0 path="" helper out
+  case "$action" in
+    bundle|collect) shift || true ;;
+    -h|--help|help) support_usage; return 0 ;;
+    *) support_usage; exit 2 ;;
+  esac
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --json) json=1; shift ;;
+      --active) active=1; shift ;;
+      -h|--help) support_usage; return 0 ;;
+      --*) echo "unknown support option: $1" >&2; support_usage; exit 2 ;;
+      *)
+        [ -z "$path" ] || { echo "support bundle accepts at most one path" >&2; support_usage; exit 2; }
+        path="$1"
+        shift
+        ;;
+    esac
+  done
+  helper="${DORY_DOCTOR_BIN:-$DORY_SCRIPT_DIR/dory-doctor}"
+  [ -x "$helper" ] || { echo "dory-doctor helper not found: $helper" >&2; exit 1; }
+  local args=(bundle)
+  [ "$active" -eq 1 ] && args+=(--active)
+  [ -n "$path" ] && args+=("$path")
+  out="$("$helper" "${args[@]}")" || exit $?
+  if [ "$json" -eq 1 ]; then
+    support_bundle_json "$out"
+  else
+    printf 'Dory support bundle: %s\n' "$out"
+    printf 'Attach this redacted zip to your GitHub issue instead of screenshots.\n'
+  fi
+}
+
+logs_cmd() {
+  case "${1:-collect}" in
+    collect|bundle) shift || true; support_cmd bundle "$@" ;;
+    -h|--help|help) echo "usage: dory logs collect [--json] [--active] [PATH]" >&2 ;;
+    *) echo "usage: dory logs collect [--json] [--active] [PATH]" >&2; exit 2 ;;
+  esac
+}
+
 idle_proxy_cmd() {
   local helper="${DORY_IDLE_PROXY_BIN:-$DORY_SCRIPT_DIR/dory-idle-proxy}"
   [ -x "$helper" ] || { echo "dory-idle-proxy helper not found: $helper" >&2; exit 1; }
@@ -2230,6 +2296,16 @@ data = {
             "groups": ["socket", "api", "docker", "context", "registry", "network", "ports", "domains", "mounts", "watch", "clock", "disk", "memory", "helpers"],
         },
         {
+            "id": "support",
+            "status": "available",
+            "invoke": "dory support bundle --json [--active] [PATH]",
+            "json": True,
+            "dryRun": False,
+            "safeForAutomation": True,
+            "redacted": True,
+            "notes": "Writes a redacted support zip and returns schema dev.dory.support.bundle v1 with the shareable path.",
+        },
+        {
             "id": "repair",
             "status": "available",
             "invoke": "dory repair TARGET --json [--apply]",
@@ -2380,6 +2456,7 @@ data = {
         },
     ],
     "recommendedRecoveryLoop": [
+        "Run dory support bundle --json when filing an issue or collecting a shareable evidence pack.",
         "Run dory doctor --json before modifying runtime state.",
         "If a result includes an action, prefer the matching dory repair TARGET --json dry-run.",
         "Only add --apply when the user or task has authorized a write.",
@@ -2431,6 +2508,8 @@ agent_cmd() {
 case "${1:-help}" in
   help|-h|--help) usage ;;
   doctor)         shift; doctor_cmd doctor "$@" ;;
+  support)        shift; support_cmd "$@" ;;
+  logs)           shift; logs_cmd "$@" ;;
   network)        shift; doctor_cmd network "$@" ;;
   mount)          shift; doctor_cmd mount "$@" ;;
   disk)           shift; doctor_cmd disk "$@" ;;

@@ -16,14 +16,20 @@ on:
         description: 'Comma-separated engines: dory,orbstack,docker-desktop,apple-container'
         default: 'dory,orbstack,docker-desktop,apple-container'
       metrics:
-        description: 'Comma-separated metrics: memory,network,fs'
-        default: 'memory,network,fs'
+        description: 'Comma-separated metrics: memory,cpu,network,fs'
+        default: 'memory,cpu,network,fs'
+      dory_app:
+        description: 'Optional released Dory.app path to launch/record, e.g. /Applications/Dory.app'
+        default: ''
       memory_count:
         description: 'Number of idle containers for memory metric'
         default: '3'
       runs:
         description: 'Repetitions per timed metric'
         default: '3'
+      cpu_mb:
+        description: 'MiB streamed through sha256sum for the CPU metric'
+        default: '256'
       fs_files:
         description: 'Small files for the filesystem metric'
         default: '2000'
@@ -38,13 +44,20 @@ jobs:
       - name: Run cross-engine benchmark
         env:
           BENCH_WORKDIR: ${{ runner.temp }}/dory-benchmark
+          DORY_BENCH_APP_INPUT: ${{ github.event.inputs.dory_app || '' }}
         run: |
-          scripts/benchmark-compare.sh \
+          args=( \
             --engines "${{ github.event.inputs.engines || 'dory,orbstack,docker-desktop,apple-container' }}" \
-            --metrics "${{ github.event.inputs.metrics || 'memory,network,fs' }}" \
+            --metrics "${{ github.event.inputs.metrics || 'memory,cpu,network,fs' }}" \
             --memory-count "${{ github.event.inputs.memory_count || '3' }}" \
             --runs "${{ github.event.inputs.runs || '3' }}" \
-            --fs-files "${{ github.event.inputs.fs_files || '2000' }}"
+            --cpu-mb "${{ github.event.inputs.cpu_mb || '256' }}" \
+            --fs-files "${{ github.event.inputs.fs_files || '2000' }}" \
+          )
+          if [ -n "$DORY_BENCH_APP_INPUT" ]; then
+            args+=(--dory-app "$DORY_BENCH_APP_INPUT")
+          fi
+          scripts/benchmark-compare.sh "${args[@]}"
           result_dir="$(find "$BENCH_WORKDIR" -mindepth 1 -maxdepth 1 -type d | sort | tail -1)"
           test -n "$result_dir"
           echo "BENCH_RESULT_DIR=$result_dir" >> "$GITHUB_ENV"

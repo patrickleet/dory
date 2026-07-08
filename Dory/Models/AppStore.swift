@@ -249,10 +249,10 @@ final class AppStore {
     static let kubernetesVersionKey = "dory.kubernetesVersion"
     nonisolated static let localDorydCapabilityCatalog: [LocalDorydCapability] = [
         LocalDorydCapability(
-            id: "doctor",
-            title: "Doctor bundle",
+            id: "support-bundle",
+            title: "Support bundle",
             summary: "Collect local diagnostics for the daemon, socket, engine, memory, helpers, and recovery checks.",
-            command: "dory doctor --json --bundle",
+            command: "dory support bundle",
             status: "Stable"
         ),
         LocalDorydCapability(

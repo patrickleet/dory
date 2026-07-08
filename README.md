@@ -70,8 +70,9 @@
 - `dory repair` offers non-destructive socket, context, DNS, route, domain, port, dockerd, engine,
   and guest-agent recovery actions before users reach for a full reset. `dory repair all --apply`
   only touches subsystems that are actually unhealthy.
-- `dory bundle` writes a redacted diagnostic zip so support starts from one artifact instead of
-  a thread full of shell commands.
+- `dory support bundle` writes one redacted diagnostic zip and prints the path to attach to a
+  GitHub issue; `dory logs collect` is the same support-safe collection flow for users who think
+  in logs first.
 - `dory mode` and `dory idle status` expose the Auto-Idle foundation; `dory idle proxy` can run
   the opt-in always-listening socket proxy for headless dogfooding. The proxy wakes a sleeping
   headless engine on Docker API use, forwards the request, and records its idle/wake state.
@@ -214,12 +215,23 @@ dory cleanup
 dory routes
 dory repair
 dory network --list-probes
-dory bundle
+dory support bundle
+dory logs collect --json
 dory idle status
 dory idle proxy --foreground
 ```
 
 For scripted checks, add `--json` to the commands that support it.
+For release benchmark evidence, use the installed app path so the raw artifacts record the exact
+build under test:
+
+```sh
+BENCH_WORKDIR="$PWD/.benchmark-results" \
+scripts/benchmark-compare.sh \
+  --dory-app /Applications/Dory.app \
+  --engines dory,orbstack,docker-desktop \
+  --metrics memory,cpu,network,fs
+```
 
 ## Architecture
 
