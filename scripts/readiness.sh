@@ -6,12 +6,15 @@
 #
 # Examples:
 #   scripts/readiness.sh --engines dory
+#   scripts/readiness.sh --engines doryd
 #   scripts/readiness.sh --engines orbstack,dory --memory-count 5
 #   RUN_DOMAINS=1 RUN_NONNATIVE_ARCH=1 scripts/readiness.sh --engines dory,orbstack
 #
 # Environment knobs:
-#   DORY_SOCK, ORBSTACK_SOCK, DOCKER_DESKTOP_SOCK
+#   DORY_SOCK, DORYD_SOCK, ORBSTACK_SOCK, DOCKER_DESKTOP_SOCK
 #   READINESS_WORKDIR, READINESS_SETTLE, READINESS_ALPINE_IMAGE, READINESS_NGINX_IMAGE
+#   READINESS_BUILD_CONTEXT_MB for the BuildKit streaming build payload (default: 32)
+#   READINESS_NONNATIVE_BUILD_IMAGE for the non-native BuildKit qemu/npm probe (default: node:20-alpine)
 #   RUN_MEMORY=0|1, RUN_NONNATIVE_ARCH=0|1, RUN_AMD64=0|1 (legacy alias), RUN_ONLINE=0|1, RUN_DOMAINS=0|1, RUN_DIRECT_IP=0|1, RUN_FILE_WATCH=0|1, RUN_K8S=0|1, RUN_MACHINES=0|1, RUN_MACHINE_RECIPE=0|1, RUN_USB=0|1, RUN_VPN=0|1
 #   DORY_DIRECT_IP_INTERFACE_FILE points at the helper-written utun interface file
 #   READINESS_FILE_WATCH_IMAGE for --file-watch (default: alpine image)
@@ -19,6 +22,7 @@
 #   RUN_DEBUG_SHELL=0|1, DORY_DEBUG_AGENT_SOCK, DORY_DEBUG_CONTAINER_ID
 #   RUN_CLOCK_SYNC=0|1, DORY_CLOCK_SYNC_AGENT_SOCK, DORY_CLOCK_SYNC_PID, DORY_CLOCK_SYNC_TOLERANCE_MS
 #   RUN_GUEST_AGENT=0|1, DORY_HV_BIN, DORY_GUEST_KERNEL, DORY_GUEST_INITFS
+#   DORYD_CTL, DORYD_MACHINE_KERNEL, DORYD_MACHINE_ROOTFS for doryd per-VM machine checks
 #   DORY_USB_TEST_BUSID, optional DORY_USB_MODE=userAuthorized|seize|capture for --usb hardware smoke
 #   DORY_REQUIRE_VPN=1 makes --vpn fail when no active VPN-like interface or route is detected
 #   STOP_ORBSTACK=1 to quit OrbStack before running Dory-only checks
@@ -28,7 +32,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENGINES="${ENGINES:-dory}"
 ALPINE_IMAGE="${READINESS_ALPINE_IMAGE:-alpine:latest}"
 NGINX_IMAGE="${READINESS_NGINX_IMAGE:-nginx:alpine}"
+NONNATIVE_BUILD_IMAGE="${READINESS_NONNATIVE_BUILD_IMAGE:-node:20-alpine}"
 MEMORY_COUNT="${READINESS_MEMORY_COUNT:-3}"
+BUILD_CONTEXT_MB="${READINESS_BUILD_CONTEXT_MB:-32}"
 SETTLE="${READINESS_SETTLE:-8}"
 RUN_MEMORY="${RUN_MEMORY:-1}"
 RUN_NONNATIVE_ARCH="${RUN_NONNATIVE_ARCH:-${RUN_AMD64:-1}}"
@@ -72,7 +78,7 @@ usage() {
 Usage: scripts/readiness.sh [options]
 
 Options:
-  --engines LIST       Comma-separated: dory,orbstack,docker-desktop,current
+  --engines LIST       Comma-separated: dory,doryd,orbstack,docker-desktop,current
   --memory-count N     Containers to run for memory measurements (default: $MEMORY_COUNT)
   --settle SECONDS     Wait time before/after memory workload (default: $SETTLE)
   --skip-memory        Skip memory measurements
@@ -100,6 +106,11 @@ Options:
 Clock sync env:
   DORY_CLOCK_SYNC_AGENT_SOCK or DORY_AGENT_SOCK
   DORY_CLOCK_SYNC_PID, DORY_CLOCK_SYNC_TOLERANCE_MS
+
+doryd VM machine env:
+  DORYD_CTL
+  DORYD_MACHINE_KERNEL, DORYD_MACHINE_ROOTFS
+  DORYD_MACHINE_MEMORY_MB, DORYD_MACHINE_CPUS
 EOF
 }
 
@@ -210,7 +221,7 @@ used_mem() {
 process_rss_bytes() {
   local engine="$1" pattern
   case "$engine" in
-    dory) pattern="${DORY_PROCESS_PATTERN:-Dory|dory-vm|dory-vmboot|containermanagerd}" ;;
+    dory|doryd) pattern="${DORY_PROCESS_PATTERN:-Dory|doryd|dory-hv|dory-vmm|dory-vm|dory-vmboot|containermanagerd}" ;;
     orbstack) pattern="${ORBSTACK_PROCESS_PATTERN:-OrbStack}" ;;
     docker-desktop|desktop) pattern="${DOCKER_DESKTOP_PROCESS_PATTERN:-Docker|com.docker}" ;;
     *) pattern="${GENERIC_ENGINE_PROCESS_PATTERN:-$engine}" ;;
@@ -229,6 +240,7 @@ engine_socket() {
   local engine="$1"
   case "$engine" in
     dory) echo "${DORY_SOCK:-$HOME/.dory/dory.sock}" ;;
+    doryd) echo "${DORYD_SOCK:-${DORY_SOCK:-$HOME/.dory/dory.sock}}" ;;
     orbstack) echo "${ORBSTACK_SOCK:-$HOME/.orbstack/run/docker.sock}" ;;
     docker-desktop|desktop) echo "${DOCKER_DESKTOP_SOCK:-$HOME/.docker/run/docker.sock}" ;;
     current)
@@ -244,8 +256,80 @@ docker_e() {
   docker -H "unix://$ENGINE_SOCK" "$@"
 }
 
+dorydctl() {
+  local arch cand
+  if [ -n "${DORYD_CTL:-}" ]; then
+    "$DORYD_CTL" "$@"
+    return
+  fi
+  arch="$(uname -m)"
+  for cand in \
+    "$ROOT/dory-core-swift/.build/debug/dorydctl" \
+    "$ROOT/dory-core-swift/.build/release/dorydctl" \
+    "$ROOT/dory-core-swift/.build/$arch-apple-macosx/debug/dorydctl" \
+    "$ROOT/dory-core-swift/.build/$arch-apple-macosx/release/dorydctl"; do
+    [ -x "$cand" ] && { "$cand" "$@"; return; }
+  done
+  [ -f "$ROOT/dory-core-swift/Package.swift" ] || {
+    echo "dorydctl not found; set DORYD_CTL or build dory-core-swift" >&2
+    return 1
+  }
+  swift run --package-path "$ROOT/dory-core-swift" dorydctl "$@"
+}
+
+json_get() {
+  local path="$1"
+  python3 -c '
+import json
+import sys
+
+path = sys.argv[1].split(".")
+value = json.load(sys.stdin)
+for part in path:
+    if isinstance(value, dict):
+        value = value.get(part)
+    else:
+        value = None
+    if value is None:
+        break
+if value is None:
+    print("")
+elif isinstance(value, bool):
+    print("true" if value else "false")
+else:
+    print(value)
+' "$path"
+}
+
 compose_e() {
   DOCKER_HOST="unix://$ENGINE_SOCK" docker compose "$@"
+}
+
+first_host_port() {
+  awk -F: '
+    NF {
+      port = $NF
+      gsub(/[^0-9].*/, "", port)
+      if (port ~ /^[0-9]+$/) {
+        print port
+        exit
+      }
+    }
+  '
+}
+
+wait_for_engine_ready() {
+  local timeout="${READINESS_READY_TIMEOUT:-90}"
+  local i
+  for i in $(seq 1 "$timeout"); do
+    docker_e version >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  docker_e version >/dev/null
+}
+
+is_dory_engine() {
+  [ "$CURRENT_ENGINE" = "dory" ] || [ "$CURRENT_ENGINE" = "doryd" ]
 }
 
 cleanup_engine() {
@@ -376,7 +460,7 @@ test_published_port() {
   local name="$PREFIX-port"
   local port
   docker_e run -d --name "$name" --label "$LABEL_KEY=$RUN_ID" -p 127.0.0.1::80 "$NGINX_IMAGE" >/dev/null
-  port="$(docker_e port "$name" 80/tcp | sed 's/.*://')"
+  port="$(docker_e port "$name" 80/tcp | first_host_port)"
   [ -n "$port" ]
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
     curl -fsS "http://127.0.0.1:$port" | grep -qi 'welcome' && { docker_e rm -f "$name" >/dev/null; return 0; }
@@ -389,15 +473,34 @@ test_published_port() {
 test_buildkit_build() {
   local dir="$WORKDIR/${ENGINE_ID}-build"
   local tag="dory-readiness-${ENGINE_ID}-${RUN_SLUG}:build"
+  local payload_mb payload_sha
   mkdir -p "$dir"
+  case "$BUILD_CONTEXT_MB" in
+    ''|*[!0-9]*) echo "READINESS_BUILD_CONTEXT_MB must be a non-negative integer"; return 1 ;;
+  esac
+  if [ "$BUILD_CONTEXT_MB" -gt 0 ]; then
+    dd if=/dev/zero of="$dir/payload.bin" bs=1048576 count="$BUILD_CONTEXT_MB" status=none
+  else
+    : > "$dir/payload.bin"
+  fi
+  payload_mb="$BUILD_CONTEXT_MB"
+  payload_sha="$(shasum -a 256 "$dir/payload.bin" | awk '{print $1}')"
   cat > "$dir/Dockerfile" <<EOF
 FROM $ALPINE_IMAGE
 LABEL $LABEL_KEY=$RUN_ID
-RUN echo built-ok > /built.txt
+ARG PAYLOAD_SHA
+ARG PAYLOAD_MB
+COPY payload.bin /payload.bin
+RUN actual="\$(sha256sum /payload.bin | awk '{print \$1}')" \\
+    && test "\$actual" = "\$PAYLOAD_SHA" \\
+    && printf 'built-ok %sMB %s\n' "\$PAYLOAD_MB" "\$actual" > /built.txt
 CMD ["cat", "/built.txt"]
 EOF
-  DOCKER_BUILDKIT=1 docker_e build -t "$tag" "$dir" >/dev/null
-  docker_e run --rm --label "$LABEL_KEY=$RUN_ID" "$tag" | grep -q 'built-ok'
+  DOCKER_BUILDKIT=1 docker_e build --progress=plain \
+    --build-arg "PAYLOAD_SHA=$payload_sha" \
+    --build-arg "PAYLOAD_MB=$payload_mb" \
+    -t "$tag" "$dir"
+  docker_e run --rm --label "$LABEL_KEY=$RUN_ID" "$tag" | grep -q "built-ok ${payload_mb}MB $payload_sha"
   docker_e rmi -f "$tag" >/dev/null
 }
 
@@ -429,7 +532,7 @@ EOF
   compose_e -f "$dir/compose.yaml" -p "$project" up -d >/dev/null
   compose_e -f "$dir/compose.yaml" -p "$project" ps >/dev/null
   compose_e -f "$dir/compose.yaml" -p "$project" logs worker | grep -q 'compose-ok'
-  port="$(compose_e -f "$dir/compose.yaml" -p "$project" port web 80 | sed 's/.*://')"
+  port="$(compose_e -f "$dir/compose.yaml" -p "$project" port web 80 | first_host_port)"
   [ -n "$port" ]
   rc=1
   for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -485,6 +588,39 @@ test_nonnative_arch() {
   docker_e run --rm --platform "linux/$arch" --label "$LABEL_KEY=$RUN_ID" "$ALPINE_IMAGE" uname -m | grep -Eq "$pattern"
 }
 
+test_nonnative_build() {
+  local arch pattern node_arch dir tag
+  arch="$(nonnative_guest_arch)"
+  pattern="$(uname_pattern_for_arch "$arch")"
+  case "$arch" in
+    amd64) node_arch="x64" ;;
+    arm64) node_arch="arm64" ;;
+    *) echo "unsupported arch: $arch" >&2; return 2 ;;
+  esac
+  dir="$WORKDIR/${ENGINE_ID}-nonnative-build"
+  tag="dory-readiness-${ENGINE_ID}-${RUN_SLUG}:nonnative-$arch"
+  mkdir -p "$dir"
+  cat > "$dir/Dockerfile" <<EOF
+FROM $NONNATIVE_BUILD_IMAGE
+LABEL $LABEL_KEY=$RUN_ID
+ARG EXPECTED_UNAME
+ARG EXPECTED_NODE_ARCH
+ENV EXPECTED_NODE_ARCH=\$EXPECTED_NODE_ARCH
+RUN actual="\$(uname -m)" \\
+    && printf '%s\n' "\$actual" > /uname.txt \\
+    && printf '%s\n' "\$actual" | grep -Eq "\$EXPECTED_UNAME"
+RUN node -e "if (process.arch !== process.env.EXPECTED_NODE_ARCH) { throw new Error(process.arch + ' != ' + process.env.EXPECTED_NODE_ARCH) } console.log(process.arch)" > /node-arch.txt
+RUN npm --version > /npm-version.txt
+CMD ["sh", "-c", "cat /uname.txt /node-arch.txt /npm-version.txt"]
+EOF
+  DOCKER_BUILDKIT=1 docker_e build --progress=plain --platform "linux/$arch" \
+    --build-arg "EXPECTED_UNAME=$pattern" \
+    --build-arg "EXPECTED_NODE_ARCH=$node_arch" \
+    -t "$tag" "$dir"
+  docker_e run --rm --platform "linux/$arch" --label "$LABEL_KEY=$RUN_ID" "$tag" | grep -q "$node_arch"
+  docker_e rmi -f "$tag" >/dev/null
+}
+
 test_online_search() {
   docker_e search --limit 1 alpine | grep -qi 'alpine'
 }
@@ -493,7 +629,7 @@ test_domains() {
   local name="$PREFIX-domain"
   local host
   case "$CURRENT_ENGINE" in
-    dory) host="$name.dory.local" ;;
+    dory|doryd) host="$name.dory.local" ;;
     orbstack) host="$name.orb.local" ;;
     *) return 2 ;;
   esac
@@ -507,7 +643,7 @@ test_domains() {
 }
 
 test_direct_ip() {
-  [ "$CURRENT_ENGINE" = "dory" ] || { echo "direct container IP routing is a Dory shared-VM claim"; return 1; }
+  is_dory_engine || { echo "direct container IP routing is a Dory shared-VM claim"; return 1; }
   local name="$PREFIX-direct-ip" ip iface_file iface route_info
   iface_file="${DORY_DIRECT_IP_INTERFACE_FILE:-$HOME/.dory/hv/direct-ip.interface}"
   [ -f "$iface_file" ] || {
@@ -568,7 +704,7 @@ vpn_detected() {
 }
 
 test_vpn_coexistence() {
-  [ "$CURRENT_ENGINE" = "dory" ] || { echo "VPN coexistence is a Dory gvproxy claim"; return 1; }
+  is_dory_engine || { echo "VPN coexistence is a Dory gvproxy claim"; return 1; }
   local dir="$WORKDIR/${ENGINE_ID}-vpn"
   vpn_snapshot "$dir"
   if vpn_detected "$dir"; then
@@ -587,7 +723,7 @@ test_vpn_coexistence() {
 test_k8s() {
   command -v kubectl >/dev/null
   case "$CURRENT_ENGINE" in
-    dory) KUBECONFIG="$HOME/.kube/dory-config" kubectl get nodes >/dev/null ;;
+    dory|doryd) KUBECONFIG="$HOME/.kube/dory-config" kubectl get nodes >/dev/null ;;
     orbstack) kubectl --context orbstack get nodes >/dev/null ;;
     docker-desktop|desktop) kubectl --context docker-desktop get nodes >/dev/null ;;
     *) return 2 ;;
@@ -597,6 +733,7 @@ test_k8s() {
 test_machines() {
   case "$CURRENT_ENGINE" in
     dory) test_machines_dory ;;
+    doryd) test_machines_doryd ;;
     orbstack) orb list >/dev/null ;;
     docker-desktop|desktop) return 2 ;;
     *) return 2 ;;
@@ -643,10 +780,92 @@ EOF
   docker_e rmi -f "$tag" >/dev/null
 }
 
+test_machines_doryd() {
+  local host_arch rootfs_default kernel rootfs
+  case "$(uname -m)" in
+    arm64|aarch64) host_arch="arm64" ;;
+    *) host_arch="amd64" ;;
+  esac
+  rootfs_default="$ROOT/guest/out/initfs-$host_arch.ext4"
+  kernel="${DORYD_MACHINE_KERNEL:-${DORYD_GUEST_KERNEL:-$ROOT/guest/out/Image}}"
+  rootfs="${DORYD_MACHINE_ROOTFS:-${DORYD_GUEST_ROOTFS:-$rootfs_default}}"
+  local memory="${DORYD_MACHINE_MEMORY_MB:-2048}"
+  local cpus="${DORYD_MACHINE_CPUS:-2}"
+  local dir="$WORKDIR/${ENGINE_ID}-machine-vm"
+  local name="ready-${RUN_SLUG}"
+  local state agent agent_socket detail
+
+  [ -n "$kernel" ] && [ -f "$kernel" ] || {
+    echo "set DORYD_MACHINE_KERNEL to a bootable Linux kernel for doryd VM machine readiness"
+    return 1
+  }
+  [ -n "$rootfs" ] && [ -f "$rootfs" ] || {
+    echo "set DORYD_MACHINE_ROOTFS to a rootfs with dory-agent as PID 1 for doryd VM machine readiness"
+    return 1
+  }
+
+  mkdir -p "$dir"
+  dorydctl machine delete "$name" >/dev/null 2>&1 || true
+  trap 'dorydctl machine stop "$name" >/dev/null 2>&1 || true; dorydctl machine delete "$name" >/dev/null 2>&1 || true' RETURN
+
+  dorydctl machine create "$name" --kernel "$kernel" --rootfs "$rootfs" --memory-mb "$memory" --cpus "$cpus" > "$dir/create.json"
+  dorydctl machine start "$name" > "$dir/start.json"
+
+  state=""
+  for _ in $(seq 1 "${DORYD_MACHINE_READY_POLLS:-60}"); do
+    dorydctl machine status "$name" > "$dir/status.json"
+    state="$(json_get state < "$dir/status.json")"
+    case "$state" in
+      running) break ;;
+      failed)
+        detail="$(json_get lastError < "$dir/status.json")"
+        echo "doryd machine failed: ${detail:-unknown failure}"
+        return 1
+        ;;
+    esac
+    sleep "${DORYD_MACHINE_READY_INTERVAL:-2}"
+  done
+
+  [ "$state" = "running" ] || {
+    cat "$dir/status.json" >&2
+    echo "doryd machine did not reach running"
+    return 1
+  }
+  agent="$(json_get agentBuild < "$dir/status.json")"
+  [ -n "$agent" ] || {
+    cat "$dir/status.json" >&2
+    echo "doryd machine reached running without an agent build"
+    return 1
+  }
+  agent_socket="$(json_get agentSocketPath < "$dir/status.json")"
+  [ -n "$agent_socket" ] && [ -S "$agent_socket" ] || {
+    cat "$dir/status.json" >&2
+    echo "doryd machine reached running without a live agent socket"
+    return 1
+  }
+  dorydctl machine exec "$name" -- /bin/sh -lc 'echo machine-exec-ok' > "$dir/exec.out"
+  grep -qx 'machine-exec-ok' "$dir/exec.out"
+  dorydctl machine stop "$name" > "$dir/stop.json"
+  dorydctl machine delete "$name" > "$dir/delete.json"
+  trap - RETURN
+}
+
 machine_recipe_command() {
   local recipe="$1"
   if [ -n "${READINESS_MACHINE_RECIPE_COMMAND:-}" ]; then
     printf '%s' "$READINESS_MACHINE_RECIPE_COMMAND"
+    return
+  fi
+  if [ "${CURRENT_ENGINE:-}" = "doryd" ]; then
+    case "$recipe" in
+      rust|rust-dev) printf '%s' 'cargo --version' ;;
+      node) printf '%s' 'node --version && npm --version' ;;
+      go) printf '%s' 'go version' ;;
+      python|python-ml) printf '%s' 'python3 --version && python3 -m pip --version' ;;
+      docker-host) printf '%s' 'docker --version' ;;
+      k8s-lab|k8s|kubectl) printf '%s' 'kubectl version --client=true' ;;
+      *) printf '%s' 'cat /proc/1/comm | grep -Eq "dory-agent|init|systemd|tail"' ;;
+    esac
     return
   fi
   case "$recipe" in
@@ -661,7 +880,69 @@ machine_recipe_command() {
 }
 
 test_machine_recipe() {
-  [ "$CURRENT_ENGINE" = "dory" ] || return 2
+  is_dory_engine || return 2
+  if [ "$CURRENT_ENGINE" = "doryd" ]; then
+    local host_arch rootfs_default kernel rootfs memory cpus dir name state detail command recipe
+    case "$(uname -m)" in
+      arm64|aarch64) host_arch="arm64" ;;
+      *) host_arch="amd64" ;;
+    esac
+    rootfs_default="$ROOT/guest/out/initfs-$host_arch.ext4"
+    kernel="${DORYD_MACHINE_KERNEL:-${DORYD_GUEST_KERNEL:-$ROOT/guest/out/Image}}"
+    rootfs="${DORYD_MACHINE_ROOTFS:-${DORYD_GUEST_ROOTFS:-$rootfs_default}}"
+    memory="${DORYD_MACHINE_MEMORY_MB:-2048}"
+    cpus="${DORYD_MACHINE_CPUS:-2}"
+    recipe="${READINESS_MACHINE_RECIPE:-rust}"
+    dir="$WORKDIR/${ENGINE_ID}-machine-recipe"
+    name="recipe-${RUN_SLUG}"
+    command="$(machine_recipe_command "$recipe")"
+
+    [ -n "$kernel" ] && [ -f "$kernel" ] || {
+      echo "set DORYD_MACHINE_KERNEL to a bootable Linux kernel for doryd VM recipe readiness"
+      return 1
+    }
+    [ -n "$rootfs" ] && [ -f "$rootfs" ] || {
+      echo "set DORYD_MACHINE_ROOTFS to a rootfs with dory-agent as PID 1 for doryd VM recipe readiness"
+      return 1
+    }
+
+    mkdir -p "$dir"
+    dorydctl machine delete "$name" >/dev/null 2>&1 || true
+    trap 'dorydctl machine stop "$name" >/dev/null 2>&1 || true; dorydctl machine delete "$name" >/dev/null 2>&1 || true' RETURN
+
+    dorydctl machine create "$name" --kernel "$kernel" --rootfs "$rootfs" --memory-mb "$memory" --cpus "$cpus" > "$dir/create.json"
+    dorydctl machine start "$name" > "$dir/start.json"
+    state=""
+    for _ in $(seq 1 "${DORYD_MACHINE_READY_POLLS:-60}"); do
+      dorydctl machine status "$name" > "$dir/status.json"
+      state="$(json_get state < "$dir/status.json")"
+      case "$state" in
+        running) break ;;
+        failed)
+          detail="$(json_get lastError < "$dir/status.json")"
+          echo "doryd recipe machine failed: ${detail:-unknown failure}"
+          return 1
+          ;;
+      esac
+      sleep "${DORYD_MACHINE_READY_INTERVAL:-2}"
+    done
+    [ "$state" = "running" ] || {
+      cat "$dir/status.json" >&2
+      echo "doryd recipe machine did not reach running"
+      return 1
+    }
+    dorydctl machine provision "$name" --recipe "$recipe" > "$dir/provision.json"
+    dorydctl machine exec "$name" -- /bin/sh -lc "$command" > "$dir/verify.out"
+    [ -s "$dir/verify.out" ] || {
+      cat "$dir/provision.json" >&2
+      echo "doryd recipe verification produced no output"
+      return 1
+    }
+    dorydctl machine stop "$name" > "$dir/stop.json"
+    dorydctl machine delete "$name" > "$dir/delete.json"
+    trap - RETURN
+    return 0
+  fi
   local recipe="${READINESS_MACHINE_RECIPE:-rust}"
   local name="recipe-${RUN_SLUG}"
   local cid="dory-machine-$name"
@@ -712,7 +993,7 @@ test_bridge() {
 }
 
 test_dax() {
-  [ "$CURRENT_ENGINE" = "dory" ] || return 2
+  is_dory_engine || return 2
   local hv="${DORY_HV_BIN:-$ROOT/Packages/ContainerizationEngine/.build/debug/dory-hv}"
   [ -x "$hv" ] || { echo "dory-hv not found or executable: $hv"; return 1; }
   "$hv" daxprobe | grep -q "dax coherence passed"
@@ -726,7 +1007,7 @@ test_rosetta() {
 }
 
 test_guest_agent() {
-  [ "$CURRENT_ENGINE" = "dory" ] || return 2
+  is_dory_engine || return 2
   local hv="${DORY_HV_BIN:-$ROOT/Packages/ContainerizationEngine/.build/debug/dory-hv}"
   local kernel="${DORY_GUEST_KERNEL:-$ROOT/guest/out/Image}"
   local initfs="${DORY_GUEST_INITFS:-}"
@@ -796,7 +1077,7 @@ clock_sync_helper_pid() {
 }
 
 test_clock_sync() {
-  [ "$CURRENT_ENGINE" = "dory" ] || return 2
+  is_dory_engine || return 2
   local sock="${DORY_CLOCK_SYNC_AGENT_SOCK:-${DORY_AGENT_SOCK:-}}"
   local pid guest_raw guest_ns host_ns delta_ms
   [ -n "$sock" ] && [ -S "$sock" ] || { echo "set DORY_CLOCK_SYNC_AGENT_SOCK or DORY_AGENT_SOCK to a live guest agent bridge socket"; return 1; }
@@ -832,7 +1113,7 @@ PY
 }
 
 test_usb() {
-  [ "$CURRENT_ENGINE" = "dory" ] || return 2
+  is_dory_engine || return 2
   if ! "$ROOT/scripts/dory" usb ls 2>/dev/null | grep -q "$DORY_USB_TEST_BUSID"; then
     echo "device $DORY_USB_TEST_BUSID not present in 'dory usb ls'" >&2
     return 1
@@ -843,9 +1124,16 @@ test_usb() {
 }
 
 test_debug_shell() {
-  [ "$CURRENT_ENGINE" = "dory" ] || return 2
+  is_dory_engine || return 2
   DORY_DEBUG_AGENT_SOCK="$DORY_DEBUG_AGENT_SOCK" "$ROOT/scripts/dory" debug "$DORY_DEBUG_CONTAINER_ID" -- /bin/sh -c 'echo dory-debug-ok' \
     | grep -q 'dory-debug-ok'
+}
+
+test_doryd_launchd() {
+  [ "$CURRENT_ENGINE" = "doryd" ] || return 2
+  local domain="gui/$(id -u)/dev.dory.doryd"
+  launchctl print "$domain" | grep -q 'state = running'
+  launchctl print "$domain" | grep -q '"dev.dory.doryd"'
 }
 
 measure_memory() {
@@ -887,6 +1175,14 @@ run_engine() {
     return
   fi
 
+  if [ "$CURRENT_ENGINE" = "doryd" ]; then
+    run_case "$CURRENT_ENGINE" "doryd launchd MachService loaded" test_doryd_launchd
+    test_doryd_launchd >/dev/null 2>&1 || return
+  fi
+
+  run_case "$CURRENT_ENGINE" "Docker API ready" wait_for_engine_ready
+  wait_for_engine_ready >/dev/null 2>&1 || return
+
   cleanup_engine
   run_case "$CURRENT_ENGINE" "engine info / version / system df" test_engine_info
   run_case "$CURRENT_ENGINE" "pull alpine + nginx" test_pull_images
@@ -908,8 +1204,10 @@ run_engine() {
 
   if [ "$RUN_NONNATIVE_ARCH" = "1" ]; then
     run_case "$CURRENT_ENGINE" "linux/$(nonnative_guest_arch) emulation" test_nonnative_arch
+    run_case "$CURRENT_ENGINE" "linux/$(nonnative_guest_arch) BuildKit node/npm build" test_nonnative_build
   else
     skip_case "$CURRENT_ENGINE" "linux/$(nonnative_guest_arch) emulation" "disabled"
+    skip_case "$CURRENT_ENGINE" "linux/$(nonnative_guest_arch) BuildKit node/npm build" "disabled"
   fi
 
   if [ "$RUN_ONLINE" = "1" ]; then
@@ -980,7 +1278,7 @@ run_engine() {
     skip_case "$CURRENT_ENGINE" "Rosetta x86-64 machine execution" "enable with --rosetta (needs a signed dory-vm + Rosetta installed)"
   fi
 
-  if [ "$RUN_CLOCK_SYNC" = "1" ] && [ "$CURRENT_ENGINE" != "dory" ]; then
+  if [ "$RUN_CLOCK_SYNC" = "1" ] && ! is_dory_engine; then
     skip_case "$CURRENT_ENGINE" "host wake clock sync" "Dory-only"
   elif [ "$RUN_CLOCK_SYNC" = "1" ] && [ -z "${DORY_CLOCK_SYNC_AGENT_SOCK:-${DORY_AGENT_SOCK:-}}" ]; then
     skip_case "$CURRENT_ENGINE" "host wake clock sync" "set DORY_CLOCK_SYNC_AGENT_SOCK or DORY_AGENT_SOCK"

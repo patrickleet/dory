@@ -3,6 +3,12 @@
 # OrbStack, Homebrew, or `brew install container` on the user's Mac.
 #
 # Bundled payload:
+#   * Contents/Helpers/doryd     — launchd/XPC daemon that owns the engine, idle policy, networking,
+#                                   health, and Linux machine lifecycle.
+#   * Contents/Helpers/dorydctl  — diagnostic/control CLI used by readiness and support flows.
+#   * Contents/Helpers/dory-vmm  — per-machine Virtualization.framework helper, signed with
+#                                   com.apple.security.virtualization.
+#   * Contents/Helpers/dory-network-helper — local networking helper for doryd-owned domains/routes.
 #   * Contents/Helpers/dory-hv    — Dory's own Hypervisor.framework VMM (elastic memory via free-page
 #                                   reporting, SMP, journaled data disk), signed with
 #                                   com.apple.security.hypervisor. Preferred when DORY_HV_ENGINE=1.
@@ -11,6 +17,8 @@
 #   * Contents/Helpers/docker, docker-compose, kubectl — host CLIs for clean-Mac Docker/Compose/k8s.
 #   * Contents/Frameworks/libvirglrenderer.dylib, libMoltenVK.dylib — optional experimental
 #                                   Venus/Vulkan renderer payload for in-guest GPU acceleration.
+#   * Contents/Resources/dory-hv-kernel-<arch>             — raw kernel path used by doryd/dory-hv.
+#   * Contents/Resources/dory-machine-rootfs-<arch>.ext4   — raw per-machine rootfs used by dory-vmm.
 #   * Contents/Resources/dory-hv-kernel-<arch>.lzfse       — LZFSE PVH/Image kernel for dory-hv.
 #   * Contents/Resources/dory-vm-kernel-<arch>.lzfse       — LZFSE Linux kernel.
 #   * Contents/Resources/dory-vm-initfs-<arch>.ext4.lzfse  — LZFSE VM initfs.
@@ -32,7 +40,15 @@
 set -euo pipefail
 export PATH="/opt/homebrew/bin:$PATH"
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 APP="${1:?usage: bundle-engine.sh <path/to/Dory.app>}"
+case "$APP" in
+  /*) ;;
+  *) APP="$(pwd)/$APP" ;;
+esac
+cd "$REPO_ROOT"
+
 RESOURCES="$APP/Contents/Resources"
 HELPERS="$APP/Contents/Helpers"
 FRAMEWORKS="$APP/Contents/Frameworks"
@@ -41,10 +57,164 @@ SUPPORT="$HOME/Library/Application Support/com.apple.container"
 [ -d "$APP" ] || { echo "no such app bundle: $APP"; exit 1; }
 mkdir -p "$RESOURCES" "$HELPERS" "$FRAMEWORKS"
 
+find_xcode() {
+  local dev app found
+  for app in /Applications/Xcode.app /Applications/Xcode-*.app \
+             "$HOME"/Applications/Xcode*.app "$HOME"/Downloads/Xcode*.app; do
+    dev="$app/Contents/Developer"
+    [ -x "$dev/usr/bin/xcodebuild" ] && { printf '%s' "$dev"; return 0; }
+  done
+  found="$(mdfind "kMDItemCFBundleIdentifier == 'com.apple.dt.Xcode'" 2>/dev/null | head -1)"
+  [ -n "$found" ] && [ -x "$found/Contents/Developer/usr/bin/xcodebuild" ] \
+    && { printf '%s' "$found/Contents/Developer"; return 0; }
+  return 1
+}
+
+if [ -z "${DEVELOPER_DIR:-}" ]; then
+  active="$(xcode-select -p 2>/dev/null || true)"
+  need_fallback=0
+  case "$active" in
+    ""|*CommandLineTools*) need_fallback=1 ;;
+  esac
+  [ -n "$active" ] && [ -x "$active/usr/bin/xcodebuild" ] || need_fallback=1
+  if [ "$need_fallback" -eq 1 ]; then
+    if DEVELOPER_DIR="$(find_xcode)"; then
+      export DEVELOPER_DIR
+      echo "note: active xcode-select ('${active:-unset}') has no xcodebuild; using DEVELOPER_DIR=$DEVELOPER_DIR" >&2
+    else
+      echo "error: no full Xcode found. Install Xcode.app or set DEVELOPER_DIR=/path/to/Xcode.app/Contents/Developer" >&2
+      exit 1
+    fi
+  fi
+fi
+
 sign_runtime_payload() {
   local path="$1"
   codesign --force --options runtime --timestamp -s "${DORY_SIGN_ID:-Developer ID Application}" "$path" 2>/dev/null \
     || codesign --force -s - "$path"
+}
+
+sign_runtime_payload_with_entitlements() {
+  local path="$1" entitlements="$2"
+  codesign --force --options runtime --timestamp --entitlements "$entitlements" \
+    -s "${DORY_SIGN_ID:-Developer ID Application}" "$path" 2>/dev/null \
+    || codesign --force --options runtime --entitlements "$entitlements" -s - "$path" 2>/dev/null \
+    || codesign --force --entitlements "$entitlements" -s - "$path"
+}
+
+normalize_darwin_arch() {
+  case "$1" in
+    arm64|aarch64) printf '%s\n' "arm64" ;;
+    amd64|x86_64) printf '%s\n' "x86_64" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+darwin_triple_for_arch() {
+  case "$1" in
+    arm64) printf '%s\n' "arm64-apple-macosx" ;;
+    x86_64) printf '%s\n' "x86_64-apple-macosx" ;;
+    *) echo "unsupported Darwin helper arch: $1" >&2; return 1 ;;
+  esac
+}
+
+swiftpm_helper_arches() {
+  local raw arch normalized out
+  raw="${DORY_SWIFTPM_HELPER_ARCHES:-${DORY_BUNDLE_ARCHES:-arm64 amd64}}"
+  out=""
+  for arch in $raw; do
+    normalized="$(normalize_darwin_arch "$arch")"
+    case " $out " in
+      *" $normalized "*) ;;
+      *) out="${out:+$out }$normalized" ;;
+    esac
+  done
+  printf '%s\n' "$out"
+}
+
+host_cli_arches() {
+  local raw arch normalized out
+  raw="${DORY_HOST_CLI_ARCHES:-${DORY_BUNDLE_ARCHES:-arm64 amd64}}"
+  out=""
+  for arch in $raw; do
+    normalized="$(normalize_darwin_arch "$arch")"
+    case " $out " in
+      *" $normalized "*) ;;
+      *) out="${out:+$out }$normalized" ;;
+    esac
+  done
+  printf '%s\n' "$out"
+}
+
+darwin_download_arch() {
+  case "$1" in
+    arm64) printf '%s\n' "arm64" ;;
+    x86_64) printf '%s\n' "amd64" ;;
+    *) echo "unsupported Darwin CLI arch: $1" >&2; return 1 ;;
+  esac
+}
+
+docker_download_arch() {
+  case "$1" in
+    arm64) printf '%s\n' "aarch64" ;;
+    x86_64) printf '%s\n' "x86_64" ;;
+    *) echo "unsupported Docker CLI arch: $1" >&2; return 1 ;;
+  esac
+}
+
+macho_has_arches() {
+  local file="$1" expected="$2" actual arch
+  [ -x "$file" ] || return 1
+  actual="$(lipo -archs "$file" 2>/dev/null || true)"
+  [ -n "$actual" ] || return 1
+  for arch in $expected; do
+    case " $actual " in
+      *" $arch "*) ;;
+      *) return 1 ;;
+    esac
+  done
+  return 0
+}
+
+build_swiftpm_product_for_arch() {
+  local package="$1" configuration="$2" product="$3" arch="$4" package_abs scratch triple bin_path
+  package_abs="$(cd "$package" && pwd)"
+  scratch="$package_abs/.build/bundle-$configuration-$arch"
+  triple="$(darwin_triple_for_arch "$arch")"
+  swift build --package-path "$package_abs" -c "$configuration" --triple "$triple" \
+    --scratch-path "$scratch" --product "$product" >&2
+  bin_path="$(swift build --package-path "$package_abs" -c "$configuration" --triple "$triple" \
+    --scratch-path "$scratch" --show-bin-path 2>/dev/null)"
+  printf '%s/%s\n' "$bin_path" "$product"
+}
+
+bundle_swiftpm_executable() {
+  local package="$1" configuration="$2" product="$3" destination="$4" entitlements="${5:-}"
+  local arch bin arches arch_info
+  local built=()
+
+  arches="$(swiftpm_helper_arches)"
+  [ -n "$arches" ] || { echo "    ERROR: no SwiftPM helper architectures configured" >&2; exit 1; }
+  for arch in $arches; do
+    bin="$(build_swiftpm_product_for_arch "$package" "$configuration" "$product" "$arch")"
+    [ -x "$bin" ] || { echo "    ERROR: $product helper was not produced for $arch" >&2; exit 1; }
+    built+=("$bin")
+  done
+
+  if [ "${#built[@]}" -eq 1 ]; then
+    install -m0755 "${built[0]}" "$destination"
+  else
+    lipo -create "${built[@]}" -output "$destination"
+    chmod 0755 "$destination"
+  fi
+
+  if [ -n "$entitlements" ]; then
+    sign_runtime_payload_with_entitlements "$destination" "$entitlements"
+  else
+    sign_runtime_payload "$destination"
+  fi
+  arch_info="$(lipo -archs "$destination" 2>/dev/null || true)"
+  echo "    bundled Helpers/$(basename "$destination")${arch_info:+ ($arch_info)}"
 }
 
 fetch_url() {
@@ -196,6 +366,15 @@ warn_or_fail_optional_venus() {
   echo "    WARNING: $message"
 }
 
+warn_or_fail_missing_bundle_asset() {
+  local message="$1"
+  if [ "${DORY_REQUIRE_BUNDLE_ASSETS:-0}" = "1" ]; then
+    echo "    ERROR: $message" >&2
+    exit 1
+  fi
+  echo "    WARNING: $message"
+}
+
 bundle_venus_renderer() {
   local virgl icd molten bundled_icd dylib
   echo "==> Bundling experimental Venus GPU renderer (virglrenderer + MoltenVK)…"
@@ -264,7 +443,7 @@ inject_dory_agent_into_initfs() {
   local src="$1" agent="$2" out="$3" debugfs_bin init_tmp startup_tmp
   INITFS_TO_BUNDLE="$src"
   [ "${DORY_SKIP_AGENT_INJECT:-0}" = "1" ] && return 0
-  [ -f "$agent" ] || { echo "    WARNING: guest agent not found at $agent — run guest/agent/build.sh before bundling for Track 0 RPC"; return 0; }
+  [ -f "$agent" ] || { echo "    WARNING: guest agent not found at $agent — run guest/initfs/build.sh to build the Rust dory-agent before bundling"; return 0; }
   if ! debugfs_bin="$(find_debugfs)"; then
     echo "    WARNING: debugfs not found — install e2fsprogs or set DORY_SKIP_AGENT_INJECT=1; bundling initfs without dory-agent"
     return 0
@@ -386,6 +565,90 @@ find_toolbox_binary() {
   return 1
 }
 
+write_doryd_launch_agent() {
+  local plist doryd vmm hv gvproxy
+  plist="$RESOURCES/dev.dory.doryd.plist"
+  doryd="$HELPERS/doryd"
+  vmm="$HELPERS/dory-vmm"
+  hv="$HELPERS/dory-hv"
+  gvproxy="$HELPERS/gvproxy"
+  cat > "$plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.dory.doryd</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$doryd</string>
+    </array>
+    <key>MachServices</key>
+    <dict>
+        <key>dev.dory.doryd</key>
+        <true/>
+    </dict>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DORYD_VMM_HELPER</key>
+        <string>$vmm</string>
+        <key>DORYD_HV_HELPER</key>
+        <string>$hv</string>
+        <key>DORYD_GVPROXY</key>
+        <string>$gvproxy</string>
+        <key>DORYD_NETWORKING</key>
+        <string>1</string>
+        <key>DORYD_IDLE_SLEEP_AFTER_SECONDS</key>
+        <string>300</string>
+        <key>DORYD_DNS_PORT</key>
+        <string>15353</string>
+        <key>DORYD_HTTP_PROXY_PORT</key>
+        <string>8080</string>
+        <key>DORYD_HTTPS_PROXY_PORT</key>
+        <string>8443</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/doryd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/doryd.log</string>
+</dict>
+</plist>
+PLIST
+  plutil -lint "$plist" >/dev/null
+  echo "    wrote Resources/dev.dory.doryd.plist"
+}
+
+bundle_doryd_helpers() {
+  local configuration entitlements product helper
+  [ "${DORY_BUNDLE_DORYD:-1}" = "1" ] || { echo "==> DORY_BUNDLE_DORYD=0: skipping doryd helper bundling"; return 0; }
+  [ -f "dory-core-swift/Package.swift" ] || { echo "    ERROR: dory-core-swift/Package.swift missing; cannot build doryd helpers" >&2; exit 1; }
+  configuration="${DORY_DORYD_HELPER_CONFIGURATION:-release}"
+
+  entitlements="$(mktemp "${TMPDIR:-/tmp}/dory-vmm-entitlements.XXXXXX")"
+  cat > "$entitlements" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>com.apple.security.virtualization</key><true/></dict></plist>
+PLIST
+
+  echo "==> Building + signing doryd launchd helpers ($configuration, arches: $(swiftpm_helper_arches))…"
+  for product in doryd dorydctl dory-vmm dory-network-helper; do
+    helper="$HELPERS/$product"
+    if [ "$product" = "dory-vmm" ]; then
+      bundle_swiftpm_executable "dory-core-swift" "$configuration" "$product" "$helper" "$entitlements"
+    else
+      bundle_swiftpm_executable "dory-core-swift" "$configuration" "$product" "$helper"
+    fi
+  done
+  rm -f "$entitlements"
+}
+
 inject_debug_toolbox_into_initfs() {
   local image="$1" arch="$2" debugfs_bin busybox curl_bin strace_bin upper_arch
   [ "${DORY_SKIP_TOOLBOX_INJECT:-0}" = "1" ] && return 0
@@ -433,22 +696,19 @@ inject_debug_toolbox_into_initfs() {
   fi
 }
 
+bundle_doryd_helpers
+
 echo "==> Building + signing the in-process VM engine helper (dory-vm)…"
 PKG="$(dirname "$0")/../Packages/ContainerizationEngine"
 if [ -d "$PKG" ]; then
-  ( cd "$PKG" && swift build -c release --product dory-vmboot )
-  HELPER_BIN="$(cd "$PKG" && swift build -c release --product dory-vmboot --show-bin-path 2>/dev/null)/dory-vmboot"
-  [ -x "$HELPER_BIN" ] || HELPER_BIN="$(find "$PKG/.build" -name dory-vmboot -type f -ipath '*/release/*' -not -path '*dSYM*' 2>/dev/null | head -1)"
-  cat > /tmp/dory-vm.entitlements <<'PLIST'
+  DORY_VM_ENTITLEMENTS="$(mktemp "${TMPDIR:-/tmp}/dory-vm-entitlements.XXXXXX")"
+  cat > "$DORY_VM_ENTITLEMENTS" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict><key>com.apple.security.virtualization</key><true/></dict></plist>
 PLIST
-  cp "$HELPER_BIN" "$HELPERS/dory-vm"
-  codesign --force --options runtime --entitlements /tmp/dory-vm.entitlements \
-    -s "${DORY_SIGN_ID:-Developer ID Application}" "$HELPERS/dory-vm" 2>/dev/null \
-    || codesign --force --entitlements /tmp/dory-vm.entitlements -s - "$HELPERS/dory-vm"
-  echo "    bundled Helpers/dory-vm (signed with com.apple.security.virtualization)"
+  bundle_swiftpm_executable "$PKG" release dory-vmboot "$HELPERS/dory-vm" "$DORY_VM_ENTITLEMENTS"
+  rm -f "$DORY_VM_ENTITLEMENTS"
 fi
 
 echo "==> Building + signing the Hypervisor.framework VM engine (dory-hv)…"
@@ -456,23 +716,14 @@ echo "==> Building + signing the Hypervisor.framework VM engine (dory-hv)…"
 # It needs only the unrestricted com.apple.security.hypervisor entitlement (no vm.networking).
 # The provisioner prefers it when DORY_HV_ENGINE=1 and it is present in Helpers.
 if [ -d "$PKG" ]; then
-  ( cd "$PKG" && swift build -c release --product dory-hv )
-  HV_BIN="$(cd "$PKG" && swift build -c release --product dory-hv --show-bin-path 2>/dev/null)/dory-hv"
-  [ -x "$HV_BIN" ] || HV_BIN="$(find "$PKG/.build" -name dory-hv -type f -ipath '*/release/*' -not -path '*dSYM*' 2>/dev/null | head -1)"
-  if [ -n "$HV_BIN" ]; then
-    cat > /tmp/dory-hv.entitlements <<'PLIST'
+  DORY_HV_ENTITLEMENTS="$(mktemp "${TMPDIR:-/tmp}/dory-hv-entitlements.XXXXXX")"
+  cat > "$DORY_HV_ENTITLEMENTS" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>
 PLIST
-    cp "$HV_BIN" "$HELPERS/dory-hv"
-    codesign --force --options runtime --timestamp --entitlements /tmp/dory-hv.entitlements \
-      -s "${DORY_SIGN_ID:-Developer ID Application}" "$HELPERS/dory-hv" 2>/dev/null \
-      || codesign --force --entitlements /tmp/dory-hv.entitlements -s - "$HELPERS/dory-hv"
-    echo "    bundled Helpers/dory-hv (signed with com.apple.security.hypervisor)"
-  else
-    echo "    WARNING: dory-hv build produced no binary; skipping the HV engine"
-  fi
+  bundle_swiftpm_executable "$PKG" release dory-hv "$HELPERS/dory-hv" "$DORY_HV_ENTITLEMENTS"
+  rm -f "$DORY_HV_ENTITLEMENTS"
 fi
 
 echo "==> Bundling gvproxy (userspace networking for the dory-hv engine)…"
@@ -484,7 +735,11 @@ if [ -z "$GVPROXY_SRC" ]; then
   for cand in /opt/homebrew/opt/podman/libexec/podman/gvproxy \
               /usr/local/opt/podman/libexec/podman/gvproxy \
               "$(command -v gvproxy 2>/dev/null)"; do
-    [ -n "$cand" ] && [ -x "$cand" ] && { GVPROXY_SRC="$cand"; break; }
+    [ -n "$cand" ] && [ -x "$cand" ] || continue
+    if macho_has_arches "$cand" "$(host_cli_arches)"; then
+      GVPROXY_SRC="$cand"; break
+    fi
+    echo "    note: skipping $cand; missing release architectures ($(host_cli_arches))"
   done
 fi
 if [ -z "$GVPROXY_SRC" ] || [ ! -x "$GVPROXY_SRC" ]; then
@@ -496,6 +751,10 @@ if [ -z "$GVPROXY_SRC" ] || [ ! -x "$GVPROXY_SRC" ]; then
   fi
 fi
 if [ -n "$GVPROXY_SRC" ] && [ -x "$GVPROXY_SRC" ]; then
+  if ! macho_has_arches "$GVPROXY_SRC" "$(host_cli_arches)"; then
+    echo "    ERROR: gvproxy at $GVPROXY_SRC is missing release architectures ($(host_cli_arches))" >&2
+    exit 1
+  fi
   cp "$GVPROXY_SRC" "$HELPERS/gvproxy"
   codesign --force --options runtime --timestamp -s "${DORY_SIGN_ID:-Developer ID Application}" "$HELPERS/gvproxy" 2>/dev/null \
     || codesign --force -s - "$HELPERS/gvproxy"
@@ -513,42 +772,76 @@ fi
 
 echo "==> Bundling the host kubectl + docker CLIs (so k8s and the docker CLI need no separate install)…"
 # Host-side CLIs Dory shells out to: kubectl (Kubernetes browser/apply/scale/exec) and docker (the
-# optional `docker` context). Bundling them means a fresh download needs nothing installed. Prefer a
-# local copy on the build machine, else fetch the darwin/arm64 binary. HostTools resolves the
-# bundled copy first at runtime.
-ARCH="$(uname -m)"; [ "$ARCH" = "x86_64" ] && KARCH="amd64" || KARCH="arm64"
-[ "$ARCH" = "x86_64" ] && DARCH="x86_64" || DARCH="aarch64"
+# optional `docker` context). Bundling them means a fresh download needs nothing installed.
+# Universal releases must carry CLIs that run on both Apple silicon and Intel Macs; fetch each
+# Darwin architecture and lipo them into one helper.
 
-bundle_cli() {  # name  local-fallback-path  download-url
-  local name="$1" local_src="$2" url="$3" tmp="/tmp/dory-cli-$1"
-  if [ -x "$local_src" ]; then cp "$local_src" "$HELPERS/$name"
-  elif command -v "$name" >/dev/null 2>&1; then cp "$(command -v "$name")" "$HELPERS/$name"
-  elif [ -n "$url" ]; then fetch_url "$url" "$tmp" 2>/dev/null && install -m0755 "$tmp" "$HELPERS/$name" && rm -f "$tmp"; fi
-  if [ -x "$HELPERS/$name" ]; then
-    codesign --force --options runtime --timestamp -s "${DORY_SIGN_ID:-Developer ID Application}" "$HELPERS/$name" 2>/dev/null \
-      || codesign --force -s - "$HELPERS/$name"
-    echo "    bundled Helpers/$name"
-  else
-    echo "    WARNING: could not bundle $name — the feature will need a system install."
-  fi
+download_host_cli_for_arch() {
+  local name="$1" arch="$2" out="$3" karch darch tgz work
+  case "$name" in
+    kubectl)
+      karch="$(darwin_download_arch "$arch")"
+      fetch_url "https://dl.k8s.io/release/${KVER}/bin/darwin/${karch}/kubectl" "$out"
+      chmod 0755 "$out"
+      ;;
+    docker)
+      darch="$(docker_download_arch "$arch")"
+      tgz="$(mktemp "${TMPDIR:-/tmp}/dory-docker-$arch.XXXXXX.tgz")"
+      work="$(mktemp -d "${TMPDIR:-/tmp}/dory-docker-$arch.XXXXXX")"
+      fetch_url "https://download.docker.com/mac/static/stable/${darch}/docker-${DOCKER_CLI_VERSION}.tgz" "$tgz"
+      tar -xzf "$tgz" -C "$work" docker/docker
+      install -m0755 "$work/docker/docker" "$out"
+      rm -rf "$tgz" "$work"
+      ;;
+    docker-compose)
+      darch="$(docker_download_arch "$arch")"
+      fetch_url "https://github.com/docker/compose/releases/download/${COMPOSE_VER}/docker-compose-darwin-${darch}" "$out"
+      chmod 0755 "$out"
+      ;;
+    *)
+      echo "unknown host CLI: $name" >&2
+      return 1
+      ;;
+  esac
 }
 
-KVER="$(fetch_url_stdout https://dl.k8s.io/release/stable.txt 2>/dev/null || echo v1.31.0)"
-bundle_cli kubectl "" "https://dl.k8s.io/release/${KVER}/bin/darwin/${KARCH}/kubectl"
-# The static docker CLI tarball contains a single `docker` binary.
-if [ ! -x "$HELPERS/docker" ]; then
-  DOCKER_TGZ="/tmp/dory-docker.tgz"
-  if fetch_url "https://download.docker.com/mac/static/stable/${DARCH}/docker-27.5.1.tgz" "$DOCKER_TGZ" 2>/dev/null; then
-    tar -xzf "$DOCKER_TGZ" -C /tmp docker/docker 2>/dev/null && install -m0755 /tmp/docker/docker "$HELPERS/docker" && rm -rf "$DOCKER_TGZ" /tmp/docker
+bundle_universal_host_cli() {
+  local name="$1" destination="$HELPERS/$1" tmp arch bin arches arch_info
+  local built=()
+  arches="$(host_cli_arches)"
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/dory-$name.XXXXXX")"
+  for arch in $arches; do
+    bin="$tmp/$name-$arch"
+    if ! download_host_cli_for_arch "$name" "$arch" "$bin"; then
+      rm -rf "$tmp"
+      if [ "${DORY_ALLOW_MISSING_HOST_CLI:-0}" = "1" ]; then
+        echo "    WARNING: could not bundle $name for $arch — feature will need a system install on that architecture."
+        return 0
+      fi
+      echo "    ERROR: could not bundle $name for $arch; set DORY_ALLOW_MISSING_HOST_CLI=1 only for development artifacts." >&2
+      exit 1
+    fi
+    built+=("$bin")
+  done
+
+  if [ "${#built[@]}" -eq 1 ]; then
+    install -m0755 "${built[0]}" "$destination"
+  else
+    lipo -create "${built[@]}" -output "$destination"
+    chmod 0755 "$destination"
   fi
-fi
-bundle_cli docker "" ""
-# The docker compose v2 plugin, so `docker compose` works on the host with nothing else installed.
-if [ ! -x "$HELPERS/docker-compose" ]; then
-  COMPOSE_VER="v2.32.4"
-  fetch_url "https://github.com/docker/compose/releases/download/${COMPOSE_VER}/docker-compose-darwin-${DARCH}" "$HELPERS/docker-compose" 2>/dev/null && chmod +x "$HELPERS/docker-compose"
-fi
-bundle_cli docker-compose "" ""
+  rm -rf "$tmp"
+  sign_runtime_payload "$destination"
+  arch_info="$(lipo -archs "$destination" 2>/dev/null || true)"
+  echo "    bundled Helpers/$name${arch_info:+ ($arch_info)}"
+}
+
+KVER="${DORY_KUBECTL_VERSION:-$(fetch_url_stdout https://dl.k8s.io/release/stable.txt 2>/dev/null || echo v1.31.0)}"
+DOCKER_CLI_VERSION="${DORY_DOCKER_CLI_VERSION:-27.5.1}"
+COMPOSE_VER="${DORY_COMPOSE_VERSION:-v2.32.4}"
+bundle_universal_host_cli kubectl
+bundle_universal_host_cli docker
+bundle_universal_host_cli docker-compose
 
 # The `dory` CLI + its Python helpers, so the in-app Health panel and `dory doctor`/`dory compat`/
 # `dory idle` work on a clean Mac with nothing installed. They must sit together in Helpers so the
@@ -575,6 +868,14 @@ done
 
 host_guest_arch() {
   [ "$(uname -m)" = "x86_64" ] && printf '%s\n' "amd64" || printf '%s\n' "arm64"
+}
+
+native_guest_arch() {
+  case "${DORY_BUNDLE_NATIVE_ARCH:-$(host_guest_arch)}" in
+    arm64|aarch64) printf '%s\n' "arm64" ;;
+    amd64|x86_64) printf '%s\n' "amd64" ;;
+    *) host_guest_arch ;;
+  esac
 }
 
 env_for_arch() {
@@ -650,20 +951,52 @@ engine_rootfs_source() {
   return 1
 }
 
+host_darwin_arch() {
+  normalize_darwin_arch "$(uname -m)"
+}
+
+lzfse_helper_path() {
+  local helper host_arch
+  if [ -n "${DORY_LZFSE_HELPER:-}" ] && [ -x "$DORY_LZFSE_HELPER" ]; then
+    printf '%s\n' "$DORY_LZFSE_HELPER"
+    return 0
+  fi
+
+  host_arch="$(host_darwin_arch)"
+  helper="$HELPERS/dory-hv"
+  if macho_has_arches "$helper" "$host_arch"; then
+    printf '%s\n' "$helper"
+    return 0
+  fi
+
+  if [ -n "${LZFSE_HELPER_CACHE:-}" ] && [ -x "$LZFSE_HELPER_CACHE" ]; then
+    printf '%s\n' "$LZFSE_HELPER_CACHE"
+    return 0
+  fi
+
+  [ -d "$PKG" ] || { echo "    ERROR: $PKG missing; cannot build a host dory-hv compressor" >&2; exit 1; }
+  echo "    building host-arch dory-hv for asset compression ($host_arch)" >&2
+  LZFSE_HELPER_CACHE="$(build_swiftpm_product_for_arch "$PKG" release dory-hv "$host_arch")"
+  [ -x "$LZFSE_HELPER_CACHE" ] || { echo "    ERROR: host dory-hv compressor was not produced" >&2; exit 1; }
+  printf '%s\n' "$LZFSE_HELPER_CACHE"
+}
+
 compress_asset() {  # raw_src  out.lzfse
-  [ -x "$HELPERS/dory-hv" ] || { echo "    ERROR: $HELPERS/dory-hv missing; cannot compress engine assets" >&2; exit 1; }
-  "$HELPERS/dory-hv" lzfse compress "$1" "$2"
+  "$(lzfse_helper_path)" lzfse compress "$1" "$2"
 }
 
 bundle_hv_kernel_for_arch() {
-  local arch="$1" kernel_src kernel_out
+  local arch="$1" kernel_src kernel_raw kernel_out
   kernel_src="$(hv_kernel_source_for_arch "$arch" || true)"
+  kernel_raw="$RESOURCES/dory-hv-kernel-$arch"
   kernel_out="$RESOURCES/dory-hv-kernel-$arch.lzfse"
   if [ -n "$kernel_src" ] && [ -f "$kernel_src" ]; then
+    install -m0644 "$kernel_src" "$kernel_raw"
+    echo "    bundled Resources/$(basename "$kernel_raw") ($(du -h "$kernel_raw" | awk '{print $1}'))"
     compress_asset "$kernel_src" "$kernel_out"
     echo "    bundled Resources/$(basename "$kernel_out") ($(du -h "$kernel_out" | awk '{print $1}'), from $(du -h "$kernel_src" | awk '{print $1}'))"
   else
-    echo "    WARNING: no $arch dory-hv kernel found; run guest/kernel/build.sh $arch or set $(env_for_arch DORY_HV_KERNEL "$arch")"
+    warn_or_fail_missing_bundle_asset "no $arch dory-hv kernel found; run guest/kernel/build.sh $arch or set $(env_for_arch DORY_HV_KERNEL "$arch")"
   fi
 }
 
@@ -684,17 +1017,18 @@ bundle_hv_gpu_kernel_for_arch() {
 }
 
 bundle_guest_assets_for_arch() {
-  local arch="$1" kernel_src initfs_src kernel_out initfs_out agent qemu_guest_arch qemu_static
+  local arch="$1" kernel_src initfs_src kernel_out initfs_raw initfs_out agent qemu_guest_arch qemu_static
   kernel_src="$(kernel_source_for_arch "$arch" || true)"
   initfs_src="$(initfs_source_for_arch "$arch" || true)"
   kernel_out="$RESOURCES/dory-vm-kernel-$arch.lzfse"
+  initfs_raw="$RESOURCES/dory-machine-rootfs-$arch.ext4"
   initfs_out="$RESOURCES/dory-vm-initfs-$arch.ext4.lzfse"
 
   if [ -n "$kernel_src" ] && [ -f "$kernel_src" ]; then
     compress_asset "$kernel_src" "$kernel_out"
     echo "    bundled Resources/$(basename "$kernel_out") ($(du -h "$kernel_out" | awk '{print $1}'), from $(du -h "$kernel_src" | awk '{print $1}'))"
   else
-    echo "    WARNING: no $arch kernel found; run guest/kernel/build.sh $arch or set $(env_for_arch DORY_KERNEL "$arch")"
+    warn_or_fail_missing_bundle_asset "no $arch kernel found; run guest/kernel/build.sh $arch or set $(env_for_arch DORY_KERNEL "$arch")"
   fi
 
   INITFS_TO_BUNDLE="$initfs_src"
@@ -710,11 +1044,13 @@ bundle_guest_assets_for_arch() {
       echo "    WARNING: qemu static interpreter for $qemu_guest_arch not found; non-native binfmt will rely on runtime fallback"
     fi
     inject_debug_toolbox_into_initfs "$INITFS_TO_BUNDLE" "$arch"
+    install -m0644 "$INITFS_TO_BUNDLE" "$initfs_raw"
+    echo "    bundled Resources/$(basename "$initfs_raw") ($(du -h "$initfs_raw" | awk '{print $1}'))"
     compress_asset "$INITFS_TO_BUNDLE" "$initfs_out"
     echo "    bundled Resources/$(basename "$initfs_out") ($(du -h "$initfs_out" | awk '{print $1}'), from $(du -h "$INITFS_TO_BUNDLE" | awk '{print $1}'))"
     [ "$INITFS_TO_BUNDLE" = "$initfs_src" ] || rm -f "$INITFS_TO_BUNDLE"
   else
-    echo "    WARNING: no $arch initfs found; run guest/initfs/build.sh or set $(env_for_arch DORY_INITFS "$arch")"
+    warn_or_fail_missing_bundle_asset "no $arch initfs found; run guest/initfs/build.sh or set $(env_for_arch DORY_INITFS "$arch")"
   fi
 }
 
@@ -726,7 +1062,7 @@ bundle_guest_agent_for_arch() {
     install -m0755 "$agent_src" "$agent_out"
     echo "    bundled Resources/$(basename "$agent_out") ($(du -h "$agent_out" | awk '{print $1}'))"
   else
-    echo "    WARNING: no $arch dory-agent found; run guest/agent/build.sh or set $(env_for_arch DORY_GUEST_AGENT "$arch")"
+    warn_or_fail_missing_bundle_asset "no $arch dory-agent found; run guest/initfs/build.sh $arch or set $(env_for_arch DORY_GUEST_AGENT "$arch")"
   fi
 }
 
@@ -744,12 +1080,18 @@ if [ -n "$ENGINE_ROOTFS_SRC" ]; then
   compress_asset "$ENGINE_ROOTFS_SRC" "$ENGINE_ROOTFS_OUT"
   echo "    bundled Resources/$(basename "$ENGINE_ROOTFS_OUT") ($(du -h "$ENGINE_ROOTFS_OUT" | awk '{print $1}'), from $(du -h "$ENGINE_ROOTFS_SRC" | awk '{print $1}'))"
 else
-  echo "    WARNING: no prepared engine rootfs found; this development bundle will fetch docker:dind internally on first boot"
+  warn_or_fail_missing_bundle_asset "no prepared engine rootfs found; this bundle would fetch docker:dind internally on first boot"
 fi
 
-HOST_GUEST_ARCH="$(host_guest_arch)"
+HOST_GUEST_ARCH="$(native_guest_arch)"
 if [ -f "$RESOURCES/dory-hv-kernel-$HOST_GUEST_ARCH.lzfse" ]; then
   ln -sf "dory-hv-kernel-$HOST_GUEST_ARCH.lzfse" "$RESOURCES/dory-hv-kernel.lzfse"
+fi
+if [ -f "$RESOURCES/dory-hv-kernel-$HOST_GUEST_ARCH" ]; then
+  ln -sf "dory-hv-kernel-$HOST_GUEST_ARCH" "$RESOURCES/dory-hv-kernel"
+fi
+if [ -f "$RESOURCES/dory-machine-rootfs-$HOST_GUEST_ARCH.ext4" ]; then
+  ln -sf "dory-machine-rootfs-$HOST_GUEST_ARCH.ext4" "$RESOURCES/dory-machine-rootfs.ext4"
 fi
 if [ -f "$RESOURCES/dory-vm-kernel-$HOST_GUEST_ARCH.lzfse" ]; then
   ln -sf "dory-vm-kernel-$HOST_GUEST_ARCH.lzfse" "$RESOURCES/dory-vm-kernel.lzfse"
@@ -757,6 +1099,8 @@ fi
 if [ -f "$RESOURCES/dory-vm-initfs-$HOST_GUEST_ARCH.ext4.lzfse" ]; then
   ln -sf "dory-vm-initfs-$HOST_GUEST_ARCH.ext4.lzfse" "$RESOURCES/dory-vm-initfs.ext4.lzfse"
 fi
+
+write_doryd_launch_agent
 
 if [ "${DORY_BUNDLE_LEGACY:-0}" = "1" ]; then
   echo "==> DORY_BUNDLE_LEGACY=1: injecting the heavy offline payload (image tar + container toolchain)…"

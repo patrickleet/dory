@@ -121,11 +121,14 @@ not need a separate Docker install.
 
 ### Pick your flavor
 
-Every release ships three artifacts, so you install only what you need:
+Every release ships native app artifacts, so you install only what you need:
 
 | Asset | What it is |
 |---|---|
-| `Dory-x.y.z.dmg` / `.zip` | **Full app** with Dory's bundled engine — zero prerequisites, works on a clean Mac |
+| `Dory-x.y.z-arm64.dmg` / `.zip` | **Full app** optimized for Apple silicon — zero prerequisites, works on a clean Mac |
+| `Dory-x.y.z-x86_64.dmg` / `.zip` | **Full app** optimized for Intel Macs — zero prerequisites, works on a clean Mac |
+| `Dory-x.y.z-universal.dmg` / `.zip` | **Full app** for both Apple silicon and Intel |
+| `Dory-x.y.z.dmg` / `.zip` | Compatibility alias for the universal build, used by the Homebrew cask |
 | `Dory-x.y.z-lite.zip` | **App only** (~6 MB) — front an engine you already run (Colima, Docker Desktop, OrbStack, Rancher Desktop, Podman) |
 | `dory-engine-x.y.z-arm64.tar.gz` | **Headless engine runtime**, no GUI — `./dory-engine start`, then `docker context use dory-engine`. Colima-style |
 

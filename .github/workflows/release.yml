@@ -11,9 +11,9 @@ name: Release
 #   NOTARY_TEAM_ID               Apple Developer Team ID
 #   NOTARY_APPLE_PASSWORD        app-specific password for that Apple ID
 #
-# NOTE: Dory targets macOS 15+ and releases as a universal Intel + Apple silicon app. Engine-bundled
-# releases still need the guest assets present on the runner; set BUNDLE_ENGINE=1 only on a runner
-# that has built or fetched those assets.
+# NOTE: Dory targets macOS 15+ and releases as Apple-silicon, Intel, and universal downloads.
+# Engine-bundled releases still need the guest assets present on the runner; set BUNDLE_ENGINE=1
+# only on a runner that has built or fetched those assets.
 
 on:
   push:
@@ -36,6 +36,10 @@ jobs:
       version: ${{ steps.ver.outputs.version }}
       sha256: ${{ steps.build.outputs.sha256 }}
       dmg: ${{ steps.build.outputs.dmg }}
+      zip: ${{ steps.build.outputs.zip }}
+      zip_arm64: ${{ steps.build.outputs.zip_arm64 }}
+      zip_x86_64: ${{ steps.build.outputs.zip_x86_64 }}
+      zip_universal: ${{ steps.build.outputs.zip_universal }}
     steps:
       - uses: actions/checkout@v4
 
@@ -81,6 +85,7 @@ jobs:
           # Self-contained build (bundles helper binaries plus kernel/initfs assets). Hosted CI can
           # build the universal app; set BUNDLE_ENGINE=1 only on a runner with guest assets available.
           DORY_BUNDLE_ENGINE: ${{ vars.BUNDLE_ENGINE || '0' }}
+          DORY_RELEASE_VARIANTS: ${{ vars.RELEASE_VARIANTS || 'arm64 x86_64 universal' }}
         run: scripts/release.sh "${{ steps.ver.outputs.version }}" "${{ github.run_number }}"
 
       - name: Publish GitHub Release
@@ -89,22 +94,32 @@ jobs:
           tag_name: v${{ steps.ver.outputs.version }}
           name: Dory ${{ steps.ver.outputs.version }}
           files: |
+            ${{ steps.build.outputs.zip_arm64 }}
+            ${{ steps.build.outputs.zip_x86_64 }}
+            ${{ steps.build.outputs.zip_universal }}
             ${{ steps.build.outputs.zip }}
+            ${{ steps.build.outputs.dmg_arm64 }}
+            ${{ steps.build.outputs.dmg_x86_64 }}
+            ${{ steps.build.outputs.dmg_universal }}
             ${{ steps.build.outputs.dmg }}
             ${{ steps.build.outputs.lite }}
             ${{ steps.build.outputs.runtime }}
           generate_release_notes: true
           body: |
             Native, lightweight Docker & Linux containers, a free, open-source alternative to
-            OrbStack and Docker Desktop. Universal for Intel and Apple silicon, macOS 15+.
+            OrbStack and Docker Desktop. Optimized downloads for Apple silicon and Intel, plus
+            a universal build, macOS 15+.
             See the release notes and COMPATIBILITY.md for the current built-in engine tier on
             each Mac architecture.
 
-            **Pick your flavor**
+            **Pick your Mac build**
 
             | Asset | What it is |
             |---|---|
-            | `Dory-${{ steps.ver.outputs.version }}.dmg` / `.zip` | Full app with Dory's bundled engine — zero prerequisites |
+            | `Dory-${{ steps.ver.outputs.version }}-arm64.dmg` / `.zip` | Full app optimized for Apple silicon |
+            | `Dory-${{ steps.ver.outputs.version }}-x86_64.dmg` / `.zip` | Full app optimized for Intel Macs |
+            | `Dory-${{ steps.ver.outputs.version }}-universal.dmg` / `.zip` | Full app that runs on both Apple silicon and Intel |
+            | `Dory-${{ steps.ver.outputs.version }}.dmg` / `.zip` | Compatibility alias for the universal build |
             | `Dory-${{ steps.ver.outputs.version }}-lite.zip` | App only (~6 MB) — front an engine you already run (Colima, Docker Desktop, OrbStack, Rancher, Podman) via Settings → Engine Backend |
             | `dory-engine-${{ steps.ver.outputs.version }}-arm64.tar.gz` | Headless engine runtime, no GUI — `./dory-engine start`, then `docker context use dory-engine` |
 
@@ -114,10 +129,10 @@ jobs:
             brew install --cask Augani/dory/dory
             ```
 
-            …or download `Dory-${{ steps.ver.outputs.version }}.dmg` below and drag Dory to Applications.
+            …or download the matching `.dmg` below and drag Dory to Applications.
 
             ```
-            zip sha256: ${{ steps.build.outputs.sha256 }}
+            universal zip sha256: ${{ steps.build.outputs.sha256 }}
             ```
 
   # Keeps the Homebrew cask in this repo (the tap) current after every release.

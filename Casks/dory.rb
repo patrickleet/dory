@@ -9,9 +9,10 @@ cask "dory" do
   desc "Lightweight Docker and Linux container runtime"
   homepage "https://github.com/Augani/dory"
 
-  # Universal binary (arm64 + x86_64), minimum macOS 14 (Sonoma). Dory's built-in shared-VM
-  # engine needs macOS 15 (Sequoia) or later; on macOS 14 Dory runs against any Docker-compatible
-  # engine. The engine is bundled when release assets are available.
+  # The cask intentionally follows the unsuffixed universal artifact. GitHub releases also publish
+  # smaller arm64 and x86_64 downloads for users who want a platform-optimized app. Dory's built-in
+  # shared-VM engine needs macOS 15 (Sequoia) or later; on macOS 14 Dory runs against any
+  # Docker-compatible engine. The engine is bundled when release assets are available.
   depends_on macos: :sonoma
 
   app "Dory.app"

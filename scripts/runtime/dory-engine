@@ -19,7 +19,17 @@ STATE="$HOME/.dory"
 SOCK="$STATE/engine.sock"
 PIDFILE="$STATE/engine-cli.pid"
 LOGFILE="$STATE/engine.log"
-KERNEL="$STATE/vm/dory-hv-kernel-arm64"
+if [ "$(uname -m)" = "x86_64" ]; then
+  GUEST_ARCH="amd64"
+else
+  GUEST_ARCH="arm64"
+fi
+KERNEL="$STATE/vm/dory-hv-kernel-$GUEST_ARCH"
+KERNEL_ASSET="$SHARE/dory-hv-kernel-$GUEST_ARCH.lzfse"
+ROOTFS="$STATE/vm/dory-engine-rootfs.ext4"
+ROOTFS_ASSET="$SHARE/dory-engine-rootfs.ext4.lzfse"
+AGENT_ASSET="$SHARE/dory-agent-linux-$GUEST_ARCH"
+AGENT_OUTPUT="$STATE/bin/dory-agent-linux-$GUEST_ARCH"
 
 LOG_MAX_BYTES="${DORY_LOG_MAX_BYTES:-8388608}"
 
@@ -44,7 +54,7 @@ rotate_log() {
 require_layout() {
   [ -x "$BIN/dory-hv" ] || die "missing $BIN/dory-hv (run from the extracted release directory)"
   [ -x "$BIN/gvproxy" ] || die "missing $BIN/gvproxy"
-  [ -f "$SHARE/dory-hv-kernel-arm64.lzfse" ] || die "missing kernel asset"
+  [ -f "$KERNEL_ASSET" ] || die "missing $GUEST_ARCH kernel asset"
 }
 
 engine_pid() {
@@ -80,14 +90,22 @@ cmd_start() {
   fi
 
   mkdir -p "$STATE/vm" "$STATE/bin"
-  if [ ! -f "$KERNEL" ] || [ "$SHARE/dory-hv-kernel-arm64.lzfse" -nt "$KERNEL" ]; then
+  if [ ! -f "$KERNEL" ] || [ "$KERNEL_ASSET" -nt "$KERNEL" ]; then
     note "preparing kernel (one-time)…"
-    "$BIN/dory-hv" lzfse decompress "$SHARE/dory-hv-kernel-arm64.lzfse" "$KERNEL"
+    "$BIN/dory-hv" lzfse decompress "$KERNEL_ASSET" "$KERNEL"
+  fi
+  local rootfs_args=()
+  if [ -f "$ROOTFS_ASSET" ]; then
+    if [ ! -f "$ROOTFS" ] || [ "$ROOTFS_ASSET" -nt "$ROOTFS" ]; then
+      note "preparing engine rootfs (one-time, offline)…"
+      "$BIN/dory-hv" lzfse decompress "$ROOTFS_ASSET" "$ROOTFS"
+    fi
+    rootfs_args+=(--rootfs "$ROOTFS")
   fi
   # The guest agent rides the home share; the boot script prefers this copy so upgrades apply.
-  if [ -f "$SHARE/dory-agent-linux-arm64" ]; then
-    cp "$SHARE/dory-agent-linux-arm64" "$STATE/bin/dory-agent-linux-arm64"
-    chmod 0755 "$STATE/bin/dory-agent-linux-arm64"
+  if [ -f "$AGENT_ASSET" ]; then
+    cp "$AGENT_ASSET" "$AGENT_OUTPUT"
+    chmod 0755 "$AGENT_OUTPUT"
   fi
 
   note "starting engine (${mem_mb} MiB ceiling, $cpus cpus)…"
@@ -98,6 +116,7 @@ cmd_start() {
     --kernel "$KERNEL" \
     --gvproxy "$BIN/gvproxy" \
     --mem-mb "$mem_mb" --cpus "$cpus" --direct-ip \
+    ${rootfs_args[@]+"${rootfs_args[@]}"} \
     ${extra[@]+"${extra[@]}"} \
     --share "home=$HOME:rw:at=$HOME:safe" \
     >> "$LOGFILE" 2>&1 &
