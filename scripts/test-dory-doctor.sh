@@ -39,12 +39,43 @@ commands = {item["id"]: item for item in data["commands"]}
 assert commands["doctor"]["status"] == "available"
 assert commands["doctor"]["json"] is True
 assert commands["repair"]["dryRun"] is True
+assert commands["wait"]["status"] == "available"
+assert "machine" in commands["wait"]["targets"]
 assert commands["sandbox"]["status"] == "planned"
-assert commands["wait"]["invoke"].startswith("dory wait")
 assert data["recommendedRecoveryLoop"]
 '
 
 scripts/dory agent guide --text | grep -q "Dory agent guide v1"
+
+DORYDCTL_BIN=/usr/bin/false DORY_DOCKER_BIN=/usr/bin/false scripts/dory wait engine --until not-running --timeout 0 --json | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["kind"] == "engine"
+assert data["state"] == "not-running"
+assert data["matched"] is True
+'
+
+set +e
+wait_json="$(DORYDCTL_BIN=/usr/bin/false DORY_DOCKER_BIN=/usr/bin/false scripts/dory wait engine --until running --timeout 0 --json)"
+wait_rc=$?
+set -e
+test "$wait_rc" -eq 1
+printf '%s' "$wait_json" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["kind"] == "engine"
+assert data["desiredState"] == "running"
+assert data["matched"] is False
+'
+
+DORYDCTL_BIN=/usr/bin/false DORY_DOCKER_BIN=/usr/bin/false scripts/dory wait machine ghost --until missing --timeout 0 --json | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["kind"] == "machine"
+assert data["target"] == "ghost"
+assert data["state"] == "missing"
+assert data["matched"] is True
+'
 
 scripts/dory-doctor mode show --json | python3 -c '
 import json, sys
@@ -218,6 +249,7 @@ scripts/dory help | grep -q "dory idle proxy-status"
 scripts/dory help | grep -q "dory cleanup"
 scripts/dory help | grep -q "dory compat"
 scripts/dory help | grep -q "dory agent guide"
+scripts/dory help | grep -q "dory wait engine"
 
 # Compatibility center: every registered tool is checked and every non-pass carries an action;
 # runs without an engine (skips/warns/fails, never crashes). `compat` exits 1 when a tool fails,
