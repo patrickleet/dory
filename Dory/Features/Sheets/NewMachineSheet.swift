@@ -9,6 +9,7 @@ struct NewMachineSheet: View {
     @State private var selectedArch: MachineArch
     @State private var name: String
     @State private var lastAutoName: String
+    @State private var address = ""
     @State private var nameEdited = false
     @State private var selectedRecipe: DevRecipe?
 
@@ -390,6 +391,12 @@ struct NewMachineSheet: View {
                         .font(.system(size: 11)).foregroundStyle(p.red)
                 }
             }
+            VStack(alignment: .leading, spacing: 9) {
+                sectionLabel("ADDRESS")
+                fieldInput(defaultAddress, text: $address, width: 260)
+                Text("Leave blank to use \(defaultAddress).")
+                    .font(.system(size: 11)).foregroundStyle(p.text3)
+            }
         }
     }
 
@@ -661,8 +668,8 @@ struct NewMachineSheet: View {
         Task { _ = await store.createMachine(image: image, name: machineName, arch: arch, recipe: recipe, settings: settings, identity: identity) }
     }
 
-    static func buildSettings(cpus: Int, memoryGB: Int, mounts: [MountPair], ports: [PortPair], env: [String: String]) -> MachineSettings {
-        MachineSettings(cpus: cpus, memoryMB: memoryGB * 1024, mounts: mounts, ports: ports, env: env)
+    static func buildSettings(cpus: Int, memoryGB: Int, mounts: [MountPair], ports: [PortPair], env: [String: String], address: String? = nil) -> MachineSettings {
+        MachineSettings(cpus: cpus, memoryMB: memoryGB * 1024, mounts: mounts, ports: ports, env: env, address: address)
     }
 
     private func collectedSettings() -> MachineSettings {
@@ -683,10 +690,20 @@ struct NewMachineSheet: View {
             guard !key.isEmpty else { return nil }
             return (key, row.value)
         }, uniquingKeysWith: { _, latest in latest })
-        return Self.buildSettings(cpus: cpus, memoryGB: memoryGB, mounts: mounts, ports: ports, env: env)
+        return Self.buildSettings(cpus: cpus, memoryGB: memoryGB, mounts: mounts, ports: ports, env: env, address: trimmedAddress)
     }
 
     static func defaultName(_ family: MachineFamily) -> String {
         "\(family.id)-\(String(UUID().uuidString.prefix(4).lowercased()))"
+    }
+
+    private var defaultAddress: String {
+        let trimmedName = name.trimmingCharacters(in: .whitespaces)
+        return AppStore.defaultMachineAddress(name: trimmedName.isEmpty ? "machine" : trimmedName, suffix: store.domainSuffix)
+    }
+
+    private var trimmedAddress: String? {
+        let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }

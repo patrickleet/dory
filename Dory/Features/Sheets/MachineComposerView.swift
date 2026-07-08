@@ -10,6 +10,7 @@ struct MachineComposerView: View {
     @State private var name: String
     @State private var cpus = 2
     @State private var memoryGB = 4
+    @State private var address = ""
     @State private var scanning = false
     @State private var matchNote: String?
 
@@ -168,6 +169,17 @@ struct MachineComposerView: View {
                 }
                 Spacer(minLength: 0)
             }
+            VStack(alignment: .leading, spacing: 6) {
+                fieldLabel("ADDRESS")
+                TextField(defaultAddress, text: $address)
+                    .textFieldStyle(.plain).font(.mono(12.5)).foregroundStyle(p.text)
+                    .padding(.horizontal, 10).padding(.vertical, 7)
+                    .frame(width: 260)
+                    .background(p.bgInput, in: RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(p.border))
+                Text("Leave blank to use \(defaultAddress).")
+                    .font(.system(size: 11)).foregroundStyle(p.text3)
+            }
             if nameInvalid {
                 Text("Use letters, numbers, dots, dashes or underscores.")
                     .font(.system(size: 11)).foregroundStyle(p.red)
@@ -275,8 +287,18 @@ struct MachineComposerView: View {
         let identity = MacIdentity.make(username: Self.linuxUsername(), uid: Int(getuid()),
                                         homePath: NSHomeDirectory(), shell: "/bin/bash",
                                         sshDir: NSHomeDirectory() + "/.ssh")
-        let settings = NewMachineSheet.buildSettings(cpus: cpus, memoryGB: memoryGB, mounts: [], ports: [], env: [:])
+        let settings = NewMachineSheet.buildSettings(cpus: cpus, memoryGB: memoryGB, mounts: [], ports: [], env: [:], address: trimmedAddress)
         let machineName = name
         Task { _ = await store.createMachine(image: "ubuntu:24.04", name: machineName, arch: .host, recipe: recipe, settings: settings, identity: identity) }
+    }
+
+    private var defaultAddress: String {
+        let trimmedName = name.trimmingCharacters(in: .whitespaces)
+        return AppStore.defaultMachineAddress(name: trimmedName.isEmpty ? "machine" : trimmedName, suffix: store.domainSuffix)
+    }
+
+    private var trimmedAddress: String? {
+        let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
