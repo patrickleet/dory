@@ -140,15 +140,10 @@ enum EngineMode {
             throw VMError.invalidConfiguration("dory-hv engine requires a bundled engine rootfs for offline macOS 14 runtime support")
         }
 
-        if !FileManager.default.fileExists(atPath: pristineRootfs) {
-            let temporary = pristineRootfs + ".partial"
-            try? FileManager.default.removeItem(atPath: temporary)
-            // Offline build: the engine image ships in the app, no network on first launch.
-            note("first run: installing bundled engine rootfs (one-time, offline)…")
-            try FileManager.default.copyItem(atPath: bundledRootfs, toPath: temporary)
-            try fsyncFile(temporary)
-            try FileManager.default.moveItem(atPath: temporary, toPath: pristineRootfs)
-        }
+        // Offline build: the engine image ships in the app, no network on first launch. Reinstall
+        // whenever the bundled rootfs changes so a new app version's guest agent/init is not masked
+        // by a stale pristine.
+        try PristineRootfs.ensure(state: state, bundledRootfs: bundledRootfs) { note($0) }
         try? FileManager.default.removeItem(atPath: bootRootfs)
         try FileManager.default.copyItem(atPath: pristineRootfs, toPath: bootRootfs)
 
