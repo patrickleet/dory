@@ -691,8 +691,25 @@ final class DorydServiceTests: XCTestCase {
         ))
         try networking.start()
         defer { networking.stop() }
+        let home = "/tmp/doryd-service-network-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let agent = AgentControl(configuration: AgentControlConfiguration(forwardSocketPath: home + "/agent.sock")) { _ in
+            ServiceFakeAgentControlClient(ports: [
+                DoryListenPort(protocol: "tcp", port: 25),
+                DoryListenPort(protocol: "tcp", port: 80),
+                DoryListenPort(protocol: "udp", port: 53),
+                DoryListenPort(protocol: "tcp", port: 8080),
+            ])
+        }
+        let tier = DockerTier(
+            configuration: DockerTierConfiguration(home: home, forwardSocketPath: home + "/forward.sock"),
+            agentControl: agent
+        )
+        try tier.start()
+        defer { tier.stop() }
         let service = DorydService(
             socketPath: "/tmp/doryd-test.sock",
+            dockerTier: tier,
             networkingController: networking
         )
         let listener = makeAnonymousListener(service: service)
@@ -750,7 +767,9 @@ final class DorydServiceTests: XCTestCase {
         XCTAssertEqual(authorization["suffix"] as? String, "dory.local")
         let forwards = try XCTUnwrap(authorization["privilegedTCPForwards"] as? [NSDictionary])
         XCTAssertEqual(forwards.first?["listenPort"] as? UInt16, 25)
-        XCTAssertEqual(forwards.first?["targetPort"] as? UInt16, 1025)
+        XCTAssertEqual(forwards.first?["targetPort"] as? UInt16, 60_025)
+        XCTAssertFalse(forwards.contains { $0["listenPort"] as? UInt16 == 80 })
+        XCTAssertFalse(forwards.contains { $0["listenPort"] as? UInt16 == 53 })
         let requests = try XCTUnwrap(authorization["requests"] as? [NSDictionary])
         XCTAssertTrue(requests.contains { $0["kind"] as? String == "resolverFile" })
         XCTAssertTrue(requests.contains { $0["kind"] as? String == "pfAnchor" })
@@ -1181,6 +1200,12 @@ private struct ServiceFakeHealthRegistryProbe: HealthRegistryProbing {
 }
 
 private final class ServiceFakeAgentControlClient: AgentControlClient, @unchecked Sendable {
+    private let watchedPorts: [DoryListenPort]
+
+    init(ports: [DoryListenPort] = [DoryListenPort(protocol: "tcp", port: 8080)]) {
+        self.watchedPorts = ports
+    }
+
     func info() throws -> DoryAgentInfo {
         DoryAgentInfo(
             protocolVersion: 1,
@@ -1196,7 +1221,7 @@ private final class ServiceFakeAgentControlClient: AgentControlClient, @unchecke
 
     func portsWatch() throws -> DoryPortsSnapshot {
         DoryPortsSnapshot(
-            ports: [DoryListenPort(protocol: "tcp", port: 8080)],
+            ports: watchedPorts,
             added: [],
             removed: []
         )

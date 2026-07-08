@@ -532,7 +532,11 @@ public final class DorydService: NSObject, DorydControl {
             return
         }
         do {
-            reply(try networkingController.authorizationPlan().xpcDictionary, "")
+            let publishedPorts = currentPublishedPorts()
+            let autoForwards = PrivilegedPortMapping.forwards(from: publishedPorts)
+            reply(try networkingController.authorizationPlan(
+                additionalPrivilegedTCPForwards: autoForwards
+            ).xpcDictionary, "")
         } catch {
             reply([:], "\(error)")
         }
@@ -638,6 +642,15 @@ public final class DorydService: NSObject, DorydControl {
         guard let idleSleepScheduler else { return }
         let configuration = idlePolicyStore.schedulerConfiguration(base: idleSleepScheduler.currentConfiguration)
         idleSleepScheduler.update(configuration: configuration)
+    }
+
+    private func currentPublishedPorts() -> [DoryListenPort] {
+        do {
+            _ = try dockerTier?.refreshPublishedPorts()
+        } catch {
+            incidentWriter?.record(type: "network.ports_failed", detail: "\(error)")
+        }
+        return dockerTier?.currentPublishedPorts() ?? []
     }
 }
 

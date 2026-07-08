@@ -32,6 +32,23 @@ final class DoryHTTPProxyServerTests: XCTestCase {
         XCTAssertTrue(response.contains("no backend"))
     }
 
+    func testExplicitLocalhostRouteIsAllowedForLowPortFallbacks() throws {
+        let backend = TinyHTTPBackend(responseBody: "hello from low port backend")
+        try backend.start()
+        defer { backend.stop() }
+
+        let proxy = DoryHTTPProxyServer(port: 0, routes: [
+            DomainRoute(hostname: "localhost", address: "127.0.0.1", port: backend.port),
+        ])
+        try proxy.start()
+        defer { proxy.stop() }
+
+        let response = try sendHTTP(port: proxy.port, host: "localhost")
+
+        XCTAssertTrue(response.contains("HTTP/1.1 200 OK"))
+        XCTAssertTrue(response.contains("hello from low port backend"))
+    }
+
     func testHostHeaderParsingStripsPort() {
         let request = Data("GET / HTTP/1.1\r\nHost: Web.Dory.Local:8080\r\n\r\n".utf8)
         XCTAssertEqual(DoryHTTPProxyServer.hostHeader(request), "web.dory.local")

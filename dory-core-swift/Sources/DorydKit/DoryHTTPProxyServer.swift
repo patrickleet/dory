@@ -179,7 +179,9 @@ public final class DoryHTTPProxyServer: @unchecked Sendable {
         lock.unlock()
         return currentRoutes.first { route in
             let hostname = DomainRouter.normalize(route.hostname)
-            return hostname == normalized && router.owns(hostname) && IPv4Address(route.address) != nil
+            return hostname == normalized
+                && (router.owns(hostname) || Self.isLoopbackHost(hostname))
+                && IPv4Address(route.address) != nil
         }
     }
 
@@ -207,6 +209,14 @@ public final class DoryHTTPProxyServer: @unchecked Sendable {
             return value.split(separator: ":").first.map(String.init) ?? value
         }
         return nil
+    }
+
+    public static func isLoopbackHost(_ host: String) -> Bool {
+        let normalized = DomainRouter.normalize(host)
+        return normalized == "localhost"
+            || normalized == "127.0.0.1"
+            || normalized == "::1"
+            || normalized == "[::1]"
     }
 
     private static func headerRange(in data: Data) -> Range<Data.Index>? {

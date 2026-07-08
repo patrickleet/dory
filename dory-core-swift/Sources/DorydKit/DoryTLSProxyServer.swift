@@ -178,7 +178,9 @@ public final class DoryTLSProxyServer: @unchecked Sendable {
         lock.unlock()
         return currentRoutes.first { route in
             let hostname = DomainRouter.normalize(route.hostname)
-            return hostname == normalized && router.owns(hostname) && IPv4Address(route.address) != nil
+            return hostname == normalized
+                && (router.owns(hostname) || DoryHTTPProxyServer.isLoopbackHost(hostname))
+                && IPv4Address(route.address) != nil
         }
     }
 

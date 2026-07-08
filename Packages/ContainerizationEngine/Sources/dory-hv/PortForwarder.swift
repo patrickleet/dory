@@ -33,13 +33,13 @@ final class PortForwarder: MachinePortForwarding, @unchecked Sendable {
         guard let wanted = publishedPorts() else { return }  // docker not ready or unreachable
         for port in wanted.subtracting(exposed) where expose(port) {
             exposed.insert(port)
-            log("port forward: \(localHost):\(port) -> container")
+            log("port forward: \(localHost):\(Self.localPort(forPublishedPort: port)) -> container:\(port)")
         }
         // Only forget the port once gvproxy confirms the forward is gone; a failed unexpose stays
         // tracked and is retried on the next tick, so a stale host forward can't leak.
         for port in exposed.subtracting(wanted) where unexpose(port) {
             exposed.remove(port)
-            log("port forward: released \(localHost):\(port)")
+            log("port forward: released \(localHost):\(Self.localPort(forPublishedPort: port))")
         }
     }
 
@@ -53,6 +53,8 @@ final class PortForwarder: MachinePortForwarding, @unchecked Sendable {
         for container in containers {
             guard let list = container["Ports"] as? [[String: Any]] else { continue }
             for entry in list {
+                let proto = (entry["Type"] as? String ?? "tcp").lowercased()
+                guard proto == "tcp" || proto == "tcp6" else { continue }
                 if let publicPort = entry["PublicPort"] as? Int { ports.insert(publicPort) }
             }
         }
@@ -60,15 +62,17 @@ final class PortForwarder: MachinePortForwarding, @unchecked Sendable {
     }
 
     private func expose(_ port: Int) -> Bool {
+        let localPort = Self.localPort(forPublishedPort: port)
         // gvproxy's TCP forward wants a bare host:port remote (no scheme), unlike the unix-socket
         // forward used for the docker socket.
-        curlPost(unixSocket: apiSocket, url: "http://gvproxy/services/forwarder/expose",
-                 body: "{\"local\":\"\(localHost):\(port)\",\"remote\":\"\(guestIP):\(port)\",\"protocol\":\"tcp\"}")
+        return curlPost(unixSocket: apiSocket, url: "http://gvproxy/services/forwarder/expose",
+                        body: "{\"local\":\"\(localHost):\(localPort)\",\"remote\":\"\(guestIP):\(port)\",\"protocol\":\"tcp\"}")
     }
 
     private func unexpose(_ port: Int) -> Bool {
-        curlPost(unixSocket: apiSocket, url: "http://gvproxy/services/forwarder/unexpose",
-                 body: "{\"local\":\"\(localHost):\(port)\",\"protocol\":\"tcp\"}")
+        let localPort = Self.localPort(forPublishedPort: port)
+        return curlPost(unixSocket: apiSocket, url: "http://gvproxy/services/forwarder/unexpose",
+                        body: "{\"local\":\"\(localHost):\(localPort)\",\"protocol\":\"tcp\"}")
     }
 
     func exposeMachinePort(_ port: UInt16) async -> Bool {
@@ -77,6 +81,11 @@ final class PortForwarder: MachinePortForwarding, @unchecked Sendable {
 
     func unexposeMachinePort(_ port: UInt16) async -> Bool {
         unexpose(Int(port))
+    }
+
+    private static func localPort(forPublishedPort port: Int) -> Int {
+        guard port > 0, port < 1024 else { return port }
+        return 60_000 + port
     }
 
     private func curlData(unixSocket: String, url: String) -> Data? {

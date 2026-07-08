@@ -160,7 +160,7 @@ public final class NetworkingController: @unchecked Sendable {
         )
     }
 
-    public func authorizationPlan() throws -> NetworkingAuthorizationPlan {
+    public func authorizationPlan(additionalPrivilegedTCPForwards: [PrivilegedTCPForward] = []) throws -> NetworkingAuthorizationPlan {
         var live = configuration
         let activeDNSPort = dnsServer.port
         if activeDNSPort != 0 {
@@ -172,6 +172,9 @@ public final class NetworkingController: @unchecked Sendable {
         }
         if let tlsProxy, tlsProxy.port != 0 {
             live.httpsProxyPort = tlsProxy.port
+        }
+        if !additionalPrivilegedTCPForwards.isEmpty {
+            live.privilegedTCPForwards += additionalPrivilegedTCPForwards
         }
         return try NetworkingAuthorizationPlan.make(configuration: live)
     }

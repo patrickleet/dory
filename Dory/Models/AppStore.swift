@@ -1025,18 +1025,33 @@ final class AppStore {
         guard let response = await runtime.proxyRequest(method: "GET", path: "/containers/json", headers: [], body: Data()),
               response.isSuccess else { return [:] }
         struct Entry: Decodable { let Names: [String]?; let Ports: [PortItem]? }
-        struct PortItem: Decodable { let PublicPort: Int? }
+        struct PortItem: Decodable { let PublicPort: Int?; let `Type`: String? }
         guard let entries = try? JSONDecoder().decode([Entry].self, from: response.body) else { return [:] }
         var result: [String: Int] = [:]
         for entry in entries {
-            guard let port = (entry.Ports ?? []).compactMap(\.PublicPort).min() else { continue }
+            let publishedPorts = (entry.Ports ?? []).compactMap { item -> Int? in
+                let proto = (item.Type ?? "tcp").lowercased()
+                guard proto == "tcp" || proto == "tcp6" else { return nil }
+                return item.PublicPort
+            }
+            guard let port = publishedPorts.min() else { continue }
+            let backendPort = effectivePublishedPort(port)
             for raw in entry.Names ?? [] {
                 let name = raw.hasPrefix("/") ? String(raw.dropFirst()) : raw
                 guard !name.isEmpty else { continue }
-                result["\(name).\(suffix)".lowercased()] = port
+                result["\(name).\(suffix)".lowercased()] = backendPort
+            }
+            if port == 80 {
+                result["localhost"] = backendPort
+                result["127.0.0.1"] = backendPort
             }
         }
         return result
+    }
+
+    nonisolated static func effectivePublishedPort(_ port: Int) -> Int {
+        guard port > 0, port < 1024 else { return port }
+        return 60_000 + port
     }
 
     nonisolated static func machineDNSHosts(_ machines: [Machine], suffix: String) -> [String: String] {
@@ -1055,7 +1070,7 @@ final class AppStore {
     ) -> [DorydDomainRoute] {
         var routes: [String: DorydDomainRoute] = [:]
         for (rawHost, port) in containerEndpoints {
-            guard let backendPort = UInt16(exactly: port), backendPort > 0 else { continue }
+            guard let backendPort = UInt16(exactly: effectivePublishedPort(port)), backendPort > 0 else { continue }
             let host = DoryDNS.normalizeHost(rawHost)
             guard !host.isEmpty else { continue }
             routes[host] = DorydDomainRoute(hostname: host, address: "127.0.0.1", port: backendPort)
