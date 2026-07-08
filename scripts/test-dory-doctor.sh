@@ -43,6 +43,7 @@ assert commands["wait"]["status"] == "available"
 assert "machine" in commands["wait"]["targets"]
 assert commands["events"]["status"] == "available"
 assert "incident" in commands["events"]["sources"]
+assert commands["engine"]["json"] is True
 assert commands["sandbox"]["status"] == "planned"
 assert data["recommendedRecoveryLoop"]
 '
@@ -78,6 +79,32 @@ assert data["target"] == "ghost"
 assert data["state"] == "missing"
 assert data["matched"] is True
 '
+
+cat > "$TMP_HOME/fake-dorydctl" <<'SH'
+#!/bin/sh
+if [ "$1" = "--timeout" ]; then shift 2; fi
+if [ "$1" = "engine" ] && [ "$2" = "status" ]; then
+  printf '{"state":"sleeping","detail":"idle policy"}\n'
+elif [ "$1" = "engine" ] && [ "$2" = "sleep" ]; then
+  printf '{"ok":true,"message":"sleep requested"}\n'
+elif [ "$1" = "engine" ] && [ "$2" = "wake" ]; then
+  printf '{"ok":true,"message":"wake requested"}\n'
+else
+  echo "unexpected args: $*" >&2
+  exit 64
+fi
+SH
+chmod +x "$TMP_HOME/fake-dorydctl"
+
+DORYDCTL_BIN="$TMP_HOME/fake-dorydctl" scripts/dory engine status --json | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["state"] == "sleeping"
+assert data["detail"] == "idle policy"
+'
+
+DORYDCTL_BIN="$TMP_HOME/fake-dorydctl" scripts/dory engine status | grep -q "Dory engine: sleeping"
+DORYDCTL_BIN="$TMP_HOME/fake-dorydctl" scripts/dory engine sleep --json | grep -q '"sleep requested"'
 
 mkdir -p "$TMP_HOME/.dory"
 cat > "$TMP_HOME/.dory/idle-history.jsonl" <<'JSONL'

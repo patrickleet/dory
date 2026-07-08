@@ -1030,15 +1030,91 @@ idle_proxy_cmd() {
   exec "$helper" "$@"
 }
 
-# When the Dory app is running it owns the engine, so `dory engine` talks to the app's sockets rather
-# than a standalone runtime: engine.sock answers only when the engine is awake, dory.sock (the app's
-# shim) answers whenever the app is up, and any real API call through it wakes an idle-slept engine.
 _engine_socket_up() { curl -sf --max-time "${2:-3}" --unix-socket "$1" http://d/_ping >/dev/null 2>&1; }
 
 engine_cmd() {
-  local esock="$HOME/.dory/engine.sock" dsock="$HOME/.dory/dory.sock"
-  case "${1:-status}" in
+  local action="${1:-status}" json=0 ctl out state detail message rc esock="$HOME/.dory/engine.sock" dsock="$HOME/.dory/dory.sock"
+  [ "$#" -eq 0 ] || shift
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --json) json=1; shift ;;
+      -h|--help) echo "usage: dory engine status|wake|sleep [--json]"; return 0 ;;
+      *) echo "unknown engine option: $1" >&2; exit 2 ;;
+    esac
+  done
+
+  if ctl="$(dorydctl_bin 2>/dev/null)"; then
+    case "$action" in
+      status)
+        set +e
+        out="$("$ctl" --timeout 5 engine status 2>/dev/null)"
+        rc=$?
+        set -e
+        if [ "$rc" -eq 0 ] && [ -n "$out" ]; then
+          if [ "$json" -eq 1 ]; then
+            printf '%s\n' "$out"
+          else
+            state="$(printf '%s' "$out" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("state","unknown"))' 2>/dev/null || printf '%s' "unknown")"
+            detail="$(printf '%s' "$out" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("detail",""))' 2>/dev/null || true)"
+            if [ -n "$detail" ]; then
+              echo "Dory engine: $state — $detail"
+            else
+              echo "Dory engine: $state"
+            fi
+          fi
+          return 0
+        fi
+        ;;
+      wake|start)
+        if [ "$json" -eq 1 ]; then exec "$ctl" --timeout 90 engine wake; fi
+        set +e
+        out="$("$ctl" --timeout 90 engine wake 2>&1)"
+        rc=$?
+        set -e
+        if [ "$rc" -eq 0 ]; then
+          message="$(printf '%s' "$out" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("message") or "wake requested")' 2>/dev/null || printf '%s' "wake requested")"
+          echo "Dory engine: $message"
+        else
+          printf '%s\n' "$out" >&2
+        fi
+        return "$rc"
+        ;;
+      sleep|stop)
+        if [ "$json" -eq 1 ]; then exec "$ctl" --timeout 90 engine sleep; fi
+        set +e
+        out="$("$ctl" --timeout 90 engine sleep 2>&1)"
+        rc=$?
+        set -e
+        if [ "$rc" -eq 0 ]; then
+          message="$(printf '%s' "$out" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("message") or "sleep requested")' 2>/dev/null || printf '%s' "sleep requested")"
+          echo "Dory engine: $message"
+        else
+          printf '%s\n' "$out" >&2
+        fi
+        return "$rc"
+        ;;
+    esac
+  fi
+
+  # Legacy app-shim fallback: engine.sock answers only when awake; dory.sock answers while the app is
+  # up and can wake the old app-owned engine on a real API call.
+  case "$action" in
     status)
+      if [ "$json" -eq 1 ]; then
+        local fallback_state fallback_detail
+        if _engine_socket_up "$esock"; then
+          fallback_state="running"; fallback_detail=""
+        elif _engine_socket_up "$dsock"; then
+          fallback_state="sleeping"; fallback_detail="legacy app shim is reachable"
+        else
+          fallback_state="not-running"; fallback_detail="open the Dory app or start doryd"
+        fi
+        python3 - "$fallback_state" "$fallback_detail" <<'PY'
+import json, sys
+print(json.dumps({"state": sys.argv[1], "detail": sys.argv[2]}, separators=(",", ":"), sort_keys=True))
+PY
+        return 0
+      fi
       if _engine_socket_up "$esock"; then
         echo "Dory engine: running"
       elif _engine_socket_up "$dsock"; then
@@ -1072,10 +1148,11 @@ engine_cmd() {
       fi
       ;;
     sleep|stop)
-      echo "Dory's engine sleeps on its own when idle (Settings → Auto-Idle). To stop it now, quit the Dory app." >&2
+      echo "dorydctl not found; Dory's legacy app-owned engine sleeps on its own when idle. Open the Dory app Settings to enable Auto-Idle." >&2
+      exit 1
       ;;
     *)
-      echo "usage: dory engine status|wake|sleep" >&2
+      echo "usage: dory engine status|wake|sleep [--json]" >&2
       exit 64
       ;;
   esac
@@ -1477,10 +1554,10 @@ data = {
         {
             "id": "engine",
             "status": "available",
-            "invoke": "dory engine status|wake|sleep",
-            "json": False,
-            "safeForAutomation": False,
-            "notes": "Use dorydctl when available for machine-readable engine state.",
+            "invoke": "dory engine status|wake|sleep --json",
+            "json": True,
+            "safeForAutomation": True,
+            "notes": "Routes through dorydctl when available; wake/sleep are explicit state-changing commands.",
         },
         {
             "id": "machine",
