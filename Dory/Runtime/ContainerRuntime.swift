@@ -29,7 +29,7 @@ enum RuntimeKind: String, Sendable {
         switch self {
         case .mock: "Mock"
         case .docker: "Docker Engine"
-        case .appleContainer: "Apple container"
+        case .appleContainer: "Unsupported runtime"
         case .sharedVM: "Shared VM"
         case .disconnected: "Disconnected"
         }

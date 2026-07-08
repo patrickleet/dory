@@ -94,6 +94,7 @@ final class AppStore {
 
     var dorydRuntimeActive: Bool { runtimeOwnedByDoryd }
     var dorydRuntimeRequired: Bool { dorydEngineRequired }
+    var localDorydCapabilities: [LocalDorydCapability] { Self.localDorydCapabilityCatalog }
     var runtimeAuthorityDisplay: String {
         if runtimeOwnedByDoryd { return "Managed by doryd" }
         if runtimeKind == .sharedVM { return "App-managed development engine" }
@@ -246,6 +247,50 @@ final class AppStore {
     static let containerDetailWidthKey = "dory.containerDetailWidth"
     static let containerScopeKey = "dory.containerScope"
     static let kubernetesVersionKey = "dory.kubernetesVersion"
+    nonisolated static let localDorydCapabilityCatalog: [LocalDorydCapability] = [
+        LocalDorydCapability(
+            id: "doctor",
+            title: "Doctor bundle",
+            summary: "Collect local diagnostics for the daemon, socket, engine, memory, helpers, and recovery checks.",
+            command: "dory doctor --json --bundle",
+            status: "Stable"
+        ),
+        LocalDorydCapability(
+            id: "agent-guide",
+            title: "Agent guide",
+            summary: "Expose Dory's stable machine-readable local command contract for coding agents and automation.",
+            command: "dory agent guide --json",
+            status: "Stable"
+        ),
+        LocalDorydCapability(
+            id: "mcp",
+            title: "Read-only MCP",
+            summary: "Serve the local Dory tool surface over stdio while blocking machine exec writes.",
+            command: "dory mcp serve --read-only",
+            status: "Stable"
+        ),
+        LocalDorydCapability(
+            id: "sandbox",
+            title: "Sandbox VM",
+            summary: "Preview: run an isolated command in a dedicated Linux machine when bundled dorydctl and machine assets are present.",
+            command: "dory sandbox run --json --network none --rollback -- /bin/sh -lc 'uname -a'",
+            status: "Preview"
+        ),
+        LocalDorydCapability(
+            id: "wait",
+            title: "Wait primitive",
+            summary: "Block scripts until the engine, a container, or a machine reaches the expected state.",
+            command: "dory wait engine --until running --timeout 60 --json",
+            status: "Stable"
+        ),
+        LocalDorydCapability(
+            id: "events",
+            title: "Event stream",
+            summary: "Follow local doryd idle and incident events for CI, agents, or live debugging.",
+            command: "dory events --follow --json",
+            status: "Stable"
+        ),
+    ]
     nonisolated static let dockerCompatibleEngineHint = "Start Dory's shared VM in Settings > Docker Engine, or run a local Docker-compatible engine such as Docker Desktop, Colima, Rancher Desktop, Podman, or OrbStack."
     nonisolated static var dockerCompatibleFallbackHint: String {
         if MacHostPlatform.current().isAppleSilicon {

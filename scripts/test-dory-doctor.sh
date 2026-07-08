@@ -416,6 +416,20 @@ assert "[redacted]" in text
 assert "[redacted]" in log
 '
 
+set +e
+dory_bundle_json="$(scripts/dory doctor --json --only socket --bundle)"
+dory_bundle_rc=$?
+set -e
+test "$dory_bundle_rc" -eq 1
+printf '%s' "$dory_bundle_json" | python3 -c '
+import json, os, sys, zipfile
+data = json.load(sys.stdin)
+assert data["bundle"]
+assert os.path.exists(data["bundle"])
+with zipfile.ZipFile(data["bundle"]) as zf:
+    assert "doctor.json" in zf.namelist()
+'
+
 scripts/dory help | grep -q "dory doctor"
 scripts/dory help | grep -q "dory idle proxy"
 scripts/dory help | grep -q "dory idle proxy-status"

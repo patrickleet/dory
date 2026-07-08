@@ -52,6 +52,7 @@ struct SettingsView: View {
         case .autoIdle: AutoIdleView()
         case .network: network
         case .usb: UsbDevicesView()
+        case .localTools: localTools
         case .migrate: migrate
         case .managed: managed
         case .about: infoPanel(aboutText)
@@ -256,6 +257,117 @@ struct SettingsView: View {
         }
     }
 
+    private var localTools: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            groupLabel("LOCAL DORYD TOOLS")
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Dory's daemon features are available from any terminal through the bundled `dory` CLI. Stable commands are release-supported; preview rows call out their prerequisites before you rely on them.")
+                    .font(.system(size: 12.5)).foregroundStyle(p.text2).lineSpacing(4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(spacing: 0) {
+                    ForEach(store.localDorydCapabilities) { capability in
+                        localToolRow(capability)
+                    }
+                }
+                .background(p.bgInput, in: RoundedRectangle(cornerRadius: 9))
+                .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(p.border))
+            }
+            .padding(18)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(p.bgElevated, in: RoundedRectangle(cornerRadius: 11))
+            .overlay(RoundedRectangle(cornerRadius: 11).strokeBorder(p.border))
+
+            groupLabel("WHAT THIS COVERS")
+            VStack(spacing: 0) {
+                localToolFact("Daemon-owned state", "The app can close while doryd keeps Docker, machines, Auto-Idle, networking, and durable state on disk.")
+                localToolFact("Agent-ready JSON", "Doctor, guide, wait, events, and MCP all expose stable structured output for automation.")
+                localToolFact("Isolated sandbox runs", "Preview sandbox commands run in dedicated Linux machines with no host file sharing by default when dorydctl and machine assets are bundled.")
+                localToolFact("Visible recovery", "Diagnostics and event history make sleep, wake, memory reclaim, and incidents inspectable before asking users to restart.")
+            }
+            .background(p.bgElevated, in: RoundedRectangle(cornerRadius: 11))
+            .overlay(RoundedRectangle(cornerRadius: 11).strokeBorder(p.border))
+        }
+    }
+
+    private func localToolRow(_ capability: LocalDorydCapability) -> some View {
+        HStack(spacing: 11) {
+            Image(systemName: localToolIcon(capability.id))
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(p.accentText)
+                .frame(width: 28, height: 28)
+                .background(p.accentWeak, in: RoundedRectangle(cornerRadius: 7))
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 7) {
+                    Text(capability.title)
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(p.text)
+                    Text(capability.status)
+                        .font(.system(size: 9.5, weight: .bold))
+                        .foregroundStyle(capability.status == "Preview" ? p.amber : p.green)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(p.bgElevated, in: Capsule())
+                }
+                Text(capability.summary)
+                    .font(.system(size: 11.2))
+                    .foregroundStyle(p.text3)
+                    .lineLimit(2)
+                Text(capability.command)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(p.text2)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+            }
+            Spacer(minLength: 8)
+            Button {
+                copy(capability.command)
+            } label: {
+                Image(systemName: "doc.on.doc")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(p.text2)
+                    .frame(width: 30, height: 28)
+                    .background(p.bgElevated, in: RoundedRectangle(cornerRadius: 7))
+                    .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(p.border))
+            }
+            .buttonStyle(.plain)
+            .help("Copy command")
+            .accessibilityIdentifier("local-tool-copy-\(capability.id)")
+        }
+        .padding(.horizontal, 13)
+        .padding(.vertical, 11)
+        .overlay(alignment: .top) { Rectangle().fill(p.border).frame(height: 1) }
+    }
+
+    private func localToolFact(_ title: String, _ detail: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 12))
+                .foregroundStyle(p.green)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.system(size: 12.5, weight: .semibold)).foregroundStyle(p.text)
+                Text(detail).font(.system(size: 11.5)).foregroundStyle(p.text3).lineSpacing(3)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 15)
+        .padding(.vertical, 12)
+        .overlay(alignment: .top) { Rectangle().fill(p.border).frame(height: 1) }
+    }
+
+    private func localToolIcon(_ id: String) -> String {
+        switch id {
+        case "doctor": "stethoscope"
+        case "agent-guide": "curlybraces.square"
+        case "mcp": "point.3.connected.trianglepath.dotted"
+        case "sandbox": "shippingbox.and.arrow.backward"
+        case "wait": "timer"
+        case "events": "waveform.path.ecg"
+        default: "terminal"
+        }
+    }
+
     private var comparisonHeader: some View {
         HStack(spacing: 0) {
             Text("").frame(maxWidth: .infinity, alignment: .leading)
@@ -412,6 +524,11 @@ struct SettingsView: View {
 
     private func shortHost(_ host: String) -> String {
         host.hasPrefix("unix://") ? String(host.dropFirst("unix://".count)) : host
+    }
+
+    private func copy(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
     private func toggleRow(_ title: String, _ subtitle: String, isOn: Binding<Bool>, divider: Bool, disabled: Bool = false) -> some View {
@@ -629,8 +746,8 @@ struct SettingsView: View {
             .overlay(RoundedRectangle(cornerRadius: 11).strokeBorder(p.border))
             .padding(.bottom, 22)
 
-            groupLabel("REFERENCE BACKEND")
-            appleContainerCard
+            groupLabel("LOCAL DORYD SURFACE")
+            dorydCapabilitiesCard
                 .padding(.bottom, 22)
 
             if MacHostPlatform.current().isAppleSilicon {
@@ -744,26 +861,27 @@ struct SettingsView: View {
         }
     }
 
-    private var appleContainerCard: some View {
-        let path = HostTools.appleContainer()
-        let detected = path != nil
+    private var dorydCapabilitiesCard: some View {
         return VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
-                Circle().fill(detected ? p.green : p.text3).frame(width: 8, height: 8)
+                Circle().fill(store.dorydRuntimeActive ? p.green : p.amber).frame(width: 8, height: 8)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(detected ? "Apple container detected" : "Apple container not found")
+                    Text("Local daemon tools")
                         .font(.system(size: 13, weight: .semibold)).foregroundStyle(p.text)
-                    Text(detected ? (path ?? "") : "Install Apple's container CLI only if you want to benchmark Apple's per-container VM runtime.")
+                    Text("Stable local tools are ready from the bundled `dory` CLI; sandbox is preview with explicit prerequisites.")
                         .font(.system(size: 11.5)).foregroundStyle(p.text3).lineLimit(1)
                 }
                 Spacer(minLength: 0)
-                Text("External")
-                    .font(.system(size: 10.5, weight: .bold))
-                    .foregroundStyle(p.text3)
-                    .padding(.horizontal, 8).padding(.vertical, 3)
-                    .background(p.bgInput, in: Capsule())
+                Button {
+                    store.settingsTab = .localTools
+                } label: {
+                    Label("Open", systemImage: "arrow.up.right")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(p.accentText)
+                }
+                .buttonStyle(.plain)
             }
-            Text("Dory's bundled shared VM remains the full-feature engine for Docker CLI compatibility, Compose, Kubernetes, Linux machines, port forwarding, and memory reclamation. Apple's container runtime is a useful comparison target, but it is not yet wired as a feature-equivalent selectable backend.")
+            Text("These are local-only doryd features: no cloud control plane, no remote dependency, and no external runtime required. They let users diagnose, automate, and observe Dory from any terminal, with sandbox runs gated as a preview machine workflow.")
                 .font(.system(size: 12.5)).foregroundStyle(p.text2).lineSpacing(4)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -807,7 +925,7 @@ struct SettingsView: View {
         switch kind {
         case .docker: "Proxying a host Docker-compatible engine"
         case .sharedVM: store.dorydRuntimeActive ? "Daemon-managed Linux engine VM" : "One shared Linux VM on Dory's own engine"
-        case .appleContainer: "Apple container — one micro-VM per container"
+        case .appleContainer: "Unsupported local runtime"
         case .mock: "Demo data"
         case .disconnected: "No engine running"
         }

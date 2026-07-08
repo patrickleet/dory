@@ -423,8 +423,16 @@ enum EnginePreference: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+struct LocalDorydCapability: Identifiable, Equatable, Sendable {
+    let id: String
+    let title: String
+    let summary: String
+    let command: String
+    let status: String
+}
+
 enum SettingsTab: String, CaseIterable, Identifiable, Sendable {
-    case general, engine, resources, autoIdle, network, usb, migrate, managed, about
+    case general, engine, resources, autoIdle, network, usb, localTools, migrate, managed, about
     var id: String { rawValue }
     var label: String {
         switch self {
@@ -434,6 +442,7 @@ enum SettingsTab: String, CaseIterable, Identifiable, Sendable {
         case .autoIdle: "Auto-Idle"
         case .network: "Network"
         case .usb: "USB Devices"
+        case .localTools: "Local Tools"
         case .migrate: "Migrate & Compare"
         case .managed: "Managed"
         case .about: "About"

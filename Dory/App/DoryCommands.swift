@@ -53,8 +53,19 @@ struct DoryCommands: Commands {
         CommandMenu("Runtime") {
             Button("Open Daemon Health") { openMain(.health) }
             Button("Process Memory") { openSettings(.resources) }
+            Button("Local Tools") { openSettings(.localTools) }
             Button("Auto-Idle Settings") { openSettings(.autoIdle) }
             Divider()
+
+            Menu("Local Tools") {
+                ForEach(store.localDorydCapabilities, id: \.id) { capability in
+                    Button("Copy \(capability.title) Command") {
+                        copy(capability.command)
+                    }
+                }
+                Divider()
+                Button("Open Local Tools") { openSettings(.localTools) }
+            }
 
             Menu("Running Services") {
                 if runningServices.isEmpty {

@@ -10,6 +10,7 @@ struct MenuBarContentView: View {
     @State private var machinesExpanded = true
     @State private var kubernetesExpanded = true
     @State private var runtimeExpanded = true
+    @State private var toolsExpanded = true
     @State private var memoryExpanded = true
 
     private func refreshPopover() {
@@ -129,6 +130,7 @@ struct MenuBarContentView: View {
         ScrollView {
             VStack(spacing: 8) {
                 runtimeSection
+                localToolsSection
                 memorySection
                 servicesSection
                 composeSection
@@ -170,6 +172,29 @@ struct MenuBarContentView: View {
             ) {
                 rowIcon("gearshape", "Auto-Idle Settings") { openSettings(.autoIdle) }
             }
+        }
+    }
+
+    private var localToolsSection: some View {
+        let stableTools = store.localDorydCapabilities.filter { $0.status == "Stable" }
+        return quickSection(
+            title: "Local Tools",
+            subtitle: "Doctor, agent, MCP, events",
+            systemImage: "wrench.and.screwdriver",
+            expanded: $toolsExpanded,
+            open: { openSettings(.localTools) }
+        ) {
+            ForEach(stableTools.prefix(4)) { capability in
+                quickRow(
+                    dot: p.green,
+                    title: capability.title,
+                    subtitle: capability.summary,
+                    value: capability.status
+                ) {
+                    rowIcon("doc.on.doc", "Copy \(capability.title)") { copy(capability.command) }
+                }
+            }
+            moreLine("Open all local tools") { openSettings(.localTools) }
         }
     }
 
