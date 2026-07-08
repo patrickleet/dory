@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct HealthView: View {
@@ -80,15 +81,43 @@ struct HealthView: View {
                     Task { await store.loadHealth(active: true) }
                 }
                 if snapshot.failing > 0 {
-                    actionButton("Repair", prominent: true, loading: store.healthActionInFlight) {
+                    actionButton("Repair", prominent: true, loading: store.healthActionInFlight, disabled: store.healthSupportBundleInFlight) {
                         Task { await store.runHealthRepair() }
                     }
+                }
+                actionButton("Collect support bundle", loading: store.healthSupportBundleInFlight, disabled: store.healthActionInFlight) {
+                    Task { await store.collectHealthSupportBundle(active: snapshot.activeProbed) }
                 }
                 Spacer(minLength: 0)
                 Text("Active probes start a tiny throwaway container to test DNS, ports, and mounts.")
                     .font(.system(size: 11)).foregroundStyle(p.text3)
                     .lineLimit(2).multilineTextAlignment(.trailing)
                     .frame(maxWidth: 260)
+            }
+            if let path = store.healthSupportBundlePath {
+                HStack(spacing: 8) {
+                    Image(systemName: "doc.zipper")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(p.accentText)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(store.healthSupportBundleMessage ?? "Attach this redacted zip to your GitHub issue instead of screenshots.")
+                            .font(.system(size: 11.5, weight: .medium)).foregroundStyle(p.text2)
+                        Text(path)
+                            .font(.system(size: 11, design: .monospaced)).foregroundStyle(p.text3)
+                            .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                    }
+                    Spacer(minLength: 8)
+                    Button {
+                        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+                    } label: {
+                        Text("Reveal")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundStyle(p.accentText)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(10)
+                .background(p.accentWeak, in: RoundedRectangle(cornerRadius: 8))
             }
         }
         .cardStyle(p)
@@ -261,7 +290,7 @@ struct HealthView: View {
             }
             if store.canRestartEngineForHealth {
                 HStack(spacing: 8) {
-                    actionButton("Restart engine", loading: store.healthActionInFlight) {
+                    actionButton("Restart engine", loading: store.healthActionInFlight, disabled: store.healthSupportBundleInFlight) {
                         Task { await store.restartEngineForHealth() }
                     }
                     Spacer(minLength: 0)
@@ -410,7 +439,13 @@ struct HealthView: View {
         Text(text).font(.system(size: 11, weight: .bold)).tracking(0.5).foregroundStyle(p.text3)
     }
 
-    private func actionButton(_ label: String, prominent: Bool = false, loading: Bool = false, action: @escaping () -> Void) -> some View {
+    private func actionButton(
+        _ label: String,
+        prominent: Bool = false,
+        loading: Bool = false,
+        disabled: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
         Button(action: action) {
             HStack(spacing: 6) {
                 if loading { ProgressView().controlSize(.mini) }
@@ -422,7 +457,7 @@ struct HealthView: View {
             .overlay(prominent ? nil : RoundedRectangle(cornerRadius: 7).strokeBorder(p.border))
         }
         .buttonStyle(.plain)
-        .disabled(loading)
+        .disabled(loading || disabled)
     }
 
     private func color(_ status: HealthStatus) -> Color {

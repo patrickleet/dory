@@ -88,6 +88,9 @@ final class AppStore {
     var healthActiveLoading = false
     var healthActionInFlight = false
     var healthActionError: String?
+    var healthSupportBundleInFlight = false
+    var healthSupportBundlePath: String?
+    var healthSupportBundleMessage: String?
     @ObservationIgnored private var healthLoadToken = 0
     var processMemorySnapshot: DoryProcessMemorySnapshot = .empty
     @ObservationIgnored private var processMemoryTask: Task<Void, Never>?
@@ -1904,6 +1907,22 @@ final class AppStore {
 
     func runHealthRepair() async {
         await runRepairTarget("all")
+    }
+
+    func collectHealthSupportBundle(active: Bool = false) async {
+        guard !healthSupportBundleInFlight, !healthActionInFlight else { return }
+        healthSupportBundleInFlight = true
+        healthSupportBundlePath = nil
+        healthSupportBundleMessage = nil
+        healthActionError = nil
+        let result = await HealthDiagnostics.collectSupportBundle(active: active)
+        if result.ok, let bundle = result.bundle {
+            healthSupportBundlePath = bundle.path
+            healthSupportBundleMessage = bundle.share
+        } else {
+            healthActionError = result.output.isEmpty ? "Support bundle collection failed" : result.output
+        }
+        healthSupportBundleInFlight = false
     }
 
     func runRepairTarget(_ target: String) async {

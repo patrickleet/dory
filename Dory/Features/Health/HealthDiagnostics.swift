@@ -198,6 +198,14 @@ struct IncidentReport: Decodable, Sendable {
     let incidents: [Incident]
 }
 
+struct SupportBundleResult: Decodable, Sendable, Equatable {
+    let schema: String
+    let version: Int
+    let path: String
+    let redacted: Bool
+    let share: String
+}
+
 struct FailableDecodable<Wrapped: Decodable>: Decodable {
     let value: Wrapped?
     init(from decoder: Decoder) throws {
@@ -378,6 +386,14 @@ enum HealthDiagnostics {
         let result = await run(cli, arguments, timeout: timeout)
         let output = result.stdout.isEmpty ? result.stderr : result.stdout
         return (result.ok, output.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    static func collectSupportBundle(active: Bool) async -> (ok: Bool, bundle: SupportBundleResult?, output: String) {
+        var arguments = ["support", "bundle", "--json"]
+        if active { arguments.append("--active") }
+        let result = await runControl(arguments, timeout: active ? 180 : 120)
+        let bundle: SupportBundleResult? = decode(result.output)
+        return (result.ok && bundle != nil, bundle, result.output)
     }
 
     private static func run(_ cli: URL, _ arguments: [String], timeout: TimeInterval = 90) async -> (ok: Bool, stdout: String, stderr: String) {
