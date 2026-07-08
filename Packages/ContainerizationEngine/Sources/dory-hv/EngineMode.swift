@@ -255,13 +255,11 @@ enum EngineMode {
         }
 
         try machine.loadBootPayload()
-        // engine.sock is served by dory-hv over vsock from boot: the gvproxy unix forward tears the
-        // stream down on the docker CLI's post-request half-close, which silences every foreground
-        // `docker run`/`attach`. Connections before the guest agent listens fail fast and the app's
-        // readiness probe retries, so nothing waits on the sidecar; if the agent never becomes
-        // reachable at all, the agent-unavailable path below falls back to a gvproxy forward so
-        // basic Docker still works (degraded attach) rather than not at all. Promoting mid-flight
-        // instead would leave the shim's pooled keep-alive connections on the degraded path forever.
+        // engine.sock is the sole Docker path: dory-hv serves it over vsock from boot. A gvproxy unix
+        // forward instead tears the stream down on the docker CLI's post-request half-close, which
+        // silences every foreground `docker run`/`attach`, so we never republish engineSocket to one.
+        // Connections before the guest agent listens fail fast and the app's readiness probe retries,
+        // so nothing waits on the sidecar.
         DockerSocketBridge(socketPath: configuration.engineSocket, log: { note($0) }).attach(to: vsock)
         if let forwardSocket = configuration.agentVsockForward {
             AgentVsockForward(socketPath: forwardSocket, guestCID: 3, log: { note($0) }).attach(to: vsock)
@@ -307,19 +305,6 @@ enum EngineMode {
         let usbControlServer = UsbControlServer(path: configuration.stateDirectory + "/usb-control.sock", handler: usbControlHandler)
         do { try usbControlServer.start() } catch { note("usb control server unavailable: \(error)") }
 
-        let agentFeatures = AgentFeatureHandles()
-        let shares = configuration.shares
-        Task.detached {
-            guard await probeAgent(vsock: vsock) else {
-                note("guest agent unavailable; falling back to a gvproxy docker forward (degraded attach); machine port-forward/clock/fs-relay disabled")
-                publishForward(local: configuration.engineSocket, guestPort: 2375, apiSocket: apiSocket, label: "docker socket (agent fallback)")
-                return
-            }
-            note("guest agent reachable; enabling machine port-forward and file-event relay")
-            agentFeatures.setMachinePortTimer(startMachinePortWatcher(vsock: vsock, forwarder: portForwarder))
-            agentFeatures.setRelay(startFileEventRelay(shares: shares, vsock: vsock))
-        }
-
         let memory = machine.memory
         let gauge = DispatchSource.makeTimerSource(queue: .global())
         gauge.schedule(deadline: .now() + 60, repeating: 60)
@@ -332,36 +317,8 @@ enum EngineMode {
 
         let stop = try machine.run()
         directIPBridge?.stop()
-        agentFeatures.cancel()
         gauge.cancel()
         note("engine stopped: \(stop)")
-    }
-
-    private final class AgentFeatureHandles: @unchecked Sendable {
-        private let lock = NSLock()
-        private var machinePortTimer: (any DispatchSourceTimer)?
-        private var relay: HostFSEventRelay?
-
-        func setMachinePortTimer(_ timer: any DispatchSourceTimer) {
-            lock.lock()
-            defer { lock.unlock() }
-            machinePortTimer = timer
-        }
-
-        func setRelay(_ relay: HostFSEventRelay?) {
-            lock.lock()
-            defer { lock.unlock() }
-            self.relay = relay
-        }
-
-        func cancel() {
-            lock.lock()
-            defer { lock.unlock() }
-            machinePortTimer?.cancel()
-            machinePortTimer = nil
-            relay?.stop()
-            relay = nil
-        }
     }
 
     /// Flushes a freshly written file to stable storage before it is renamed into place, so a
@@ -525,126 +482,6 @@ enum EngineMode {
 
     private static func shellQuote(_ value: String) -> String {
         "'\(value.replacingOccurrences(of: "'", with: "'\"'\"'"))'"
-    }
-
-    private static func startFileEventRelay(shares: [VirtioFSShareConfiguration], vsock: VirtioVsock) -> HostFSEventRelay? {
-        guard !shares.isEmpty else { return nil }
-        let eventShares = shares.map {
-            HostFSEventShare(hostRoot: $0.path, guestRoot: "/mnt/dory/\($0.tag)")
-        }
-        let relay = HostFSEventRelay(shares: eventShares) { paths in
-            guard !paths.isEmpty else { return }
-            let connection = vsock.connect(port: VsockPorts.agent)
-            defer { connection.close() }
-            let transport = AgentVsockTransport(connection: connection, readTimeoutNanoseconds: 2_000_000_000)
-            let channel = AgentChannel(transport: transport)
-            do {
-                let result = try await channel.sendFSEventBatch(paths: paths)
-                note("file event relay touched \(result.touched)/\(paths.count) paths")
-            } catch {
-                note("file event relay skipped batch: \(error)")
-            }
-        }
-        relay.start()
-        note("file event relay watching \(shares.count) share(s)")
-        return relay
-    }
-
-    private final class ForwardedPortSet: @unchecked Sendable {
-        private let lock = NSLock()
-        private var ports = Set<UInt16>()
-
-        func snapshot() -> Set<UInt16> {
-            lock.lock()
-            defer { lock.unlock() }
-            return ports
-        }
-
-        func insert(_ port: UInt16) {
-            lock.lock()
-            defer { lock.unlock() }
-            ports.insert(port)
-        }
-
-        func remove(_ port: UInt16) {
-            lock.lock()
-            defer { lock.unlock() }
-            ports.remove(port)
-        }
-    }
-
-    private static func reconcileMachinePorts(
-        snapshot: AgentPortSnapshot,
-        forwarded: ForwardedPortSet,
-        forwarder: PortForwarder
-    ) async {
-        let desired = Set(snapshot.ports.filter(MachinePortPolicy.isForwardable).map(\.port))
-        let alreadyForwarded = forwarded.snapshot()
-        for port in desired.subtracting(alreadyForwarded) {
-            if await forwarder.exposeMachinePort(port) {
-                forwarded.insert(port)
-                note("machine port forward: exposed 127.0.0.1:\(port)")
-            }
-        }
-        for port in alreadyForwarded.subtracting(desired) {
-            if await forwarder.unexposeMachinePort(port) {
-                forwarded.remove(port)
-                note("machine port forward: released 127.0.0.1:\(port)")
-            }
-        }
-    }
-
-    private static func startMachinePortWatcher(vsock: VirtioVsock, forwarder: PortForwarder) -> any DispatchSourceTimer {
-        let forwarded = ForwardedPortSet()
-        let timer = DispatchSource.makeTimerSource(queue: .global())
-        timer.schedule(deadline: .now() + 5, repeating: 2)
-        timer.setEventHandler {
-            Task.detached {
-                let connection = vsock.connect(port: VsockPorts.agent)
-                defer { connection.close() }
-                let transport = AgentVsockTransport(connection: connection, readTimeoutNanoseconds: 2_000_000_000)
-                let channel = AgentChannel(transport: transport)
-                do {
-                    let snapshot = try await channel.watchPorts()
-                    await reconcileMachinePorts(snapshot: snapshot, forwarded: forwarded, forwarder: forwarder)
-                } catch {
-                    note("machine port watch skipped poll: \(error)")
-                }
-            }
-        }
-        timer.resume()
-        note("machine port watcher polling guest agent")
-        return timer
-    }
-
-    private static func probeAgent(vsock: VirtioVsock, attempts: Int = 15) async -> Bool {
-        for attempt in 0..<attempts {
-            let connection = vsock.connect(port: VsockPorts.agent)
-            let transport = AgentVsockTransport(connection: connection, readTimeoutNanoseconds: 1_000_000_000)
-            let channel = AgentChannel(transport: transport)
-            do {
-                let info: GuestAgentInfo = try await channel.call("info", EmptyAgentProbeParams())
-                guard info.protocolVersion >= 1 else { throw AgentProtocolError.malformedFrame }
-                connection.close()
-                return true
-            } catch {
-                connection.close()
-                if attempt < attempts - 1 {
-                    try? await Task.sleep(nanoseconds: 1_000_000_000)
-                }
-            }
-        }
-        return false
-    }
-
-    private struct EmptyAgentProbeParams: Encodable {}
-
-    private struct GuestAgentInfo: Decodable {
-        var protocolVersion: Int
-
-        enum CodingKeys: String, CodingKey {
-            case protocolVersion = "protocol_version"
-        }
     }
 
     /// Asks gvproxy to serve a guest TCP port as a host unix socket, retrying until the listener
