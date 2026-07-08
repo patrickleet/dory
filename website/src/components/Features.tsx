@@ -98,7 +98,7 @@ export function Features() {
           </li>
           <li>Migration imports images and containers from Docker Desktop or OrbStack after a confidence report.</li>
           <li>Managed settings export local policy for engine route, domains, file sharing, Auto-Idle, and telemetry none.</li>
-          <li>First launch is guided end-to-end, including a one-click engine toolchain install.</li>
+          <li>First launch is guided end-to-end; full bundles already include the engine toolchain.</li>
           <li>
             Honest scorecard: every feature's status is tracked publicly in{' '}
             <a

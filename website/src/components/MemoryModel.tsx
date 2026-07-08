@@ -266,19 +266,10 @@ export function MemoryModel() {
         </Reveal>
         <Reveal as="h2">Every VM you don't boot is RAM you keep.</Reveal>
         <Reveal as="p" className="lead">
-          The per-container model popularized by{' '}
-          <a
-            href="https://github.com/apple/containerization"
-            target="_blank"
-            rel="noopener"
-            className="link"
-          >
-            Apple's container stack
-          </a>{' '}
-          boots a micro-VM (kernel, init, memory ballast) <em>per container</em>. Dory's own engine
-          boots <b>one</b> persistent VM instead, runs <code className="inline-code">dockerd</code>{' '}
-          inside it, and every container shares that single kernel and memory pool. Watch what happens as
-          containers stack up:
+          Per-container-VM engines boot a micro-VM (kernel, init, memory ballast){' '}
+          <em>per container</em>. Dory's own doryd-managed engine boots <b>one</b> persistent VM
+          instead, runs <code className="inline-code">dockerd</code> inside it, and every container
+          shares that single kernel and memory pool. Watch what happens as containers stack up:
         </Reveal>
         <Reveal className="model-wrap" as="div">
           <div ref={wrapRef} style={{ position: 'relative' }}>

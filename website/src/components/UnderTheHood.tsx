@@ -10,17 +10,9 @@ export function UnderTheHood() {
         <Reveal as="h2">Built like a systems tool, not a wrapper.</Reveal>
         <Reveal as="p" className="lead">
           Dory's transport, HTTP server, YAML parser, and Docker API layer are hand-rolled Swift. No
-          Electron, no Node sidecars, no frameworks between your CLI and the engine. The primary
-          virtualization layer is Dory's own raw Hypervisor.framework VMM, with the{' '}
-          <a
-            href="https://github.com/apple/containerization"
-            target="_blank"
-            rel="noopener"
-            className="link"
-          >
-            Apple Containerization framework
-          </a>
-          {' '}helper kept as a fallback tier.
+          Electron, no Node sidecars, no frameworks between your CLI and the engine. doryd is the
+          launchd-owned control plane, and each local VM is supervised through Dory's own
+          Hypervisor.framework helpers.
         </Reveal>
         <div className="hood">
           <Reveal className="hood-card">

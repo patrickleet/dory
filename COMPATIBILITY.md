@@ -29,10 +29,10 @@ experiments; the shipping shared-VM path fronts a real `dockerd` socket.
 | Image pull | ✅ | `POST /images/create` |
 | Image search (`docker search`) | ✅ | `GET /images/search`; Docker/shared-VM backends search through dockerd. Translated backends query Docker Hub (`index.docker.io/v1/search`) and merge the results with the user's matching local images (local entries tagged, deduped first), falling back to local-only when the registry is unreachable. `is-official`/`is-automated`/`stars` filters and `limit` apply to the merged list |
 | Registry auth (`docker login`) | ✅ | `POST /auth`; Docker/shared-VM backends validate through dockerd, translated backends persist Docker auth config for subsequent pulls |
-| Image tag (`docker tag`) | ✅ | `POST /images/{name}/tag`; Docker/shared-VM backends proxy/forward to dockerd, Apple backend maps to `container image tag` |
-| Image push (`docker push`) | ✅ | `POST /images/{name}/push`; Docker/shared-VM backends stream native dockerd progress with registry auth, Apple backend maps to `container image push` |
+| Image tag (`docker tag`) | ✅ | `POST /images/{name}/tag`; Docker/shared-VM backends proxy/forward to dockerd |
+| Image push (`docker push`) | ✅ | `POST /images/{name}/push`; Docker/shared-VM backends stream native dockerd progress with registry auth |
 | Image save / load / commit | ✅ | `GET /images/{name}/get`, `GET /images/get?names=...`, `POST /images/load`, `POST /commit`; Docker/shared-VM backends use daemon-native multi-image save, translated backends use a runtime-provided batch archive when available and otherwise report unsupported |
-| Network list / create / remove / connect / disconnect | 🟡 | `GET /networks` includes `id`, `name`, `driver`, `scope`, `type`, and `label` filters on translated backends; create/remove/connect/disconnect endpoints exist, but Apple's `container` CLI has no post-create connect/disconnect command yet |
+| Network list / create / remove / connect / disconnect | ✅ | Docker/shared-VM backends proxy/forward native dockerd network APIs; translated test runtimes keep coverage for `id`, `name`, `driver`, `scope`, `type`, and `label` filters |
 | Volume list / create / remove / prune | ✅ | `GET /volumes` includes `name`, `driver`, `dangling`, and `label` filters on translated backends; `POST /volumes/create`, `DELETE /volumes/{id}`, `POST /volumes/prune` |
 | System disk usage (`docker system df`) | ✅ | `GET /system/df`; translated from runtime snapshot images, containers, volumes, and empty BuildKit cache when unavailable |
 | Logs (`docker logs`, `-f`) | ✅ | Docker backend: live follow proxied verbatim. Mock/translated test runtimes: Docker raw-stream frames with `tail`, `timestamps`, stdout/stderr suppression, and finite follow via runtime streaming |
@@ -108,42 +108,22 @@ CA trust install remain consent-gated, the same one-time admin grant OrbStack ne
 | `*.k8s.dory.local` service domains | ✅ HTTP + HTTPS | `KubeServiceProxy` runs `kubectl proxy`; the reverse/TLS proxy rewrites `<svc>.<ns>.k8s.dory.local` → the API service proxy. Verified `http`+`https → 200`. TLS cert carries per-namespace wildcard SANs (`*.default.k8s.dory.local`, `*.kube-system.k8s.dory.local`); other namespaces would need their wildcard added |
 | `dory` CLI (OrbStack's `orb`) | ✅ | `scripts/dory` wraps the engine, machines, kubectl, diagnostics, disk/routes, repair, and runtime mode/idle status |
 
-### Bundled VM helper: low-level VM controls delivered
+### Bundled VM helpers: local release surface
 
-Several features need low-level VM control below Docker's API: audio, memory ballooning, the
-Rosetta device, and custom mounts. These are delivered through Dory's bundled `dory-vm` helper, not
-through Apple's separate `container` CLI and not as an Apple Container backend. USB *device*
-passthrough is the exception: the helper attaches a USB controller but does not yet pass a host
-device through - real per-device passthrough is the usbip-over-vsock path (roadmap Track 3.6).
-
-**Foundation built + PROVEN END-TO-END.** `Packages/ContainerizationEngine/` is an additive Swift
-package (separate from the shipping app) that links `apple/containerization` and drives the Linux VM
-directly via Virtualization.framework. It does not just compile. A signed boot harness
-(`dory-vmboot`, adhoc-signed with `com.apple.security.virtualization`) **boots a real Linux VM
-in-process and runs a container**, verified by exit code:
-
-- `exit 42`: VM booted + container ran (kernel + initfs + image store all working in-process).
-- `exit 77`: an **amd64 image ran via Rosetta** (`uname -m == x86_64`) → **Rosetta-fast x86 PROVEN**.
-- `exit 99`: same run also read a **host file through a `Mount.share`** (`/shared/marker.txt`) →
-  **bidirectional file sharing PROVEN**.
-
-**Shipped to users via `dory vm`.** The engine is packaged as a bundled, entitlement-signed helper
-(`Helpers/dory-vm`, built + signed by `scripts/bundle-engine.sh`) that the `dory` CLI and the app
-invoke, exactly how Dory already invokes `container`/`docker`/`kubectl`, so the app gains the
-features without linking the framework's large dependency tree.
+Several features need low-level VM control below Docker's API. For 0.3 the shipping local surfaces
+are doryd's shared Docker engine VM (`dory-hv`) and isolated Linux machine VMs (`dory-vmm`, one
+helper per machine). Older one-off VM experiments remain outside the app UI and are not release
+positioning.
 
 | Capability | Status | Delivery |
 |---|---|---|
-| Rosetta-speed x86 | 🟡 one-off VMs only | `dory vm --arch amd64 --rosetta -- <cmd>` → `uname -m == x86_64` for single-shot VMs. The Rosetta *shared-engine* switch was retired in 0.3 (its guest handshake stalled); day-to-day x86 images run on Dory's own engine via the qemu binfmt toggle instead |
-| Reverse / bidirectional file mount | ✅ **delivered** | `dory vm --mount host:guest -- <cmd>` reads/writes host files in the container. Verified |
-| Audio passthrough | ✅ **delivered** | `dory vm --devices`: a `VZInstanceExtension` injects `VZVirtioSoundDevice`. Verified audio device configured |
-| USB device passthrough | 🚧 **in progress** | `dory vm --devices` attaches a `VZXHCIController`, but **no host USB device is passed through** - it is an empty controller (`USB controllers attached: 1` confirms the controller, not a device). Real per-device passthrough is the usbip-over-vsock path (roadmap Track 3.6), pending the `--usb` hardware gate |
-| Dynamic memory balloon → macOS | ✅ **delivered** | `dory vm --devices` attaches a balloon and reclaims RAM at runtime via the public `vzVirtualMachine`, verified `1024MiB → 512MiB reclaimed to macOS` |
-
-**Rosetta, file mount, audio, and the memory balloon are delivered** through the bundled,
-entitlement-signed `dory-vm` helper, surfaced by the
-`dory` CLI (`dory vm`). The default shared-VM engine is untouched. (A GUI entry point for the
-in-process engine is not yet wired up.)
+| Shared Docker engine VM | ✅ | doryd owns one persistent `dory-hv` helper for Docker/Compose/Kubernetes workloads and can stop an empty engine while preserving `/var/lib/docker` on disk |
+| Isolated Linux machines | ✅ | doryd owns one `dory-vmm` helper per machine; machines are real Linux VMs, not Docker containers |
+| Machine addresses | ✅ | Machine definitions include assignable addresses; the app and CLI surface copyable terminal commands such as `dory ssh dev` |
+| Host file mounts | ✅ | Containers use Docker bind mounts through the shared engine; machine mount definitions are persisted by doryd and applied on restart |
+| x86 / amd64 images | 🟡 | Apple silicon uses the qemu binfmt toggle for day-to-day amd64 images; Intel runs amd64 natively when the bundled engine assets pass hardware gates |
+| Memory reclaim | ✅ | The shared engine returns memory as workloads idle, and the Auto-Idle policy stops an empty engine automatically while keeping state on disk |
+| USB/audio passthrough | 🚧 | Not a 0.3 release claim. USB remains the usbip-over-vsock roadmap path; audio device UX is not exposed in the app |
 
 ## Packaging: does the user need anything besides Dory.app?
 

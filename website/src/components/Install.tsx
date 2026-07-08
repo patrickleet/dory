@@ -49,12 +49,10 @@ export function Install() {
             </a>
           </div>
           <p className="req">
-            <b>macOS 14+ (Sonoma) on Apple silicon or Intel</b>, the same floor as OrbStack. The
-            built-in low-memory engine needs macOS 15+ on Apple silicon; on macOS 14 Dory drives a
-            Docker-compatible engine. Intel builds prefer the raw{" "}
-            <code className="inline-code">dory-hv</code> beta when PVH assets are bundled, fall back
-            to the Virtualization.framework helper when VZ assets are bundled, and can always proxy
-            a Docker-compatible local engine.
+            <b>macOS 14+ (Sonoma) on Apple silicon or Intel</b>, the same floor as OrbStack. Full
+            downloads bundle the Dory engine, doryd, Docker, Compose, kubectl, kernels, and rootfs
+            assets so Docker works on a clean Mac. Hardware or asset gates degrade to a
+            Docker-compatible local engine instead of blocking the app.
           </p>
         </Reveal>
         <Reveal className="oss">
