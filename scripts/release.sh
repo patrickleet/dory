@@ -124,12 +124,23 @@ require_tool() {
   command -v "$1" >/dev/null 2>&1 || release_error "required tool '$1' not found"
 }
 
+preflight_macos_floor() {
+  grep -q 'depends_on macos: :sonoma' Casks/dory.rb \
+    || release_error "Homebrew cask must keep macOS 14 Sonoma support"
+  for appcast in docs-build/appcast.xml website/public/appcast.xml; do
+    [ -f "$appcast" ] || continue
+    grep -q '<sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>' "$appcast" \
+      || release_error "$appcast must advertise Sparkle minimumSystemVersion 14.0"
+  done
+}
+
 preflight_release() {
   local requested
   echo "==> Release preflight..."
   for tool in xcodebuild codesign xcrun ditto lipo shasum plutil security; do
     require_tool "$tool"
   done
+  preflight_macos_floor
   if [ "${DORY_MAKE_DMG:-1}" = "1" ]; then
     require_tool hdiutil
   fi

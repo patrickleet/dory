@@ -11,7 +11,9 @@ name: Release
 #   NOTARY_TEAM_ID               Apple Developer Team ID
 #   NOTARY_APPLE_PASSWORD        app-specific password for that Apple ID
 #
-# NOTE: Dory targets macOS 15+ and releases as Apple-silicon, Intel, and universal downloads.
+# NOTE: Dory.app targets macOS 14+ and releases as Apple-silicon, Intel, and universal downloads.
+# The bundled low-memory engine is gated at runtime where host APIs require macOS 15+; macOS 14
+# remains supported for proxying an existing Docker-compatible engine.
 # Engine-bundled releases still need the guest assets present on the runner; set BUNDLE_ENGINE=1
 # only on a runner that has built or fetched those assets.
 
@@ -111,7 +113,7 @@ jobs:
           body: |
             Native, lightweight Docker & Linux containers, a free, open-source alternative to
             OrbStack and Docker Desktop. Optimized downloads for Apple silicon and Intel, plus
-            a universal build, macOS 15+.
+            a universal build, macOS 14+.
             See the release notes and COMPATIBILITY.md for the current built-in engine tier on
             each Mac architecture.
 
@@ -133,6 +135,10 @@ jobs:
             ```
 
             …or download the matching `.dmg` below and drag Dory to Applications.
+
+            Dory.app runs on macOS 14 Sonoma or later. The bundled low-memory engine requires
+            macOS 15+ where Apple host APIs require it; on macOS 14, Dory can manage an existing
+            Docker-compatible engine from Settings → Engine Backend.
 
             ```
             universal zip sha256: ${{ steps.build.outputs.sha256 }}
