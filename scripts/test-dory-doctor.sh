@@ -23,6 +23,24 @@ trap cleanup EXIT
 export HOME="$TMP_HOME"
 export DORY_CONFIG="$TMP_HOME/config.json"
 export DORY_SOCK="$TMP_HOME/missing-dory.sock"
+export DORY_SUPPORT_UNIFIED_LOG=1
+export DORY_SUPPORT_UNIFIED_LOG_LAST=1m
+
+mkdir -p "$TMP_HOME/fake-system-bin"
+cat > "$TMP_HOME/fake-system-bin/sw_vers" <<'SH'
+#!/bin/sh
+printf 'ProductName:\tmacOS\nProductVersion:\t14.7\nBuildVersion:\t23H124\n'
+SH
+cat > "$TMP_HOME/fake-system-bin/launchctl" <<'SH'
+#!/bin/sh
+printf 'service = dev.dory.doryd\nstate = running\ntoken=supersecret\n'
+SH
+cat > "$TMP_HOME/fake-system-bin/log" <<'SH'
+#!/bin/sh
+printf '2026-07-08 00:00:00.000 Dory[123]: Authorization: Bearer secret-token\n'
+SH
+chmod +x "$TMP_HOME/fake-system-bin/sw_vers" "$TMP_HOME/fake-system-bin/launchctl" "$TMP_HOME/fake-system-bin/log"
+export PATH="$TMP_HOME/fake-system-bin:$PATH"
 
 python3 -m py_compile scripts/dory-doctor
 python3 -m py_compile scripts/dory-idle-proxy
@@ -524,7 +542,7 @@ with zipfile.ZipFile(data["bundle"]) as zf:
     assert "doctor.json" in zf.namelist()
 '
 
-mkdir -p "$TMP_HOME/.dory/hv" "$TMP_HOME/.dory/machines/logs"
+mkdir -p "$TMP_HOME/.dory/hv" "$TMP_HOME/.dory/machines/logs" "$TMP_HOME/Library/Logs" "$TMP_HOME/Library/Logs/DiagnosticReports"
 cat > "$TMP_HOME/.dory/doryd.log" <<'LOG'
 Authorization: Bearer secret-token
 token=supersecret
@@ -534,6 +552,12 @@ engine helper ready
 LOG
 cat > "$TMP_HOME/.dory/machines/logs/ready-dev.log" <<'LOG'
 machine ready
+LOG
+cat > "$TMP_HOME/Library/Logs/Dory.log" <<'LOG'
+host app log password=supersecret
+LOG
+cat > "$TMP_HOME/Library/Logs/DiagnosticReports/Dory_2026-07-08.ips" <<'LOG'
+{"incident":"Dory crash","authorization":"Bearer secret-token"}
 LOG
 
 support_json="$(DORYDCTL_BIN="$TMP_HOME/fake-dorydctl" scripts/dory support bundle --json "$TMP_HOME/dory-support.zip")"
@@ -547,23 +571,39 @@ assert os.path.exists(data["path"])
 with zipfile.ZipFile(data["path"]) as zf:
     names = set(zf.namelist())
     assert "doctor.json" in names
+    assert "manifest.json" in names
+    assert "system/launchctl-dev.dory.doryd.txt" in names
+    assert "system/unified-log-dory.txt" in names
     assert "logs/doryd.log" in names
     assert "logs/hv/dory-hv.log" in names
     assert "logs/machines/ready-dev.log" in names
+    assert "logs/app/Dory.log" in names
+    assert "logs/crash/Dory_2026-07-08.ips" in names
     doctor = json.loads(zf.read("doctor.json"))
+    manifest = json.loads(zf.read("manifest.json"))
+    assert manifest["schema"] == "dev.dory.support.bundle.manifest"
+    assert "logs/app/Dory.log" in manifest["entries"]
+    assert doctor["support"]["schema"] == "dev.dory.support.bundle"
+    assert doctor["support"]["redacted"] is True
+    assert doctor["host"]["sw_vers"]["ok"] is True
+    assert "process_memory" in doctor
+    assert doctor["launchd"]["ok"] is True
+    assert doctor["unified_log"]["ok"] is True
     doryd = doctor["doryd"]
     assert doryd["doctor"]["ok"] is True
     assert doryd["health"]["body"]["state"] == "running"
     assert doryd["incidents"]["body"][0]["type"] == "engine.start"
     assert doryd["machines"]["body"][0]["address"] == "dev.dory.local"
     log = zf.read("logs/doryd.log").decode()
+    app_log = zf.read("logs/app/Dory.log").decode()
+    crash_log = zf.read("logs/crash/Dory_2026-07-08.ips").decode()
+    launchd = zf.read("system/launchctl-dev.dory.doryd.txt").decode()
+    unified = zf.read("system/unified-log-dory.txt").decode()
 text = json.dumps(doctor)
-assert "supersecret" not in text
-assert "secret-token" not in text
-assert "supersecret" not in log
-assert "secret-token" not in log
-assert "[redacted]" in text
-assert "[redacted]" in log
+combined = "\n".join([text, log, app_log, crash_log, launchd, unified])
+assert "supersecret" not in combined
+assert "secret-token" not in combined
+assert "[redacted]" in combined
 '
 
 logs_json="$(DORYDCTL_BIN="$TMP_HOME/fake-dorydctl" scripts/dory logs collect --json "$TMP_HOME/dory-logs.zip")"

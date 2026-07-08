@@ -49,6 +49,9 @@ HTTPS_PROXY_PORT = int(os.environ.get("DORY_HTTPS_PROXY_PORT", "8443"))
 DOCKER_IMAGE = os.environ.get("DORY_DOCTOR_IMAGE", "alpine:latest")
 RUN_LABEL_KEY = "dev.dory.doctor"
 LOG_HARD_MAX_BYTES = int(os.environ.get("DORY_LOG_HARD_MAX_BYTES", str(64 * 1024 * 1024)))
+SUPPORT_LOG_TAIL_BYTES = int(os.environ.get("DORY_SUPPORT_LOG_TAIL_BYTES", "300000"))
+SUPPORT_SYSTEM_LOG_BYTES = int(os.environ.get("DORY_SUPPORT_SYSTEM_LOG_BYTES", "300000"))
+SUPPORT_UNIFIED_LOG_LAST = os.environ.get("DORY_SUPPORT_UNIFIED_LOG_LAST", "15m")
 SECRET_KEY_RE = re.compile(r"(token|secret|password|passwd|authorization|auth|credential|key)", re.I)
 BEARER_RE = re.compile(r"Bearer\s+[A-Za-z0-9._~+/-]+=*", re.I)
 BASIC_RE = re.compile(r"Basic\s+[A-Za-z0-9._~+/-]+=*", re.I)
@@ -1806,6 +1809,84 @@ def memory_report() -> dict[str, Any]:
     }
 
 
+def capture_command(command: list[str], timeout: float = 5.0, max_bytes: int = SUPPORT_SYSTEM_LOG_BYTES) -> dict[str, Any]:
+    tool = shutil.which(command[0]) if not command[0].startswith("/") else command[0]
+    if not tool:
+        return {"available": False, "ok": False, "command": command, "error": f"{command[0]} not found"}
+    resolved = [tool, *command[1:]]
+    try:
+        result = subprocess.run(
+            resolved,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return {"available": True, "ok": False, "command": command, "error": f"{command[0]} timed out"}
+    except OSError as exc:
+        return {"available": True, "ok": False, "command": command, "error": str(exc)}
+    stdout = result.stdout or ""
+    stderr = result.stderr or ""
+    truncated_stdout = len(stdout.encode("utf-8", "replace")) > max_bytes
+    truncated_stderr = len(stderr.encode("utf-8", "replace")) > max_bytes
+    if truncated_stdout:
+        stdout = stdout[-max_bytes:]
+    if truncated_stderr:
+        stderr = stderr[-max_bytes:]
+    return {
+        "available": True,
+        "ok": result.returncode == 0,
+        "command": command,
+        "exit_code": result.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+        "stdout_truncated": truncated_stdout,
+        "stderr_truncated": truncated_stderr,
+    }
+
+
+def host_report() -> dict[str, Any]:
+    uname = os.uname()
+    return {
+        "generated_at": now_iso(),
+        "platform": sys.platform,
+        "machine": uname.machine,
+        "release": uname.release,
+        "version": uname.version,
+        "python": sys.version.split()[0],
+        "uid": os.getuid() if hasattr(os, "getuid") else None,
+        "state_root": str(STATE_ROOT),
+        "sw_vers": capture_command(["sw_vers"], timeout=3, max_bytes=16_000) if sys.platform == "darwin" else None,
+    }
+
+
+def launchd_report() -> dict[str, Any]:
+    if sys.platform != "darwin" or not hasattr(os, "getuid"):
+        return {"available": False, "ok": False, "error": "launchd diagnostics are macOS-only"}
+    return capture_command(
+        ["launchctl", "print", f"gui/{os.getuid()}/dev.dory.doryd"],
+        timeout=5,
+        max_bytes=120_000,
+    )
+
+
+def unified_log_report() -> dict[str, Any]:
+    if sys.platform != "darwin":
+        return {"available": False, "ok": False, "error": "unified logs are macOS-only"}
+    if os.environ.get("DORY_SUPPORT_UNIFIED_LOG", "1").lower() in {"0", "false", "no", "off"}:
+        return {"available": False, "ok": False, "error": "disabled by DORY_SUPPORT_UNIFIED_LOG"}
+    predicate = (
+        'process == "Dory" OR process == "doryd" OR process == "dory-hv" OR '
+        'process == "dory-vmm" OR process == "gvproxy" OR process == "dory-network-helper"'
+    )
+    return capture_command(
+        ["log", "show", "--style", "compact", "--last", SUPPORT_UNIFIED_LOG_LAST, "--predicate", predicate],
+        timeout=8,
+        max_bytes=SUPPORT_SYSTEM_LOG_BYTES,
+    )
+
+
 def parse_scutil_proxy(text: str) -> dict[str, Any]:
     fields: dict[str, str] = {}
     for line in text.splitlines():
@@ -2193,6 +2274,46 @@ def doryd_support_snapshot() -> dict[str, Any]:
     }
 
 
+def safe_archive_name_part(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._") or "log"
+
+
+def unique_archive_name(name: str, used: set[str]) -> str:
+    if name not in used:
+        used.add(name)
+        return name
+    path = Path(name)
+    stem = path.stem or "log"
+    suffix = "".join(path.suffixes)
+    parent = "" if str(path.parent) == "." else f"{path.parent}/"
+    index = 2
+    while True:
+        candidate = f"{parent}{stem}-{index}{suffix}"
+        if candidate not in used:
+            used.add(candidate)
+            return candidate
+        index += 1
+
+
+def recent_files(root: Path, patterns: list[str], limit: int) -> list[Path]:
+    if not root.is_dir():
+        return []
+    matched: list[Path] = []
+    for pattern in patterns:
+        matched.extend(path for path in root.glob(pattern) if path.is_file())
+    unique: dict[Path, Path] = {}
+    for path in matched:
+        try:
+            unique[path.resolve()] = path
+        except OSError:
+            continue
+    return sorted(
+        unique.values(),
+        key=lambda item: item.stat().st_mtime if item.exists() else 0,
+        reverse=True,
+    )[:limit]
+
+
 def unique_log_sources() -> list[tuple[Path, str]]:
     candidates: list[tuple[Path, str]] = []
 
@@ -2215,7 +2336,30 @@ def unique_log_sources() -> list[tuple[Path, str]]:
         for path in paths:
             candidates.append((path, f"{archive_root}/{path.name}"))
 
+    app_log_roots = [
+        HOME / "Library" / "Logs",
+        HOME / "Library" / "Logs" / "Dory",
+        HOME / "Library" / "Containers" / "com.pythonxi.Dory" / "Data" / "Library" / "Logs",
+    ]
+    app_patterns = ["Dory*.log*", "dory*.log*", "com.pythonxi.Dory*.log*", "dev.dory*.log*"]
+    for root in app_log_roots:
+        for path in recent_files(root, app_patterns, 20):
+            candidates.append((path, f"logs/app/{safe_archive_name_part(path.name)}"))
+
+    crash_root = HOME / "Library" / "Logs" / "DiagnosticReports"
+    crash_patterns = [
+        "Dory*.crash", "Dory*.ips", "Dory*.diag",
+        "dory*.crash", "dory*.ips", "dory*.diag",
+        "doryd*.crash", "doryd*.ips",
+        "dory-hv*.crash", "dory-hv*.ips",
+        "dory-vmm*.crash", "dory-vmm*.ips",
+        "gvproxy*.crash", "gvproxy*.ips",
+    ]
+    for path in recent_files(crash_root, crash_patterns, 20):
+        candidates.append((path, f"logs/crash/{safe_archive_name_part(path.name)}"))
+
     seen: set[Path] = set()
+    used_names: set[str] = set()
     result: list[tuple[Path, str]] = []
     for path, archive_name in candidates:
         try:
@@ -2225,7 +2369,7 @@ def unique_log_sources() -> list[tuple[Path, str]]:
         if resolved in seen or not path.is_file():
             continue
         seen.add(resolved)
-        result.append((path, archive_name))
+        result.append((path, unique_archive_name(archive_name, used_names)))
     return result
 
 
@@ -2237,7 +2381,18 @@ def bundle(path: Path | None, active: bool = False) -> Path:
     doctor = Doctor(active=active)
     results = doctor.run_all()
     payload = {
+        "support": {
+            "schema": "dev.dory.support.bundle",
+            "version": 1,
+            "redacted": True,
+            "active_probes": active,
+            "log_tail_bytes": SUPPORT_LOG_TAIL_BYTES,
+            "unified_log_last": SUPPORT_UNIFIED_LOG_LAST,
+        },
         "generated_at": now_iso(),
+        "host": host_report(),
+        "process_memory": memory_report(),
+        "launchd": launchd_report(),
         "doctor": [result.as_dict() for result in results],
         "routes": route_table(),
         "proxy": proxy_report(),
@@ -2249,11 +2404,38 @@ def bundle(path: Path | None, active: bool = False) -> Path:
         "config": load_config(),
         "environment": safe_environment(),
     }
+    unified_log = unified_log_report()
+    payload["unified_log"] = {
+        key: value for key, value in unified_log.items() if key not in {"stdout", "stderr"}
+    }
+    written: list[str] = []
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("doctor.json", json.dumps(redact(payload), indent=2, sort_keys=True) + "\n")
+        def write_text(name: str, text: str) -> None:
+            zf.writestr(name, redact_str(text))
+            written.append(name)
+
+        write_text("doctor.json", json.dumps(redact(payload), indent=2, sort_keys=True) + "\n")
+        if payload["launchd"].get("available"):
+            write_text(
+                "system/launchctl-dev.dory.doryd.txt",
+                (payload["launchd"].get("stdout") or payload["launchd"].get("stderr") or "") + "\n",
+            )
+        if unified_log.get("available"):
+            write_text(
+                "system/unified-log-dory.txt",
+                (unified_log.get("stdout") or unified_log.get("stderr") or "") + "\n",
+            )
         for source, name in unique_log_sources():
             if source.exists() and source.is_file():
-                zf.writestr(name, redact(tail_text(source, 300_000)))
+                write_text(name, tail_text(source, SUPPORT_LOG_TAIL_BYTES))
+        manifest = {
+            "schema": "dev.dory.support.bundle.manifest",
+            "version": 1,
+            "generated_at": payload["generated_at"],
+            "redacted": True,
+            "entries": sorted(written),
+        }
+        zf.writestr("manifest.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     return path
 
 
