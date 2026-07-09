@@ -1741,11 +1741,12 @@ final class AppStore {
             sharedVMStatus = "Sleeping — Docker use wakes it."
             return true
         case "running":
-            if engineSleeping {
-                engineSleeping = false
-                engineActivity.setSleeping(false)
-                engineActivity.touch()
-            }
+            engineSleeping = false
+            engineRunning = true
+            loadState = .ready
+            engineActivity.setSleeping(false)
+            engineActivity.touch()
+            sharedVMStatus = status.detail.isEmpty ? "Running through doryd" : status.detail
             return false
         case "stopped", "failed", "unconfigured":
             engineSleeping = false

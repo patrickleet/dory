@@ -81,7 +81,7 @@ struct MenuBarContentView: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text("Dory").font(.system(size: 13, weight: .bold)).foregroundStyle(p.text)
                 Text("\(engineSummary) · \(store.processMemorySnapshot.totalResidentDisplay)")
-                    .font(.system(size: 11, weight: .semibold)).foregroundStyle(p.green)
+                    .font(.system(size: 11, weight: .semibold)).foregroundStyle(engineStatusColor())
             }
             Spacer(minLength: 0)
             Button { refreshPopover() } label: {
@@ -137,15 +137,32 @@ struct MenuBarContentView: View {
     }
 
     private var engineSummary: String {
-        if store.engineSleeping { return "Engine sleeping" }
-        if store.engineRunning { return "Engine running" }
-        return "Engine off"
+        engineStatus.title
+    }
+
+    private var engineStatus: EnginePopoverStatus {
+        EnginePopoverStatus(
+            loadState: store.loadState,
+            running: store.engineRunning,
+            sleeping: store.engineSleeping,
+            detail: store.sharedVMStatus
+        )
+    }
+
+    private func engineStatusColor(_ status: EnginePopoverStatus? = nil) -> Color {
+        switch (status ?? engineStatus).tone {
+        case .running: p.green
+        case .sleeping, .starting: p.amber
+        case .off: p.text3
+        case .error: p.red
+        }
     }
 
     private var runtimeSection: some View {
-        quickSection(
-            title: "Daemon & Idle",
-            subtitle: "\(store.runtimeAuthorityDisplay) · \(store.runtimeMode)",
+        let engine = engineStatus
+        return quickSection(
+            title: "Daemon & Engine",
+            subtitle: "\(engine.title) · \(store.runtimeMode)",
             systemImage: "bolt.horizontal.circle",
             expanded: $runtimeExpanded,
             open: { openSection(.health) }
@@ -159,12 +176,12 @@ struct MenuBarContentView: View {
                 rowIcon("stethoscope", "Open Health") { openSection(.health) }
             }
             quickRow(
-                dot: store.engineSleeping ? p.amber : (store.engineRunning ? p.green : p.text3),
-                title: "Auto-Idle",
-                subtitle: "Sleep after \(store.idlePolicy.sleepAfterMinutes)m",
-                value: store.runtimeMode
+                dot: engineStatusColor(engine),
+                title: "Engine",
+                subtitle: engine.subtitle,
+                value: engine.value
             ) {
-                rowIcon("gearshape", "Auto-Idle Settings") { openSettings(.autoIdle) }
+                rowIcon("gearshape", "Engine Settings") { openSettings(.engine) }
             }
         }
     }
@@ -399,7 +416,8 @@ struct MenuBarContentView: View {
         switch role {
         case .app: p.accentText
         case .daemon: p.green
-        case .dockerVM, .machineVM: p.amber
+        case .dockerVM: engineStatusColor()
+        case .machineVM: p.green
         case .networking: p.accent
         case .helper: p.text3
         }
@@ -538,5 +556,61 @@ struct MenuBarContentView: View {
             }
             .buttonStyle(.plain)
         }
+    }
+}
+
+private enum EnginePopoverTone {
+    case running
+    case sleeping
+    case starting
+    case off
+    case error
+}
+
+private struct EnginePopoverStatus {
+    var title: String
+    var subtitle: String
+    var value: String
+    var tone: EnginePopoverTone
+
+    init(loadState: LoadState, running: Bool, sleeping: Bool, detail: String) {
+        let trimmedDetail = detail.trimmingCharacters(in: .whitespacesAndNewlines)
+        if sleeping {
+            title = "Engine sleeping"
+            subtitle = trimmedDetail.isEmpty ? "Docker use wakes it" : trimmedDetail
+            value = "sleeping"
+            tone = .sleeping
+        } else if running || loadState == .ready {
+            title = "Engine running"
+            subtitle = trimmedDetail.isEmpty ? "Docker API is reachable" : trimmedDetail
+            value = "running"
+            tone = .running
+        } else if loadState == .connecting {
+            title = "Engine starting"
+            subtitle = trimmedDetail.isEmpty ? "Waiting for doryd" : trimmedDetail
+            value = "starting"
+            tone = .starting
+        } else if Self.detailLooksLikeError(trimmedDetail) {
+            title = "Engine needs attention"
+            subtitle = trimmedDetail.isEmpty ? "Open Health for details" : trimmedDetail
+            value = "error"
+            tone = .error
+        } else {
+            title = "Engine off"
+            subtitle = trimmedDetail.isEmpty ? "Start Dory's engine to use Docker" : trimmedDetail
+            value = "off"
+            tone = .off
+        }
+    }
+
+    private static func detailLooksLikeError(_ detail: String) -> Bool {
+        let lowered = detail.lowercased()
+        return lowered.contains("could not")
+            || lowered.contains("failed")
+            || lowered.contains("failure")
+            || lowered.contains("unavailable")
+            || lowered.contains("did not answer")
+            || lowered.contains("no docker")
+            || lowered.contains("error")
     }
 }
