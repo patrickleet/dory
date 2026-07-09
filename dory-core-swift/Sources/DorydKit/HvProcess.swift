@@ -77,6 +77,18 @@ public final class HvProcess: @unchecked Sendable {
         return process?.isRunning == true
     }
 
+    public var terminationStatus: Int32? {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastTerminationStatus
+    }
+
+    public var launchError: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastLaunchError
+    }
+
     public func start() throws {
         lock.lock()
         defer { lock.unlock() }
@@ -195,7 +207,10 @@ public final class HvProcess: @unchecked Sendable {
         lock.lock()
         stopping = true
         task = process
+        // Take-and-null the handle so exactly one of stop()/handleTermination closes it; a
+        // double close could otherwise land on a recycled fd.
         oldLog = logHandle
+        logHandle = nil
         wasSuspended = suspended
         suspended = false
         lock.unlock()

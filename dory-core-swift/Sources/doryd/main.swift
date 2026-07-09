@@ -75,10 +75,19 @@ let networkRouteReconciler = networkingController.map { controller in
     )
 }
 let dnsTargets = wakeDNSProbeTargets(env["DORYD_WAKE_DNS_PROBES"])
+let idlePolicyStore = IdlePolicyStore(home: dorydEnvironment.home, environment: env) {
+    dockerTier?.containerSummariesForIdle() ?? .ok([])
+}
 var sleepHandlers: [HostSleepHandling] = []
 var clockSyncers: [WakeClockSyncing] = []
 if let dockerTier {
-    sleepHandlers.append(dockerTier)
+    sleepHandlers.append(PolicyAwareHostSleepHandler(
+        name: "docker",
+        handler: dockerTier,
+        shouldAttemptSleep: {
+            idlePolicyStore.managedEngineSleepEnabled()
+        }
+    ))
     clockSyncers.append(dockerTier)
 }
 if let machineManager {
@@ -91,6 +100,10 @@ let wakeCoordinator = HostWakeCoordinator(
     incidentWriter: incidentWriter
 )
 let socketPath = dockerTier?.socketPath ?? socket.path
+let shouldAutostartDockerTier = DockerTierStartupPolicy.shouldAutostartDockerTier(
+    environment: env,
+    persistedRuntimeMode: idlePolicyStore.currentRuntimeMode()
+)
 if dockerTier == nil {
     let socketFD: Int32
     do {
@@ -100,7 +113,7 @@ if dockerTier == nil {
     }
     _ = socketFD
     FileHandle.standardError.write(Data("doryd: bound \(socket.path)\n".utf8))
-} else if env["DORYD_AUTOSTART_DOCKER_TIER"] == "1" {
+} else if shouldAutostartDockerTier {
     do {
         try dockerTier?.start()
         FileHandle.standardError.write(Data("doryd: docker tier serving \(socketPath)\n".utf8))
@@ -116,9 +129,6 @@ if dockerTier == nil {
     }
 }
 
-let idlePolicyStore = IdlePolicyStore(home: dorydEnvironment.home, environment: env) {
-    dockerTier?.containerSummariesForIdle() ?? .ok([])
-}
 let idleSleepScheduler = dockerTier.flatMap { tier -> IdleSleepScheduler? in
     guard let baseConfiguration = dorydEnvironment.idleSleepConfiguration() else { return nil }
     return IdleSleepScheduler(

@@ -1,9 +1,11 @@
+import Darwin
 import Foundation
 
 public enum DoryShellError: Error, Sendable, Equatable, CustomStringConvertible {
     case launchFailed(String)
     case nonZeroExit(Int32, String)
     case toolNotFound(String)
+    case invalidArgument(String)
 
     public var description: String {
         switch self {
@@ -13,6 +15,8 @@ public enum DoryShellError: Error, Sendable, Equatable, CustomStringConvertible 
             return "process exited \(code): \(output)"
         case let .toolNotFound(tool):
             return "tool not found: \(tool)"
+        case let .invalidArgument(message):
+            return "invalid argument: \(message)"
         }
     }
 }
@@ -60,7 +64,14 @@ public struct DoryLocalCA {
     }
 
     public var caExists: Bool {
-        fileManager.fileExists(atPath: caCertificate.path) && fileManager.fileExists(atPath: caKey.path)
+        guard fileManager.fileExists(atPath: caCertificate.path),
+              fileManager.fileExists(atPath: caKey.path) else {
+            return false
+        }
+        // A crash mid-generation can leave a truncated cert; require it to actually parse
+        // so ensureCA regenerates instead of leaving TLS permanently broken.
+        guard let openssl = opensslPath else { return true }
+        return (try? DoryShell.run(openssl, ["x509", "-in", caCertificate.path, "-noout"])) != nil
     }
 
     public func ensureCA() throws {
@@ -68,20 +79,55 @@ public struct DoryLocalCA {
         if caExists { return }
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
-        try DoryShell.run(openssl, [
-            "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
-            "-keyout", caKey.path, "-out", caCertificate.path, "-days", "3650",
-            "-subj", "/CN=Dory Local CA/O=Dory",
-            "-addext", "basicConstraints=critical,CA:TRUE",
-            "-addext", "keyUsage=critical,keyCertSign,cRLSign",
-        ])
-        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: caKey.path)
-        try fileManager.setAttributes([.posixPermissions: 0o644], ofItemAtPath: caCertificate.path)
+
+        let temporaryKey = directory.appendingPathComponent("ca.key.tmp-\(UUID().uuidString)")
+        let temporaryCert = directory.appendingPathComponent("ca.crt.tmp-\(UUID().uuidString)")
+        defer {
+            try? fileManager.removeItem(at: temporaryKey)
+            try? fileManager.removeItem(at: temporaryCert)
+        }
+
+        // Create the private key 0600 from the outset via umask, not chmod-after, so it is
+        // never briefly group/world-readable.
+        let previousMask = umask(0o177)
+        do {
+            try DoryShell.run(openssl, [
+                "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
+                "-keyout", temporaryKey.path, "-out", temporaryCert.path, "-days", "3650",
+                "-subj", "/CN=Dory Local CA/O=Dory",
+                "-addext", "basicConstraints=critical,CA:TRUE",
+                "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+            ])
+            umask(previousMask)
+        } catch {
+            umask(previousMask)
+            throw error
+        }
+        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporaryKey.path)
+        try fileManager.setAttributes([.posixPermissions: 0o644], ofItemAtPath: temporaryCert.path)
+
+        // Publish atomically so a crash mid-write can never leave a half-written CA.
+        try atomicPublish(from: temporaryKey, to: caKey)
+        try atomicPublish(from: temporaryCert, to: caCertificate)
+    }
+
+    private func atomicPublish(from source: URL, to destination: URL) throws {
+        guard rename(source.path, destination.path) == 0 else {
+            throw DoryShellError.launchFailed(
+                "rename \(source.path) -> \(destination.path): \(String(cString: strerror(errno)))"
+            )
+        }
     }
 
     @discardableResult
     public func issue(domain: String, extraSANs: [String] = []) throws -> DoryCertificatePair {
         guard let openssl = opensslPath else { throw DoryShellError.toolNotFound("openssl") }
+        // Validate every name before it lands in the openssl SAN string: a comma or
+        // other metacharacter would otherwise let a caller inject extra SAN entries.
+        try Self.validateCertificateName(domain)
+        for name in extraSANs where !name.isEmpty {
+            try Self.validateCertificateName(name)
+        }
         try ensureCA()
         let safeName = domain.replacingOccurrences(of: "/", with: "_")
         let certificate = directory.appendingPathComponent("\(safeName).crt")
@@ -113,13 +159,33 @@ public struct DoryLocalCA {
         let pair = try issue(domain: domain, extraSANs: extraSANs)
         let safeName = domain.replacingOccurrences(of: "/", with: "_")
         let p12 = directory.appendingPathComponent("\(safeName).p12")
+        // Pass the export passphrase via the environment (env:) rather than argv, so it is
+        // not visible to `ps` while openssl runs.
+        let passphraseVariable = "DORY_LOCALCA_P12_PASS"
+        var childEnvironment = environment
+        childEnvironment[passphraseVariable] = password
         try DoryShell.run(openssl, [
             "pkcs12", "-export", "-inkey", pair.privateKey.path, "-in", pair.certificate.path,
             "-certfile", caCertificate.path, "-out", p12.path,
-            "-passout", "pass:\(password)", "-legacy",
-        ])
+            "-passout", "env:\(passphraseVariable)", "-legacy",
+        ], environment: childEnvironment)
         try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: p12.path)
         return p12
+    }
+
+    private static func validateCertificateName(_ name: String) throws {
+        var value = name
+        if value.hasPrefix("*.") {
+            value = String(value.dropFirst(2))
+        }
+        let labels = value.split(separator: ".", omittingEmptySubsequences: false)
+        guard !labels.isEmpty else { throw DoryShellError.invalidArgument("certificate name: \(name)") }
+        for label in labels {
+            guard !label.isEmpty,
+                  label.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }) else {
+                throw DoryShellError.invalidArgument("certificate name: \(name)")
+            }
+        }
     }
 
     public func verify(certificate: URL) -> Bool {
@@ -163,12 +229,20 @@ public enum DoryShell {
     }
 
     @discardableResult
-    public static func run(_ launchPath: String, _ arguments: [String], cwd: URL? = nil) throws -> String {
+    public static func run(
+        _ launchPath: String,
+        _ arguments: [String],
+        cwd: URL? = nil,
+        environment: [String: String]? = nil
+    ) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: launchPath)
         process.arguments = arguments
         if let cwd {
             process.currentDirectoryURL = cwd
+        }
+        if let environment {
+            process.environment = environment
         }
         let output = Pipe()
         process.standardOutput = output

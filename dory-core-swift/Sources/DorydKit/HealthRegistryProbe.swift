@@ -19,7 +19,7 @@ public final class URLSessionHealthRegistryProbe: HealthRegistryProbing, @unchec
         let tcpID = defaultProbe ? "network.registry_tcp" : "network.registry_tcp.\(slug)"
         let probeData = ["probe": "\(host):\(port)"]
 
-        let resolved = resolve(host: host, port: port)
+        let resolved = resolveWithDeadline(host: host, port: port, timeout: timeout)
         switch resolved {
         case let .failure(message):
             return [
@@ -186,6 +186,41 @@ private final class RegistryProbeResponse: @unchecked Sendable {
         lock.unlock()
         return value
     }
+}
+
+private final class ResolveResultBox: @unchecked Sendable {
+    private let semaphore = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var value: ResolveResult?
+
+    func finish(_ result: ResolveResult) {
+        lock.lock()
+        if value == nil { value = result }
+        lock.unlock()
+        semaphore.signal()
+    }
+
+    func wait(timeout: TimeInterval) -> ResolveResult? {
+        guard semaphore.wait(timeout: .now() + timeout) == .success else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
+// getaddrinfo cannot be cancelled and blocks indefinitely on a wedged resolver, so
+// run it on a worker and bound the wait the same way the HTTPS probe bounds itself.
+private func resolveWithDeadline(host: String, port: Int, timeout: TimeInterval) -> ResolveResult {
+    let box = ResolveResultBox()
+    let thread = Thread {
+        box.finish(resolve(host: host, port: port))
+    }
+    thread.stackSize = 512 * 1024
+    thread.start()
+    guard let result = box.wait(timeout: timeout + 0.5) else {
+        return .failure("timed out after \(timeout)s")
+    }
+    return result
 }
 
 private func resolve(host: String, port: Int) -> ResolveResult {

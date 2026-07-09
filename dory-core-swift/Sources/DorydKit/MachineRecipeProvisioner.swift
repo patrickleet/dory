@@ -77,8 +77,8 @@ public enum MachineRecipeProvisioner {
         case "python", "python-ml":
             return Recipe(
                 id: "python-ml",
-                installScript: "apk add --no-cache python3 py3-pip",
-                verifyCommand: "python3 --version && python3 -m pip --version",
+                installScript: "apk add --no-cache python3 py3-pip py3-numpy",
+                verifyCommand: "python3 --version && python3 -m pip --version && python3 -c 'import numpy'",
                 timeoutMs: 600_000,
                 outputLimitBytes: 4 * 1024 * 1024
             )

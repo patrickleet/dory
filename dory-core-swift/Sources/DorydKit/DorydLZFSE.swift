@@ -8,6 +8,7 @@ public enum DorydLZFSEError: Error, CustomStringConvertible {
     case read
     case write
     case process
+    case decodedTooLarge(Int)
 
     public var description: String {
         switch self {
@@ -17,12 +18,17 @@ public enum DorydLZFSEError: Error, CustomStringConvertible {
         case .read: "read failed"
         case .write: "write failed"
         case .process: "compression_stream_process failed"
+        case .decodedTooLarge(let cap): "decompressed output exceeds \(cap) bytes"
         }
     }
 }
 
 public enum DorydLZFSE {
     private static let chunk = 1 << 20
+    // Guard against a decompression bomb. The largest legitimate payload here is an
+    // engine rootfs ext4 image (a few GiB); 16 GiB leaves generous headroom while
+    // bounding a malicious archive that would otherwise fill the disk.
+    private static let maxDecodedBytes = 16 << 30
 
     public static func compress(source: String, destination: String) throws {
         try transform(source: source, destination: destination, operation: COMPRESSION_STREAM_ENCODE)
@@ -62,6 +68,8 @@ public enum DorydLZFSE {
         stream.dst_ptr = sinkBuffer
         stream.dst_size = chunk
         var inputExhausted = false
+        var totalProduced = 0
+        let decoding = operation == COMPRESSION_STREAM_DECODE
 
         while true {
             if stream.src_size == 0, !inputExhausted {
@@ -80,6 +88,10 @@ public enum DorydLZFSE {
 
             let produced = chunk - stream.dst_size
             if produced > 0 {
+                totalProduced += produced
+                if decoding, totalProduced > maxDecodedBytes {
+                    throw DorydLZFSEError.decodedTooLarge(maxDecodedBytes)
+                }
                 var offset = 0
                 while offset < produced {
                     let written = output.write(sinkBuffer + offset, maxLength: produced - offset)

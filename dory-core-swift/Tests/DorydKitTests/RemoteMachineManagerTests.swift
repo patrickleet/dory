@@ -46,6 +46,25 @@ final class RemoteMachineManagerTests: XCTestCase {
         XCTAssertEqual(fake.closeCount, 1)
     }
 
+    func testConnectClosesLiveAgentWhenInfoFails() {
+        let keyStore = FakeSSHKeyStore(keys: ["primary": "OPENSSH-PRIVATE-KEY"])
+        let fake = FakeRemoteAgentClient(infoError: FakeConnectError.boom)
+        let manager = RemoteMachineManager(keyStore: keyStore) { _ in fake }
+        let machine = RemoteMachineConfiguration(
+            id: "prod",
+            host: "vps.example.com",
+            user: "dory",
+            privateKeyID: "primary",
+            hostKey: .pinned(opensshPublicKey: "ssh-ed25519 AAAA fake"),
+            endpoint: .unixSocket(path: "/run/dory/agent.sock"),
+            remoteRoot: "/srv/app"
+        )
+
+        XCTAssertThrowsError(try manager.connect(machine))
+        XCTAssertEqual(fake.closeCount, 1)
+        XCTAssertEqual(manager.status(id: "prod")?.state, .failed)
+    }
+
     func testUnknownRemoteMachineCannotPush() {
         let manager = RemoteMachineManager(keyStore: FakeSSHKeyStore(keys: [:])) { _ in
             FakeRemoteAgentClient()
@@ -55,6 +74,10 @@ final class RemoteMachineManagerTests: XCTestCase {
             XCTAssertEqual(error as? RemoteMachineError, .unknownMachine("missing"))
         }
     }
+}
+
+private enum FakeConnectError: Error {
+    case boom
 }
 
 private final class FakeSSHKeyStore: SSHKeyStore, @unchecked Sendable {
@@ -81,6 +104,11 @@ private final class FakeRemoteAgentClient: RemoteAgentClient, @unchecked Sendabl
     private let lock = NSLock()
     private var storedPushes: [Push] = []
     private var closes = 0
+    private let infoError: Error?
+
+    init(infoError: Error? = nil) {
+        self.infoError = infoError
+    }
 
     var pushes: [Push] {
         lock.lock()
@@ -95,7 +123,10 @@ private final class FakeRemoteAgentClient: RemoteAgentClient, @unchecked Sendabl
     }
 
     func info() throws -> DoryAgentInfo {
-        DoryAgentInfo(
+        if let infoError {
+            throw infoError
+        }
+        return DoryAgentInfo(
             protocolVersion: 1,
             kernel: "Linux remote",
             agentBuild: "remote-agent",

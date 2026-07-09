@@ -533,19 +533,21 @@ public final class HealthReporter: @unchecked Sendable {
                 action: "The Docker API did not return the container list; run `dory doctor` again once the engine is healthy."
             )
         }
+        // A nil result means the container-list probe itself failed even though the
+        // Docker API is reachable; that is a degraded state, not a genuinely empty
+        // port table (which would return an empty array and pass above).
         return HealthCheck(
             id: "network.published_ports",
-            status: .pass,
-            code: "network.port_table_ok",
-            title: "Published port table readable",
-            detail: "0 published port route(s) found",
-            data: ["ports": "0"]
+            status: .warn,
+            code: "network.port_table_probe_failed",
+            title: "Published port table could not be probed",
+            detail: "The engine is reachable but did not return a container list.",
+            action: "Run `dory doctor` again once the engine has settled."
         )
     }
 
     private func domainTableCheck(dockerReachable: Bool) -> HealthCheck {
         let ports = publishedPorts()
-        let domainCount = ports?.count ?? 0
         guard dockerReachable || ports != nil else {
             return HealthCheck(
                 id: "network.domain_table",
@@ -556,13 +558,25 @@ public final class HealthReporter: @unchecked Sendable {
                 action: "The Docker API did not return the container list; run `dory doctor` again once the engine is healthy."
             )
         }
+        guard let ports else {
+            // Reachable engine but a nil probe result: distinguish this failed probe
+            // from a genuinely empty container set (an empty array passes below).
+            return HealthCheck(
+                id: "network.domain_table",
+                status: .warn,
+                code: "network.domain_table_probe_failed",
+                title: "Domain route table could not be probed",
+                detail: "The engine is reachable but did not return a container list.",
+                action: "Run `dory doctor` again once the engine has settled."
+            )
+        }
         return HealthCheck(
             id: "network.domain_table",
             status: .pass,
             code: "network.domain_table_ok",
             title: "Domain route table readable",
-            detail: "\(domainCount) domain route(s) inferred from containers",
-            data: ["domains": String(domainCount)]
+            detail: "\(ports.count) domain route(s) inferred from containers",
+            data: ["domains": String(ports.count)]
         )
     }
 
@@ -649,7 +663,12 @@ public final class HealthReporter: @unchecked Sendable {
         }
         var usage = rusage()
         if getrusage(RUSAGE_SELF, &usage) == 0 {
+            // Darwin reports ru_maxrss in bytes; Linux reports kilobytes.
+            #if canImport(Darwin)
+            data["rss_bytes"] = String(Int64(usage.ru_maxrss))
+            #else
             data["rss_bytes"] = String(Int64(usage.ru_maxrss) * 1024)
+            #endif
         }
         let rss = data["rss_bytes"].flatMap(Int64.init).map(formatBytes) ?? "unknown"
         return HealthCheck(
@@ -733,7 +752,7 @@ public final class HealthReporter: @unchecked Sendable {
                 code: "engine.stopped",
                 title: "Docker tier is stopped",
                 detail: "engineStart is required before docker traffic can be served",
-                action: "Call engineStart over XPC or set DORYD_AUTOSTART_DOCKER_TIER=1.",
+                action: "Start the engine, or set runtime mode to always-on so doryd starts it on launch.",
                 data: engineData(status)
             )
         case .failed:

@@ -77,13 +77,15 @@ public struct NetworkingAuthorizationApplier: Sendable {
     }
 
     private func validate(plan: NetworkingAuthorizationPlan, expected: NetworkingAuthorizationPlan) throws {
-        let expectedByID = Dictionary(uniqueKeysWithValues: expected.requests.map { ($0.id, $0) })
-        guard Set(plan.requests.map(\.id)) == Set(expectedByID.keys) else {
+        // Compare the ordered sequence, not just the set: requests are applied in the
+        // order supplied, so a reordered plan could otherwise load the pf anchor
+        // (pfEnable) before its file (pfAnchor) is written.
+        guard plan.requests.count == expected.requests.count else {
             throw NetworkingAuthorizationApplyError.unsafeRequest("request-set")
         }
-        for request in plan.requests {
-            guard expectedByID[request.id] == request else {
-                throw NetworkingAuthorizationApplyError.unsafeRequest(request.id)
+        for (submitted, canonical) in zip(plan.requests, expected.requests) {
+            guard submitted == canonical else {
+                throw NetworkingAuthorizationApplyError.unsafeRequest(submitted.id)
             }
         }
     }

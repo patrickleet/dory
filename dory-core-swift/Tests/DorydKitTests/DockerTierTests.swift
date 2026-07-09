@@ -188,6 +188,117 @@ final class DockerTierTests: XCTestCase {
         XCTAssertFalse(idle.snapshot.sleeping)
     }
 
+    func testStartFromSleepingThrowsWhenWakeDoesNotReachDocker() throws {
+        let base = "/tmp/dory-tier-wake-fails-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+
+        let idle = IdleController(now: Date(timeIntervalSince1970: 0))
+        let tier = DockerTier(
+            configuration: DockerTierConfiguration(
+                home: base + "/home",
+                forwardSocketPath: base + "/forward.sock",
+                activitySocketPath: base + "/activity.sock",
+                hvProcess: HvProcessConfiguration(
+                    executablePath: "/bin/sleep",
+                    arguments: ["30"]
+                )
+            ),
+            idleController: idle,
+            dockerReadyWaiter: { _, _ in false }
+        )
+
+        try tier.armSleeping()
+        defer { tier.stop() }
+
+        XCTAssertThrowsError(try tier.start()) { error in
+            XCTAssertTrue("\(error)".contains("did not become ready"), "\(error)")
+        }
+        XCTAssertEqual(tier.status().state, .sleeping)
+        XCTAssertEqual(tier.status().lastError, "docker tier did not become ready after wake")
+        XCTAssertNil(tier.status().hvPID)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tier.socketPath), "failed wake keeps the sleeping dataplane armed")
+        XCTAssertTrue(idle.snapshot.sleeping)
+    }
+
+    func testSleepingFreshWakeDoesNotBlockStatusWhileWaitingForDocker() throws {
+        let base = "/tmp/dory-tier-wake-status-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+
+        let readyWaitEntered = DispatchSemaphore(value: 0)
+        let finishReadyWait = DispatchSemaphore(value: 0)
+        let startFinished = DispatchSemaphore(value: 0)
+        let idle = IdleController(now: Date(timeIntervalSince1970: 0))
+        let tier = DockerTier(
+            configuration: DockerTierConfiguration(
+                home: base + "/home",
+                forwardSocketPath: base + "/forward.sock",
+                activitySocketPath: base + "/activity.sock",
+                hvProcess: HvProcessConfiguration(
+                    executablePath: "/bin/sleep",
+                    arguments: ["30"]
+                )
+            ),
+            idleController: idle,
+            dockerReadyWaiter: { _, _ in
+                readyWaitEntered.signal()
+                return finishReadyWait.wait(timeout: .now() + 2) == .success
+            }
+        )
+
+        try tier.armSleeping()
+        defer { tier.stop() }
+
+        let startError = LockedErrorBox()
+        DispatchQueue.global().async {
+            do {
+                try tier.start()
+            } catch {
+                startError.set(error)
+            }
+            startFinished.signal()
+        }
+
+        XCTAssertEqual(readyWaitEntered.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(tier.status().state, .starting)
+
+        finishReadyWait.signal()
+        XCTAssertEqual(startFinished.wait(timeout: .now() + 2), .success)
+        XCTAssertNil(startError.value)
+        XCTAssertEqual(tier.status().state, .running)
+    }
+
+    func testManagedFreshStartThrowsWhenDockerNeverBecomesReady() throws {
+        let base = "/tmp/dory-tier-start-fails-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+
+        let idle = IdleController(now: Date(timeIntervalSince1970: 0))
+        let tier = DockerTier(
+            configuration: DockerTierConfiguration(
+                home: base + "/home",
+                forwardSocketPath: base + "/forward.sock",
+                activitySocketPath: base + "/activity.sock",
+                hvProcess: HvProcessConfiguration(
+                    executablePath: "/bin/sleep",
+                    arguments: ["30"]
+                )
+            ),
+            idleController: idle,
+            dockerReadyWaiter: { _, _ in false }
+        )
+        defer { tier.stop() }
+
+        XCTAssertThrowsError(try tier.start()) { error in
+            XCTAssertTrue("\(error)".contains("did not become ready"), "\(error)")
+        }
+        XCTAssertEqual(tier.status().state, .failed)
+        XCTAssertEqual(tier.status().lastError, "docker tier did not become ready after wake")
+        XCTAssertNil(tier.status().hvPID)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tier.socketPath))
+    }
+
     func testIdleSleepSuspendsHelperAndWakeResumesSameProcess() async throws {
         let base = "/tmp/dory-tier-sleep-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
         try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
@@ -552,4 +663,21 @@ private func le32(_ bytes: [UInt8]) -> UInt32 {
         | UInt32(bytes[1]) << 8
         | UInt32(bytes[2]) << 16
         | UInt32(bytes[3]) << 24
+}
+
+private final class LockedErrorBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Error?
+
+    var value: Error? {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
+
+    func set(_ error: Error) {
+        lock.lock()
+        stored = error
+        lock.unlock()
+    }
 }

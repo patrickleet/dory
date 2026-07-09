@@ -104,9 +104,12 @@ public final class NetworkingController: @unchecked Sendable {
             try httpProxy.start()
             if let localCACertificatePath = configuration.localCACertificatePath {
                 let ca = DoryLocalCA(directory: URL(fileURLWithPath: localCACertificatePath).deletingLastPathComponent())
+                // Ephemeral per-issuance password: the p12 only exists to hand the identity
+                // to the local TLS proxy, so a fixed password on disk buys nothing.
+                let p12Password = Self.ephemeralPassword()
                 let p12 = try ca.issuePKCS12(
                     domain: configuration.suffix,
-                    password: "dory",
+                    password: p12Password,
                     extraSANs: [
                         "*.k8s.\(configuration.suffix)",
                         "*.default.k8s.\(configuration.suffix)",
@@ -116,7 +119,7 @@ public final class NetworkingController: @unchecked Sendable {
                 let proxy = try DoryTLSProxyServer(
                     port: configuration.httpsProxyPort,
                     p12Path: p12.path,
-                    password: "dory",
+                    password: p12Password,
                     router: router,
                     routes: dnsServer.currentRoutes()
                 )
@@ -158,6 +161,13 @@ public final class NetworkingController: @unchecked Sendable {
             httpsProxyRunning: tlsProxy?.isRunning == true,
             routes: dnsServer.currentRoutes()
         )
+    }
+
+    private static func ephemeralPassword() -> String {
+        var generator = SystemRandomNumberGenerator()
+        return (0..<24)
+            .map { _ in String(format: "%02x", UInt8.random(in: .min ... .max, using: &generator)) }
+            .joined()
     }
 
     public func authorizationPlan(additionalPrivilegedTCPForwards: [PrivilegedTCPForward] = []) throws -> NetworkingAuthorizationPlan {

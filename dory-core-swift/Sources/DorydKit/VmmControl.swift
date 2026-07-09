@@ -69,10 +69,15 @@ public struct UnixMachineBalloonController: MachineBalloonControlling {
 }
 
 public enum VmmControlClient {
+    private static let socketTimeoutSeconds: TimeInterval = 5
+
     public static func send(socketPath: String, request: VmmControlRequest) throws -> VmmControlResponse {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw VmmControlError.syscall("socket", errno) }
         defer { close(fd) }
+
+        // Bound write/read so a wedged dory-vmm can't block the reconcile thread forever.
+        try setSocketTimeouts(fd: fd, seconds: socketTimeoutSeconds)
 
         var address = try unixAddress(path: socketPath)
         let connected = withUnsafePointer(to: &address) { pointer in
@@ -100,6 +105,18 @@ public enum VmmControlClient {
     }
 }
 
+private func setSocketTimeouts(fd: Int32, seconds: TimeInterval) throws {
+    let whole = max(0, Int(seconds))
+    var timeout = timeval(tv_sec: whole, tv_usec: 0)
+    let length = socklen_t(MemoryLayout<timeval>.size)
+    guard setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, length) == 0 else {
+        throw VmmControlError.syscall("setsockopt(SO_SNDTIMEO)", errno)
+    }
+    guard setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, length) == 0 else {
+        throw VmmControlError.syscall("setsockopt(SO_RCVTIMEO)", errno)
+    }
+}
+
 private func unixAddress(path: String) throws -> sockaddr_un {
     var address = sockaddr_un()
     address.sun_family = sa_family_t(AF_UNIX)
@@ -109,7 +126,9 @@ private func unixAddress(path: String) throws -> sockaddr_un {
     }
     withUnsafeMutableBytes(of: &address.sun_path) { destination in
         bytes.withUnsafeBytes { source in
-            destination.baseAddress!.copyMemory(from: source.baseAddress!, byteCount: bytes.count)
+            guard let destinationBase = destination.baseAddress,
+                  let sourceBase = source.baseAddress else { return }
+            destinationBase.copyMemory(from: sourceBase, byteCount: bytes.count)
         }
     }
     return address

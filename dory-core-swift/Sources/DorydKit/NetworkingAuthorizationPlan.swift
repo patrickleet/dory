@@ -124,7 +124,7 @@ public struct NetworkingAuthorizationPlan: Sendable, Equatable, Codable {
 
     public static func make(configuration: NetworkingConfiguration) throws -> NetworkingAuthorizationPlan {
         let suffix = try validatedSuffix(configuration.suffix)
-        try validateIPv4(configuration.dnsBindAddress, field: "dnsBindAddress")
+        try validateResolverNameserver(configuration.dnsBindAddress, field: "dnsBindAddress")
         try validateUnprivilegedPort(configuration.dnsPort, field: "dnsPort")
         try validateUnprivilegedPort(configuration.httpProxyPort, field: "httpProxyPort")
         try validateUnprivilegedPort(configuration.httpsProxyPort, field: "httpsProxyPort")
@@ -175,7 +175,7 @@ public struct NetworkingAuthorizationPlan: Sendable, Equatable, Codable {
         ]
 
         if let caPath = configuration.localCACertificatePath {
-            try validateAbsolutePath(caPath, field: "localCACertificatePath")
+            try validateLocalCACertificatePath(caPath)
             requests.append(NetworkingAuthorizationRequest(
                 id: "trust.local-ca",
                 kind: .localCATrust,
@@ -211,8 +211,9 @@ public struct NetworkingAuthorizationPlan: Sendable, Equatable, Codable {
             forwards[forward.listenPort] = forward.targetPort
         }
 
-        let rules = forwards.keys.sorted().map { listenPort in
-            "rdr pass on lo0 inet proto tcp from any to any port \(listenPort) -> 127.0.0.1 port \(forwards[listenPort]!)"
+        let rules = forwards.keys.sorted().compactMap { listenPort -> String? in
+            guard let targetPort = forwards[listenPort] else { return nil }
+            return "rdr pass on lo0 inet proto tcp from any to any port \(listenPort) -> 127.0.0.1 port \(targetPort)"
         }
         return (["# Managed by Dory. Do not edit."] + rules).joined(separator: "\n") + "\n"
     }
@@ -231,6 +232,12 @@ public struct NetworkingAuthorizationPlan: Sendable, Equatable, Codable {
                 throw NetworkingAuthorizationError.invalidSuffix(value)
             }
         }
+        // Restrict resolver installation to the non-public `.local` mDNS space (which
+        // covers `dory.local` and its subdomains) so a tampered plan cannot capture
+        // DNS for a real public domain like `mybank.com`.
+        guard suffix.hasSuffix(".local") else {
+            throw NetworkingAuthorizationError.invalidSuffix(value)
+        }
         return suffix
     }
 
@@ -241,9 +248,27 @@ public struct NetworkingAuthorizationPlan: Sendable, Equatable, Codable {
         return value.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" }
     }
 
-    private static func validateIPv4(_ value: String, field: String) throws {
-        guard IPv4Address(value) != nil else {
-            throw NetworkingAuthorizationError.invalidBindAddress(value)
+    // The bind address is written verbatim as the `nameserver` line in
+    // /etc/resolver/<suffix> and installed as root. Only loopback is safe: a
+    // routable address would let a tampered plan point system DNS for the suffix
+    // at an attacker-controlled host.
+    private static func validateResolverNameserver(_ value: String, field: String) throws {
+        if let address = IPv4Address(value), address.bytes.first == 127 {
+            return
+        }
+        if isIPv6Loopback(value) {
+            return
+        }
+        throw NetworkingAuthorizationError.invalidBindAddress(value)
+    }
+
+    private static func isIPv6Loopback(_ value: String) -> Bool {
+        var address = in6_addr()
+        guard inet_pton(AF_INET6, value, &address) == 1 else { return false }
+        return withUnsafeBytes(of: &address) { raw in
+            raw.enumerated().allSatisfy { index, byte in
+                index == raw.count - 1 ? byte == 1 : byte == 0
+            }
         }
     }
 
@@ -256,7 +281,12 @@ public struct NetworkingAuthorizationPlan: Sendable, Equatable, Codable {
     private static func validatedPrivilegedTCPForwards(_ forwards: [PrivilegedTCPForward]) throws -> [PrivilegedTCPForward] {
         var byListenPort: [UInt16: PrivilegedTCPForward] = [:]
         for forward in forwards {
-            guard forward.listenPort > 0, forward.listenPort < 1024, forward.targetPort >= 1024 else {
+            // Reject 80/443: those belong to the proxy's own HTTP/HTTPS redirect and
+            // a caller-supplied forward on them would silently divert web traffic.
+            guard forward.listenPort > 0,
+                  forward.listenPort < 1024,
+                  forward.targetPort >= 1024,
+                  !PrivilegedPortMapping.proxyReservedListenPorts.contains(forward.listenPort) else {
                 throw NetworkingAuthorizationError.invalidPrivilegedForward("\(forward.listenPort):\(forward.targetPort)")
             }
             byListenPort[forward.listenPort] = forward
@@ -270,6 +300,23 @@ public struct NetworkingAuthorizationPlan: Sendable, Equatable, Codable {
               !value.contains("\n"),
               !value.contains("\r") else {
             throw NetworkingAuthorizationError.invalidPath(field)
+        }
+    }
+
+    // The CA path is added to the System keychain as a trusted root, so it must be
+    // the canonical `~/.dory/ca/ca.crt` (see DoryLocalCA). Constrain the trailing
+    // components structurally so a tampered plan cannot promote an arbitrary
+    // certificate to a trusted root. Home-relative rather than absolute because the
+    // root helper validates this too and does not share doryd's home directory.
+    private static func validateLocalCACertificatePath(_ value: String) throws {
+        try validateAbsolutePath(value, field: "localCACertificatePath")
+        let components = value.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        guard !components.contains(".."),
+              components.count >= 3,
+              components[components.count - 1] == "ca.crt",
+              components[components.count - 2] == "ca",
+              components[components.count - 3] == ".dory" else {
+            throw NetworkingAuthorizationError.invalidPath("localCACertificatePath")
         }
     }
 }

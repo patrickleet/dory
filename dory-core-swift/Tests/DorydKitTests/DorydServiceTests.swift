@@ -95,7 +95,8 @@ final class DorydServiceTests: XCTestCase {
             statusReply.fulfill()
         }
         wait(for: [statusReply], timeout: 5)
-        XCTAssertEqual(status["mode"] as? String, "auto-idle")
+        XCTAssertEqual(status["mode"] as? String, "always-on")
+        XCTAssertEqual(status["auto_idle_enabled"] as? Bool, false)
         XCTAssertEqual(status["sleep_after_minutes"] as? Int, 15)
         XCTAssertEqual((status["blockers"] as? [NSDictionary])?.count, 2)
 

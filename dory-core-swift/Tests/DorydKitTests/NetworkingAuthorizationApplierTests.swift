@@ -96,6 +96,18 @@ final class NetworkingAuthorizationApplierTests: XCTestCase {
         }
     }
 
+    func testRejectsReorderedRequests() throws {
+        var plan = try NetworkingAuthorizationPlan.make(configuration: NetworkingConfiguration(
+            dnsPort: 15353,
+            localCACertificatePath: nil
+        ))
+        plan.requests.swapAt(0, 2)
+
+        XCTAssertThrowsError(try NetworkingAuthorizationApplier(dryRun: true).apply(plan)) { error in
+            XCTAssertEqual(error as? NetworkingAuthorizationApplyError, .unsafeRequest("pf.dev.dory.enable"))
+        }
+    }
+
     func testRejectsMissingExpectedRequest() throws {
         var plan = try NetworkingAuthorizationPlan.make(configuration: NetworkingConfiguration(
             dnsPort: 15353,

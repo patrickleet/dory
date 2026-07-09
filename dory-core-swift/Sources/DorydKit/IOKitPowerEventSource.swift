@@ -11,6 +11,8 @@ public final class IOKitPowerEventSource: PowerEventSource, @unchecked Sendable 
     private var onWake: (@Sendable () -> Void)?
     private var runLoop: CFRunLoop?
     private var workerThread: Thread?
+    private var cancelled = false
+    private let exited = DispatchSemaphore(value: 0)
 
     public init() {}
 
@@ -27,6 +29,7 @@ public final class IOKitPowerEventSource: PowerEventSource, @unchecked Sendable 
         }
         self.onWillSleep = onWillSleep
         self.onWake = onWake
+        cancelled = false
         lock.unlock()
 
         let start = PowerObserverStart()
@@ -51,35 +54,28 @@ public final class IOKitPowerEventSource: PowerEventSource, @unchecked Sendable 
 
     public func stop() {
         lock.lock()
-        let localNotifyPort = notifyPort
-        let localNotifier = notifier
-        let localRootPort = rootPort
-        let localRunLoop = runLoop
-        notifyPort = nil
-        notifier = 0
-        rootPort = 0
-        runLoop = nil
+        cancelled = true
+        let worker = workerThread
         workerThread = nil
-        onWillSleep = nil
-        onWake = nil
+        let localRunLoop = runLoop
         lock.unlock()
 
-        if let localNotifyPort {
-            let source = IONotificationPortGetRunLoopSource(localNotifyPort).takeUnretainedValue()
-            if let localRunLoop {
-                CFRunLoopRemoveSource(localRunLoop, source, .commonModes)
-            }
-            IONotificationPortDestroy(localNotifyPort)
-        }
-        if localNotifier != 0 {
-            IOObjectRelease(localNotifier)
-        }
-        if localRootPort != 0 {
-            IOServiceClose(localRootPort)
-        }
+        // Wake the worker's run loop so CFRunLoopRun() returns and the worker tears down
+        // the IOKit resources on the same thread that created them.
         if let localRunLoop {
             CFRunLoopStop(localRunLoop)
         }
+
+        // Join the worker so no callback (which holds an unretained reference to self)
+        // can run after stop() returns. Skip if we are already on the worker thread.
+        if let worker, worker != Thread.current {
+            _ = exited.wait(timeout: .now() + 5)
+        }
+
+        lock.lock()
+        onWillSleep = nil
+        onWake = nil
+        lock.unlock()
     }
 
     private func runPowerObserver(start: PowerObserverStart) {
@@ -94,14 +90,23 @@ public final class IOKitPowerEventSource: PowerEventSource, @unchecked Sendable 
         )
         guard port != 0, let localNotifyPort else {
             start.complete(error: PowerObserverError.registrationFailed)
+            exited.signal()
             return
         }
 
+        // stop() may have run during the (up to 5s) registration; if so, tear the freshly
+        // registered resources down here instead of leaking them and entering the loop.
+        lock.lock()
+        if cancelled {
+            lock.unlock()
+            teardownResources(notifyPort: localNotifyPort, notifier: localNotifier, rootPort: port, runLoop: nil, source: nil)
+            start.complete(error: PowerObserverError.registrationFailed)
+            exited.signal()
+            return
+        }
         let currentRunLoop = CFRunLoopGetCurrent()
         let source = IONotificationPortGetRunLoopSource(localNotifyPort).takeUnretainedValue()
         CFRunLoopAddSource(currentRunLoop, source, .commonModes)
-
-        lock.lock()
         rootPort = port
         notifyPort = localNotifyPort
         notifier = localNotifier
@@ -110,6 +115,47 @@ public final class IOKitPowerEventSource: PowerEventSource, @unchecked Sendable 
 
         start.complete(error: nil)
         CFRunLoopRun()
+
+        // Run loop stopped by stop(): tear down on this thread, then release the join.
+        lock.lock()
+        let teardownNotifyPort = notifyPort
+        let teardownNotifier = notifier
+        let teardownRootPort = rootPort
+        let teardownRunLoop = runLoop
+        notifyPort = nil
+        notifier = 0
+        rootPort = 0
+        runLoop = nil
+        lock.unlock()
+        teardownResources(
+            notifyPort: teardownNotifyPort,
+            notifier: teardownNotifier,
+            rootPort: teardownRootPort,
+            runLoop: teardownRunLoop,
+            source: source
+        )
+        exited.signal()
+    }
+
+    private func teardownResources(
+        notifyPort: IONotificationPortRef?,
+        notifier: io_object_t,
+        rootPort: io_connect_t,
+        runLoop: CFRunLoop?,
+        source: CFRunLoopSource?
+    ) {
+        if let notifyPort {
+            if let runLoop, let source {
+                CFRunLoopRemoveSource(runLoop, source, .commonModes)
+            }
+            IONotificationPortDestroy(notifyPort)
+        }
+        if notifier != 0 {
+            IOObjectRelease(notifier)
+        }
+        if rootPort != 0 {
+            IOServiceClose(rootPort)
+        }
     }
 
     fileprivate func handle(messageType: UInt32, messageArgument: UnsafeMutableRawPointer?) {

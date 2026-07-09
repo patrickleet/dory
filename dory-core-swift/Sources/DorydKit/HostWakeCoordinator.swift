@@ -13,6 +13,34 @@ public protocol HostSleepHandling: Sendable {
     func prepareForHostSleep(now: Date) -> HostSleepActionResult
 }
 
+public final class PolicyAwareHostSleepHandler: HostSleepHandling, @unchecked Sendable {
+    private let name: String
+    private let handler: HostSleepHandling
+    private let shouldAttemptSleep: @Sendable () -> Bool
+
+    public init(
+        name: String,
+        handler: HostSleepHandling,
+        shouldAttemptSleep: @escaping @Sendable () -> Bool
+    ) {
+        self.name = name
+        self.handler = handler
+        self.shouldAttemptSleep = shouldAttemptSleep
+    }
+
+    public func prepareForHostSleep(now: Date) -> HostSleepActionResult {
+        guard shouldAttemptSleep() else {
+            return HostSleepActionResult(
+                name: name,
+                attempted: false,
+                slept: false,
+                detail: "host sleep skipped by runtime mode"
+            )
+        }
+        return handler.prepareForHostSleep(now: now)
+    }
+}
+
 public protocol WakeClockSyncing: Sendable {
     func syncAgentClock(now: Date) -> AgentClockSyncResult
 }

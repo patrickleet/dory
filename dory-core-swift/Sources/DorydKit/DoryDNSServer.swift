@@ -145,8 +145,19 @@ public final class DoryDNSServer: @unchecked Sendable {
                 }
             }
             if count < 0 {
-                if errno == EINTR { continue }
-                return
+                let code = errno
+                switch code {
+                case EINTR, EAGAIN, EWOULDBLOCK, ECONNREFUSED, ECONNABORTED:
+                    // Transient: a prior sendto eliciting ICMP unreachable, or an
+                    // interrupted/again read. Keep serving instead of dropping DNS.
+                    continue
+                case EMFILE, ENFILE:
+                    // fd table exhausted: back off briefly rather than exit.
+                    usleep(50_000)
+                    continue
+                default:
+                    return
+                }
             }
             guard count > 0 else { continue }
             let packet = Array(buffer.prefix(count))

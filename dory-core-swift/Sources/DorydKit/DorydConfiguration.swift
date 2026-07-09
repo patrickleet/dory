@@ -44,7 +44,7 @@ public struct DorydEnvironment: Sendable {
                 forwardSocketPath: forwardSocket,
                 dockerdSocketPath: dockerdSocket,
                 cid: cid,
-                dockerPort: uint32("DORYD_DOCKER_PORT") ?? 1026,
+                dockerPort: clampedDockerPort(),
                 gpuSupported: false,
                 activitySocketPath: string("DORYD_ACTIVITY_SOCK")
                     ?? "\(stateDirectory)/dataplane-activity.sock",
@@ -63,7 +63,7 @@ public struct DorydEnvironment: Sendable {
             home: home,
             forwardSocketPath: forwardSocket,
             cid: cid,
-            dockerPort: uint32("DORYD_DOCKER_PORT") ?? 1026,
+            dockerPort: clampedDockerPort(),
             gpuSupported: bool("DORYD_GPU_SUPPORTED", default: false)
                 || string("DORYD_GPU") == "venus"
                 || string("DORY_EXPERIMENTAL_GPU") == "venus",
@@ -173,23 +173,35 @@ public struct DorydEnvironment: Sendable {
             "--kernel", kernel,
             "--gvproxy", gvproxy,
             "--state-dir", stateDirectory,
-            "--mem-mb", String(int("DORYD_MEMORY_MB") ?? 2048),
-            "--cpus", String(int("DORYD_CPUS") ?? 4),
+            "--mem-mb", String(clampedMemoryMB()),
+            "--cpus", String(clampedCPUs()),
         ]
 
         if bool("DORYD_DIRECT_IP", default: true) {
             arguments.append("--direct-ip")
         }
+        let engineRootfsNames = ["dory-engine-rootfs-\(hostGuestArch).ext4", "dory-engine-rootfs.ext4"]
         let engineRootfs = existingPath(firstOf: ["DORYD_ENGINE_ROOTFS", "DORY_ENGINE_ROOTFS"])
             ?? preparedBundledCompressedResource(
-                named: ["dory-engine-rootfs-\(hostGuestArch).ext4", "dory-engine-rootfs.ext4"],
+                named: engineRootfsNames,
                 outputName: "dory-engine-rootfs-\(hostGuestArch).ext4",
                 stateDirectory: stateDirectory
             )
         if let rootfs = engineRootfs {
             arguments.append(contentsOf: ["--rootfs", rootfs])
+        } else if compressedResourceSourceExists(named: engineRootfsNames) {
+            // A rootfs image was bundled but could not be prepared (e.g. decompression
+            // failed). Launching without a rootfs would produce a broken engine, so refuse
+            // to start rather than proceed silently.
+            FileHandle.standardError.write(Data(
+                "doryd: engine rootfs present but could not be prepared; not starting engine\n".utf8
+            ))
+            return nil
         } else if bool("DORYD_REQUIRE_ENGINE_ROOTFS", default: false) {
             return nil
+        }
+        if let guestAgent = guestAgentPath() {
+            arguments.append(contentsOf: ["--guest-agent", guestAgent])
         }
         if string("DORYD_GPU") == "venus" || string("DORY_EXPERIMENTAL_GPU") == "venus" {
             arguments.append(contentsOf: ["--gpu", "venus"])
@@ -245,8 +257,8 @@ public struct DorydEnvironment: Sendable {
             "--kernel", kernel,
             "--rootfs", rootfs,
             "--handoff-sock", handoffSocket,
-            "--memory-mb", String(int("DORYD_MEMORY_MB") ?? 2048),
-            "--cpus", String(int("DORYD_CPUS") ?? 4),
+            "--memory-mb", String(clampedMemoryMB()),
+            "--cpus", String(clampedCPUs()),
             "--cmdline", cmdline,
         ]
         if bool("DORYD_SHARE_HOME", default: true) {
@@ -381,14 +393,51 @@ public struct DorydEnvironment: Sendable {
         return FileManager.default.fileExists(atPath: helpers) ? helpers : nil
     }
 
-    private func bundledResource(named names: [String]) -> String? {
-        let directories = [
-            bundleResourcesDirectory,
-            "\(cwd)/Resources",
-            "\(cwd)/../Resources",
-        ].compactMap { $0 }
+    private func clampedCPUs() -> Int {
+        max(1, int("DORYD_CPUS") ?? 4)
+    }
 
-        for directory in directories {
+    private func clampedMemoryMB() -> Int {
+        max(256, int("DORYD_MEMORY_MB") ?? 2048)
+    }
+
+    private func clampedDockerPort() -> UInt32 {
+        min(65_535, uint32("DORYD_DOCKER_PORT") ?? 1026)
+    }
+
+    private func compressedResourceSourceExists(named names: [String]) -> Bool {
+        for directory in resourceDirectories {
+            for name in names {
+                let source = URL(fileURLWithPath: directory)
+                    .appendingPathComponent(name)
+                    .appendingPathExtension("lzfse")
+                if FileManager.default.fileExists(atPath: source.path) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    private func guestAgentPath() -> String? {
+        if let explicit = existingPath(firstOf: ["DORYD_GUEST_AGENT", "DORY_GUEST_AGENT"]) {
+            return explicit
+        }
+        if let bundled = bundledResource(named: ["dory-agent-linux-\(hostGuestArch)", "dory-agent-linux"]) {
+            return bundled
+        }
+        let candidates = [
+            bundleHelpersDirectory.map { "\($0)/dory-agent-linux-\(hostGuestArch)" },
+            bundleHelpersDirectory.map { "\($0)/dory-agent-linux" },
+            "\(cwd)/guest/out/dory-agent-\(hostGuestArch)",
+            "\(cwd)/guest/out/dory-agent",
+            "\(cwd)/dory-core/target/\(hostGuestArch == "arm64" ? "aarch64" : "x86_64")-unknown-linux-musl/release/dory-agent",
+        ].compactMap { $0 }
+        return candidates.first { FileManager.default.fileExists(atPath: $0) }
+    }
+
+    private func bundledResource(named names: [String]) -> String? {
+        for directory in resourceDirectories {
             for name in names {
                 let path = URL(fileURLWithPath: directory).appendingPathComponent(name).path
                 if FileManager.default.fileExists(atPath: path) {
@@ -431,13 +480,7 @@ public struct DorydEnvironment: Sendable {
         stateDirectory: String,
         refreshIfSourceNewer: Bool
     ) -> String? {
-        let directories = [
-            bundleResourcesDirectory,
-            "\(cwd)/Resources",
-            "\(cwd)/../Resources",
-        ].compactMap { $0 }
-
-        for directory in directories {
+        for directory in resourceDirectories {
             for name in names {
                 let source = URL(fileURLWithPath: directory)
                     .appendingPathComponent(name)
@@ -452,6 +495,15 @@ public struct DorydEnvironment: Sendable {
             }
         }
         return nil
+    }
+
+    private var resourceDirectories: [String] {
+        [
+            string("DORYD_RESOURCES_DIR"),
+            bundleResourcesDirectory,
+            "\(cwd)/Resources",
+            "\(cwd)/../Resources",
+        ].compactMap { $0 }.filter { !$0.isEmpty }
     }
 
     private func preparedPersistentBundledResource(
@@ -494,6 +546,9 @@ public struct DorydEnvironment: Sendable {
                     try FileManager.default.moveItem(at: temporary, to: output)
                 } catch {
                     try? FileManager.default.removeItem(at: temporary)
+                    FileHandle.standardError.write(Data(
+                        "doryd: failed to prepare \(source.lastPathComponent): \(error)\n".utf8
+                    ))
                     return nil
                 }
             }

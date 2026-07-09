@@ -189,9 +189,13 @@ public enum LocalAgentControl {
         guard bytes.count < MemoryLayout.size(ofValue: address.sun_path) else {
             throw LocalAgentControlError.pathTooLong(path)
         }
+        // An empty path yields a nil source base address; guard the copy so a malformed path
+        // fails cleanly at connect rather than trapping on a force-unwrap.
         withUnsafeMutableBytes(of: &address.sun_path) { destination in
             bytes.withUnsafeBytes { source in
-                destination.baseAddress!.copyMemory(from: source.baseAddress!, byteCount: bytes.count)
+                guard let destinationBase = destination.baseAddress,
+                      let sourceBase = source.baseAddress else { return }
+                destinationBase.copyMemory(from: sourceBase, byteCount: bytes.count)
             }
         }
         return address

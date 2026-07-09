@@ -75,11 +75,15 @@ public struct HostCLIInstaller: Sendable {
                 missing.append(tool)
                 continue
             }
-            linked.append(tool)
-            symlink(source, to: "\(binDir)/\(tool)")
+            // Only count a tool as linked once the symlink actually resolves to it, so a
+            // broken/failed link is reported missing and self-heal can retry it.
+            if symlink(source, to: "\(binDir)/\(tool)") {
+                linked.append(tool)
+            } else {
+                missing.append(tool)
+            }
             if tool == "docker-compose" {
-                symlink(source, to: "\(composePluginDir)/docker-compose")
-                composePluginInstalled = fileManager.fileExists(atPath: "\(composePluginDir)/docker-compose")
+                composePluginInstalled = symlink(source, to: "\(composePluginDir)/docker-compose")
             }
         }
         let dockerContext = reconcileDockerContext()
@@ -240,14 +244,20 @@ public struct HostCLIInstaller: Sendable {
         return process.terminationStatus
     }
 
-    private func symlink(_ source: String, to destination: String) {
-        guard source != destination else { return }
+    @discardableResult
+    private func symlink(_ source: String, to destination: String) -> Bool {
+        guard source != destination else { return true }
         let fileManager = FileManager.default
         if let existing = try? fileManager.destinationOfSymbolicLink(atPath: destination), existing == source {
-            return
+            return true
         }
         try? fileManager.removeItem(atPath: destination)
-        try? fileManager.createSymbolicLink(atPath: destination, withDestinationPath: source)
+        do {
+            try fileManager.createSymbolicLink(atPath: destination, withDestinationPath: source)
+        } catch {
+            return false
+        }
+        return (try? fileManager.destinationOfSymbolicLink(atPath: destination)) == source
     }
 
     private func addToPath() -> Bool {

@@ -2,6 +2,8 @@ import Darwin
 import DorydKit
 import Foundation
 
+private let engineColdStartTimeout: TimeInterval = 240
+
 enum DorydCtlError: Error, CustomStringConvertible {
     case daemon(String)
     case invalidProxy
@@ -261,11 +263,31 @@ func machineDictionary(name: String, client: DorydCtlClient) throws -> NSDiction
 }
 
 func tcpEndpointParts(_ raw: String) throws -> (host: String, port: UInt16) {
-    let parts = raw.split(separator: ":", maxSplits: 1).map(String.init)
-    guard parts.count == 2, !parts[0].isEmpty, let port = UInt16(parts[1]) else {
-        throw DorydCtlError.usage("--endpoint-tcp must be HOST:PORT")
+    let host: String
+    let portString: String
+    if raw.hasPrefix("[") {
+        // Bracketed IPv6, e.g. [::1]:8080 — the host itself contains colons, so split on the
+        // colon that follows the closing bracket, not the first colon in the address.
+        guard let closing = raw.firstIndex(of: "]") else {
+            throw DorydCtlError.usage("--endpoint-tcp must be HOST:PORT or [IPv6]:PORT")
+        }
+        host = String(raw[raw.index(after: raw.startIndex)..<closing])
+        let afterBracket = raw.index(after: closing)
+        guard afterBracket < raw.endIndex, raw[afterBracket] == ":" else {
+            throw DorydCtlError.usage("--endpoint-tcp must be HOST:PORT or [IPv6]:PORT")
+        }
+        portString = String(raw[raw.index(after: afterBracket)...])
+    } else {
+        guard let lastColon = raw.lastIndex(of: ":") else {
+            throw DorydCtlError.usage("--endpoint-tcp must be HOST:PORT or [IPv6]:PORT")
+        }
+        host = String(raw[raw.startIndex..<lastColon])
+        portString = String(raw[raw.index(after: lastColon)...])
     }
-    return (parts[0], port)
+    guard !host.isEmpty, let port = UInt16(portString) else {
+        throw DorydCtlError.usage("--endpoint-tcp must be HOST:PORT or [IPv6]:PORT")
+    }
+    return (host, port)
 }
 
 func run() throws {
@@ -428,13 +450,13 @@ func runEngine(cursor: inout ArgumentCursor, client: DorydCtlClient) throws {
         }
         try emitJSON(status)
     case "start":
-        try emitCommandResult(try client.command { $0.engineStart(reply: $1) })
+        try emitCommandResult(try client.withTimeout(atLeast: engineColdStartTimeout).command { $0.engineStart(reply: $1) })
     case "stop":
         try emitCommandResult(try client.command { $0.engineStop(reply: $1) })
     case "sleep":
         try emitCommandResult(try client.command { $0.engineSleep(reply: $1) })
     case "wake":
-        try emitCommandResult(try client.command { $0.engineWake(reply: $1) })
+        try emitCommandResult(try client.withTimeout(atLeast: engineColdStartTimeout).command { $0.engineWake(reply: $1) })
     default:
         throw DorydCtlError.usage("unknown engine command: \(subcommand)")
     }
@@ -1008,6 +1030,14 @@ func pump(from inputFD: Int32, to outputFD: Int32) {
 
 do {
     try run()
+} catch let error as DorydCtlError {
+    FileHandle.standardError.write(Data("dorydctl: \(error)\n".utf8))
+    switch error {
+    case .usage:
+        exit(2)
+    case .daemon, .invalidProxy, .timedOut:
+        exit(1)
+    }
 } catch {
     FileHandle.standardError.write(Data("dorydctl: \(error)\n".utf8))
     exit(1)

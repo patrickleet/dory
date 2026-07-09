@@ -114,6 +114,8 @@ final class DorydConfigurationTests: XCTestCase {
 
         let kernel = resources + "/dory-hv-kernel-\(guestArch)"
         FileManager.default.createFile(atPath: kernel, contents: Data())
+        let guestAgent = resources + "/dory-agent-linux-\(guestArch)"
+        FileManager.default.createFile(atPath: guestAgent, contents: Data())
 
         let env = DorydEnvironment(values: [
             "DORYD_HOME": directory + "/home",
@@ -122,6 +124,7 @@ final class DorydConfigurationTests: XCTestCase {
         let hv = try XCTUnwrap(env.dockerTierConfiguration()?.hvProcess)
         XCTAssertArgumentPair(hv.arguments, "--kernel", kernel)
         XCTAssertArgumentPair(hv.arguments, "--gvproxy", helpers + "/gvproxy")
+        XCTAssertArgumentPair(hv.arguments, "--guest-agent", guestAgent)
         XCTAssertEqual(hv.arguments.contains("--amd64"), expectsAMD64Emulation)
     }
 
@@ -157,6 +160,51 @@ final class DorydConfigurationTests: XCTestCase {
 
         let hv = try XCTUnwrap(env.dockerTierConfiguration()?.hvProcess)
         let preparedRootfs = state + "/assets/dory-engine-rootfs-\(guestArch).ext4"
+        XCTAssertArgumentPair(hv.arguments, "--rootfs", preparedRootfs)
+        XCTAssertEqual(FileManager.default.contents(atPath: preparedRootfs), Data("rootfs-fixture".utf8))
+    }
+
+    func testDockerTierFindsResourcesFromLaunchAgentResourceDirectory() throws {
+        let directory = "/tmp/doryd-config-launchagent-resources-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        let helpers = directory + "/Helpers"
+        let resources = directory + "/Resources"
+        let state = directory + "/state"
+        try FileManager.default.createDirectory(atPath: helpers, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(atPath: resources, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+
+        let helper = try executableFixture(at: helpers + "/dory-hv")
+        let gvproxy = try executableFixture(at: helpers + "/gvproxy")
+
+        #if arch(x86_64)
+        let guestArch = "amd64"
+        #else
+        let guestArch = "arm64"
+        #endif
+
+        let kernel = resources + "/dory-hv-kernel-\(guestArch)"
+        FileManager.default.createFile(atPath: kernel, contents: Data())
+        let guestAgent = resources + "/dory-agent-linux-\(guestArch)"
+        FileManager.default.createFile(atPath: guestAgent, contents: Data())
+        let rootfs = directory + "/fixture-rootfs.ext4"
+        let compressedRootfs = resources + "/dory-engine-rootfs-\(guestArch).ext4.lzfse"
+        try Data("rootfs-fixture".utf8).write(to: URL(fileURLWithPath: rootfs))
+        try DorydLZFSE.compress(source: rootfs, destination: compressedRootfs)
+
+        let env = DorydEnvironment(values: [
+            "DORYD_HOME": directory + "/home",
+            "DORYD_HV_HELPER": helper,
+            "DORYD_GVPROXY": gvproxy,
+            "DORYD_RESOURCES_DIR": resources,
+            "DORYD_STATE_DIR": state,
+            "DORYD_RAW_HV_SUPPORTED": "1",
+        ], cwd: directory, executablePath: "doryd")
+
+        let hv = try XCTUnwrap(env.dockerTierConfiguration()?.hvProcess)
+        let preparedRootfs = state + "/assets/dory-engine-rootfs-\(guestArch).ext4"
+        XCTAssertArgumentPair(hv.arguments, "--kernel", kernel)
+        XCTAssertArgumentPair(hv.arguments, "--gvproxy", gvproxy)
+        XCTAssertArgumentPair(hv.arguments, "--guest-agent", guestAgent)
         XCTAssertArgumentPair(hv.arguments, "--rootfs", preparedRootfs)
         XCTAssertEqual(FileManager.default.contents(atPath: preparedRootfs), Data("rootfs-fixture".utf8))
     }

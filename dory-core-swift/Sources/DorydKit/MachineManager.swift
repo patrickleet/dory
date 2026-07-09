@@ -287,6 +287,8 @@ public enum MachineManagerError: Error, Sendable, Equatable, CustomStringConvert
 public final class MachineManager: @unchecked Sendable {
     public typealias AgentConnector = @Sendable (String) throws -> any AgentControlClient
 
+    private static let handoffReadyTimeoutSeconds: TimeInterval = 60
+
     private let configuration: MachineManagerConfiguration
     private let agentConnector: AgentConnector
     private let balloonController: any MachineBalloonControlling
@@ -389,7 +391,35 @@ public final class MachineManager: @unchecked Sendable {
             lock.unlock()
             throw error
         }
+        if configuration.requiresReadyHandoff {
+            scheduleHandoffTimeout(id: id, process: process)
+        }
         return status(id: id) ?? DoryMachineStatus(id: id, state: .running)
+    }
+
+    private func scheduleHandoffTimeout(id: String, process: HvProcess) {
+        // A VMM that boots but never completes the ready handoff would otherwise leave the
+        // machine `.starting` forever. Bound the wait: if this exact launch is still starting
+        // when the deadline passes, mark it failed and tear the helper down.
+        DispatchQueue.global().asyncAfter(deadline: .now() + Self.handoffReadyTimeoutSeconds) { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            guard var entry = self.machines[id],
+                  entry.state == .starting,
+                  entry.process === process else {
+                self.lock.unlock()
+                return
+            }
+            entry.handoffServer?.stop()
+            entry.handoffServer = nil
+            entry.handoff = nil
+            entry.currentBalloonTargetMB = nil
+            entry.state = .failed
+            entry.lastError = "vmm ready handoff timed out after \(Int(Self.handoffReadyTimeoutSeconds))s"
+            self.machines[id] = entry
+            self.lock.unlock()
+            process.stop()
+        }
     }
 
     public func stop(id: String) throws -> DoryMachineStatus {
@@ -434,6 +464,11 @@ public final class MachineManager: @unchecked Sendable {
     }
 
     public func delete(id: String) throws {
+        // Reject traversal ids before any path is derived: delete() removes the machine's
+        // state directory, so a "." / ".." id must never reach machineStateDirectory(id:).
+        guard Self.isValidID(id) else {
+            throw MachineManagerError.invalidID(id)
+        }
         lock.lock()
         guard let entry = machines.removeValue(forKey: id) else {
             lock.unlock()
@@ -936,17 +971,7 @@ public final class MachineManager: @unchecked Sendable {
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(machine)
             let path = machineConfigPath(id: machine.id)
-            if FileManager.default.fileExists(atPath: path) {
-                try data.write(to: URL(fileURLWithPath: path), options: .atomic)
-            } else {
-                guard FileManager.default.createFile(
-                    atPath: path,
-                    contents: data,
-                    attributes: [.posixPermissions: 0o600]
-                ) else {
-                    throw MachineManagerError.persistence("could not create \(path)")
-                }
-            }
+            try data.write(to: URL(fileURLWithPath: path), options: .atomic)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
         } catch let error as MachineManagerError {
             throw error
@@ -965,17 +990,7 @@ public final class MachineManager: @unchecked Sendable {
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(snapshot)
             let path = snapshotMetadataPath(machineID: snapshot.machineID, snapshotID: snapshot.id)
-            if FileManager.default.fileExists(atPath: path) {
-                try data.write(to: URL(fileURLWithPath: path), options: .atomic)
-            } else {
-                guard FileManager.default.createFile(
-                    atPath: path,
-                    contents: data,
-                    attributes: [.posixPermissions: 0o600]
-                ) else {
-                    throw MachineManagerError.persistence("could not create \(path)")
-                }
-            }
+            try data.write(to: URL(fileURLWithPath: path), options: .atomic)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
         } catch let error as MachineManagerError {
             throw error
@@ -1028,6 +1043,10 @@ public final class MachineManager: @unchecked Sendable {
 
     private static func isValidID(_ id: String) -> Bool {
         guard !id.isEmpty else { return false }
+        // Reject all-dot ids (".", "..", ...) so an id can never traverse out of the
+        // machines directory when interpolated into a filesystem path. The charset below
+        // already blocks "/", so a valid id stays a single path component.
+        guard id.contains(where: { $0 != "." }) else { return false }
         return id.allSatisfy { character in
             character.isLetter || character.isNumber || character == "-" || character == "_" || character == "."
         }
@@ -1068,15 +1087,30 @@ public final class MachineManager: @unchecked Sendable {
     }
 
     private static func cloneOrCopyFile(source: String, destination: String) throws {
-        let parent = URL(fileURLWithPath: destination).deletingLastPathComponent().path
-        try FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
-        if FileManager.default.fileExists(atPath: destination) {
-            try FileManager.default.removeItem(atPath: destination)
+        // Clone/copy into a sibling temp path first, then atomically rename over the
+        // destination. If the clone and the copy fallback both fail we throw before the
+        // rename, so an existing destination (e.g. a machine's live rootfs) is never lost.
+        let destinationURL = URL(fileURLWithPath: destination)
+        let parent = destinationURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        let temporary = parent
+            .appendingPathComponent(".\(destinationURL.lastPathComponent).tmp-\(UUID().uuidString)")
+            .path
+        try? FileManager.default.removeItem(atPath: temporary)
+        do {
+            if clonefile(source, temporary, 0) != 0 {
+                try FileManager.default.copyItem(atPath: source, toPath: temporary)
+            }
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary)
+            guard rename(temporary, destination) == 0 else {
+                throw MachineManagerError.persistence(
+                    "could not replace \(destination): \(String(cString: strerror(errno)))"
+                )
+            }
+        } catch {
+            try? FileManager.default.removeItem(atPath: temporary)
+            throw error
         }
-        if clonefile(source, destination, 0) != 0 {
-            try FileManager.default.copyItem(atPath: source, toPath: destination)
-        }
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination)
     }
 
     private static func fileSize(path: String) -> Int64 {

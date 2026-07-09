@@ -77,23 +77,18 @@ public final class IdleController: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// Claim sleep, then immediately re-check in-flight work while the sleeping flag is visible.
+    /// Claim sleep when idle. The lock is held across the whole check-and-set, so the
+    /// counts cannot change between the guard and setting `sleeping`.
     public func claimSleepIfIdle(idleAfter seconds: TimeInterval, now: Date = Date()) -> Bool {
         lock.lock()
+        defer { lock.unlock() }
         guard !sleeping,
               activeRequests == 0,
               controlOperations == 0,
               now.timeIntervalSince(lastActivity) >= seconds else {
-            lock.unlock()
             return false
         }
         sleeping = true
-        if activeRequests != 0 || controlOperations != 0 {
-            sleeping = false
-            lock.unlock()
-            return false
-        }
-        lock.unlock()
         return true
     }
 
@@ -101,19 +96,13 @@ public final class IdleController: @unchecked Sendable {
     /// This prevents a stale dataplane request count from keeping an empty VM alive forever.
     public func claimSleepForEmptyEngine(idleAfter seconds: TimeInterval, now: Date = Date()) -> Bool {
         lock.lock()
+        defer { lock.unlock() }
         guard !sleeping,
               controlOperations == 0,
               now.timeIntervalSince(lastActivity) >= seconds else {
-            lock.unlock()
             return false
         }
         sleeping = true
-        if controlOperations != 0 {
-            sleeping = false
-            lock.unlock()
-            return false
-        }
-        lock.unlock()
         return true
     }
 }

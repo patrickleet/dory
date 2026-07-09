@@ -162,12 +162,17 @@ public final class DoryTLSProxyServer: @unchecked Sendable {
             return
         }
         let request = route.pathPrefix.isEmpty ? head : DoryHTTPProxyServer.rewriteRequest(head, pathPrefix: route.pathPrefix)
-        guard let upstreamFD = DoryTCP.connect(host: route.address, port: route.port),
-              (try? DoryTCP.writeAll(upstreamFD, request)) != nil else {
+        guard let upstreamFD = DoryTCP.connect(host: route.address, port: route.port) else {
             writeBadGateway(client, body: "Dory: backend unavailable\n")
             return
         }
+        // Own the fd before the first write so a failed write cannot leak it.
         let upstream = FDOwner(upstreamFD)
+        guard (try? DoryTCP.writeAll(upstream.raw, request)) != nil else {
+            upstream.closeNow()
+            writeBadGateway(client, body: "Dory: backend unavailable\n")
+            return
+        }
         pumpUpstreamToClient(upstream, client)
         pumpClientToUpstream(client, upstream)
     }
@@ -233,9 +238,11 @@ public final class DoryTLSProxyServer: @unchecked Sendable {
         var items: CFArray?
         guard SecPKCS12Import(data as CFData, options, &items) == errSecSuccess,
               let array = items as? [[String: Any]],
-              let identity = array.first?[kSecImportItemIdentity as String] else {
+              let identity = array.first?[kSecImportItemIdentity as String],
+              CFGetTypeID(identity as CFTypeRef) == SecIdentityGetTypeID() else {
             return nil
         }
+        // Safe: the CFTypeID guard above proves this is a SecIdentity.
         return (identity as! SecIdentity)
     }
 
@@ -256,6 +263,18 @@ public final class DoryTLSProxyServer: @unchecked Sendable {
             if shouldClose {
                 closed = true
             }
+            lock.unlock()
+            if shouldClose {
+                shutdown(raw, SHUT_RDWR)
+                close(raw)
+            }
+        }
+
+        func closeNow() {
+            lock.lock()
+            let shouldClose = !closed
+            closed = true
+            refs = 0
             lock.unlock()
             if shouldClose {
                 shutdown(raw, SHUT_RDWR)

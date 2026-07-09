@@ -38,23 +38,88 @@ func parseOptions(_ arguments: [String]) throws -> HelperOptions {
     return options
 }
 
-enum HelperError: Error {
+enum HelperError: Error, CustomStringConvertible {
     case usage
+    case missingPlanPath
+    case planTooLarge
+    case readTimeout
+
+    var description: String {
+        switch self {
+        case .usage:
+            return "usage"
+        case .missingPlanPath:
+            return "missing --plan-json path"
+        case .planTooLarge:
+            return "plan exceeds maximum size of \(maxPlanBytes) bytes"
+        case .readTimeout:
+            return "timed out reading plan from standard input"
+        }
+    }
 }
+
+let maxPlanBytes = 1 << 20
+let planReadDeadlineSeconds: TimeInterval = 15
 
 func readPlan(path: String) throws -> NetworkingAuthorizationPlan {
     let data: Data
     if path == "-" {
-        data = FileHandle.standardInput.readDataToEndOfFile()
+        data = try readBoundedStandardInput(maxBytes: maxPlanBytes, deadline: planReadDeadlineSeconds)
     } else {
         data = try Data(contentsOf: URL(fileURLWithPath: path))
+        guard data.count <= maxPlanBytes else { throw HelperError.planTooLarge }
     }
     return try JSONDecoder().decode(NetworkingAuthorizationPlan.self, from: data)
 }
 
+func readBoundedStandardInput(maxBytes: Int, deadline: TimeInterval) throws -> Data {
+    let box = StandardInputReadBox()
+    let thread = Thread {
+        var data = Data()
+        let handle = FileHandle.standardInput
+        while true {
+            let chunk = handle.readData(ofLength: 65_536)
+            if chunk.isEmpty { break }
+            data.append(chunk)
+            if data.count > maxBytes {
+                box.finish(.failure(HelperError.planTooLarge))
+                return
+            }
+        }
+        box.finish(.success(data))
+    }
+    thread.stackSize = 512 * 1024
+    thread.start()
+    guard let result = box.wait(deadline: deadline) else {
+        throw HelperError.readTimeout
+    }
+    return try result.get()
+}
+
+final class StandardInputReadBox: @unchecked Sendable {
+    private let semaphore = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var result: Result<Data, Error>?
+
+    func finish(_ value: Result<Data, Error>) {
+        lock.lock()
+        if result == nil { result = value }
+        lock.unlock()
+        semaphore.signal()
+    }
+
+    func wait(deadline: TimeInterval) -> Result<Data, Error>? {
+        guard semaphore.wait(timeout: .now() + deadline) == .success else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        return result
+    }
+}
+
 do {
     let options = try parseOptions(Array(CommandLine.arguments.dropFirst()))
-    let plan = try readPlan(path: options.planPath!)
+    guard let planPath = options.planPath else { throw HelperError.missingPlanPath }
+    let plan = try readPlan(path: planPath)
     let results = try NetworkingAuthorizationApplier(
         fileSystemRoot: options.fileSystemRoot,
         dryRun: options.dryRun

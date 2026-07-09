@@ -53,6 +53,8 @@ public final class VmmDockerProcess: @unchecked Sendable {
     private var handoffServer: VmmHandoffServer?
     private var logHandle: FileHandle?
     private var suspended = false
+    private var starting = false
+    private var lastReady: VmmReadyMessage?
 
     public init(configuration: VmmDockerProcessConfiguration) {
         self.configuration = configuration
@@ -71,14 +73,37 @@ public final class VmmDockerProcess: @unchecked Sendable {
         return process?.isRunning == true
     }
 
+    public var readyMessage: VmmReadyMessage? {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastReady
+    }
+
     public func start() throws {
         lock.lock()
-        if process?.isRunning == true {
+        // Hold the reservation under the lock across check + spawn so two concurrent starts
+        // can't both bind the handoff socket and double-launch the helper.
+        if process?.isRunning == true || starting {
             lock.unlock()
             throw ProcessError.alreadyRunning
         }
+        starting = true
         lock.unlock()
 
+        do {
+            try launch()
+        } catch {
+            lock.lock()
+            starting = false
+            lock.unlock()
+            throw error
+        }
+        lock.lock()
+        starting = false
+        lock.unlock()
+    }
+
+    private func launch() throws {
         guard FileManager.default.isExecutableFile(atPath: configuration.executablePath) else {
             throw ProcessError.executableMissing(configuration.executablePath)
         }
@@ -98,6 +123,9 @@ public final class VmmDockerProcess: @unchecked Sendable {
         let log = Self.openAppendLog(configuration.logPath)
         task.standardOutput = log ?? FileHandle.standardError
         task.standardError = log ?? FileHandle.standardError
+        task.terminationHandler = { [weak self] task in
+            self?.handleTermination(task)
+        }
 
         lock.lock()
         handoffServer = server
@@ -128,7 +156,10 @@ public final class VmmDockerProcess: @unchecked Sendable {
             throw ProcessError.handoffTimeout
         }
         switch result.value {
-        case .success?:
+        case .success(let handoff)?:
+            lock.lock()
+            lastReady = handoff.ready
+            lock.unlock()
             return
         case .failure(let error)?:
             stop(signal: SIGTERM, timeout: 5)
@@ -137,6 +168,26 @@ public final class VmmDockerProcess: @unchecked Sendable {
             stop(signal: SIGTERM, timeout: 5)
             throw ProcessError.handoffTimeout
         }
+    }
+
+    private func handleTermination(_ task: Process) {
+        let oldLog: FileHandle?
+        let server: VmmHandoffServer?
+        lock.lock()
+        guard process === task else {
+            lock.unlock()
+            return
+        }
+        process = nil
+        suspended = false
+        oldLog = logHandle
+        logHandle = nil
+        server = handoffServer
+        handoffServer = nil
+        lastReady = nil
+        lock.unlock()
+        server?.stop()
+        try? oldLog?.close()
     }
 
     @discardableResult
@@ -175,6 +226,7 @@ public final class VmmDockerProcess: @unchecked Sendable {
         logHandle = nil
         wasSuspended = suspended
         suspended = false
+        lastReady = nil
         lock.unlock()
 
         server?.stop()

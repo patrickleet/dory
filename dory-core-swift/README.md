@@ -73,13 +73,19 @@ boot it out with `launchctl bootout gui/$(id -u)/dev.dory.doryd`.
 
 ```sh
 DORYD_AGENT_VSOCK_FORWARD=/tmp/dory-hv-forward.sock \
-DORYD_AUTOSTART_DOCKER_TIER=1 \
+DORYD_FORCE_AUTOSTART_DOCKER_TIER=1 \
 swift run doryd
 ```
 
 The Swift side binds `~/.dory/dory.sock`, hands that listener fd to the Rust
 `startDataplaneForward` FFI entry, and the Rust dataplane dials the forward socket with the
 `HostToGuest{cid:3, port:1026}` preamble for each docker connection.
+
+Installed builds do not encode runtime mode in the LaunchAgent. `doryd` reads the persisted
+runtime policy from `~/.dory/config.json`: `always-on` starts the Docker tier on daemon launch,
+while `manual`, `auto-idle`, and `battery-saver` arm the socket until the app or Docker traffic
+wakes it. `DORYD_FORCE_AUTOSTART_DOCKER_TIER=1` is only a development override for one-off
+smoke tests.
 
 When `DORYD_ACTIVITY_SOCK` is set, or by default under `DORYD_STATE_DIR`, doryd starts a private
 activity socket. The dataplane reports meaningful docker connections there (`/_ping` is ignored),
@@ -117,7 +123,7 @@ To let `doryd` own the helper process, provide the helper, kernel, and gvproxy p
 DORYD_HV_HELPER=/path/to/dory-hv \
 DORYD_HV_KERNEL=/path/to/dory-hv-kernel \
 DORYD_GVPROXY=/path/to/gvproxy \
-DORYD_AUTOSTART_DOCKER_TIER=1 \
+DORYD_FORCE_AUTOSTART_DOCKER_TIER=1 \
 swift run doryd
 ```
 
@@ -130,6 +136,7 @@ Useful knobs:
 - `DORYD_AGENT_CONTROL=0`: disable docker-tier guest agent control.
 - `DORYD_WAKE_DNS_PROBES`: comma-separated `host[:port]` probes re-resolved after host wake.
 - `DORYD_MEMORY_MB` / `DORYD_CPUS`: helper VM resources.
+- `DORYD_FORCE_AUTOSTART_DOCKER_TIER=1`: development-only override for `doryd` smoke tests.
 - `DORYD_ENGINE_ROOTFS`: optional prebuilt engine rootfs.
 - `DORYD_GPU=venus`, `DORYD_AMD64=1`, `DORYD_PUBLISH_HOST=0.0.0.0`: opt-in engine modes.
 - `DORYD_HV_RESTART_LIMIT`: helper crash restart budget, default `3`.

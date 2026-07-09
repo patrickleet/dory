@@ -83,6 +83,9 @@ public final class IdlePolicyStore: @unchecked Sendable {
     }
 
     private static let runtimeModes = Set(["manual", "auto-idle", "always-on", "battery-saver"])
+    // ISO8601DateFormatter isn't Sendable, but only its `string(from:)` is called here and that read
+    // path is thread-safe; sharing one instance avoids reallocating a formatter on every status().
+    nonisolated(unsafe) private static let iso8601Formatter = ISO8601DateFormatter()
     private static let integerKeys = Set(["sleepAfterMinutes"])
     private static let boolKeys = Set([
         "keepPublishedPortsAwake",
@@ -119,6 +122,18 @@ public final class IdlePolicyStore: @unchecked Sendable {
         return policy(from: loadConfigLocked())
     }
 
+    public func currentRuntimeMode() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return runtimeMode(from: loadConfigLocked())
+    }
+
+    public func managedEngineSleepEnabled() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return Self.autoIdleEnabled(runtimeMode(from: loadConfigLocked()))
+    }
+
     public func schedulerConfiguration(base: IdleSleepConfiguration) -> IdleSleepConfiguration {
         lock.lock()
         defer { lock.unlock() }
@@ -136,7 +151,7 @@ public final class IdlePolicyStore: @unchecked Sendable {
         let snapshot = currentSnapshot()
 
         return [
-            "generated_at": ISO8601DateFormatter().string(from: Date()),
+            "generated_at": Self.iso8601Formatter.string(from: Date()),
             "mode": snapshot.mode,
             "auto_idle_enabled": Self.autoIdleEnabled(snapshot.mode),
             "sleep_after_minutes": snapshot.policy.sleepAfterMinutes,
@@ -289,9 +304,17 @@ public final class IdlePolicyStore: @unchecked Sendable {
 
     private func loadConfigLocked() -> [String: Any] {
         let defaults = defaultConfig()
+        guard FileManager.default.fileExists(atPath: configPath) else {
+            // Absent config: defaults are the correct baseline for a fresh install.
+            return defaults
+        }
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: configPath)),
               let object = try? JSONSerialization.jsonObject(with: data),
               var config = object as? [String: Any] else {
+            // Present but undecodable: preserve the user's file before a later write can
+            // clobber it with regenerated defaults, and surface the problem instead of
+            // silently resetting their policy.
+            preserveCorruptConfigLocked()
             return defaults
         }
         if config["runtimeMode"] == nil {
@@ -305,6 +328,21 @@ public final class IdlePolicyStore: @unchecked Sendable {
         }
         config["idle"] = idle
         return config
+    }
+
+    private func preserveCorruptConfigLocked() {
+        let backupPath = configPath + ".corrupt"
+        guard !FileManager.default.fileExists(atPath: backupPath) else { return }
+        do {
+            try FileManager.default.copyItem(atPath: configPath, toPath: backupPath)
+            FileHandle.standardError.write(Data(
+                "doryd: corrupt idle config at \(configPath); backed up to \(backupPath), using defaults\n".utf8
+            ))
+        } catch {
+            FileHandle.standardError.write(Data(
+                "doryd: corrupt idle config at \(configPath); backup failed (\(error)); using defaults without overwriting\n".utf8
+            ))
+        }
     }
 
     private func saveConfigLocked(_ config: [String: Any]) throws {
@@ -322,8 +360,8 @@ public final class IdlePolicyStore: @unchecked Sendable {
     }
 
     private func runtimeMode(from config: [String: Any]) -> String {
-        let mode = (config["runtimeMode"] as? String) ?? "auto-idle"
-        return Self.runtimeModes.contains(mode) ? mode : "auto-idle"
+        let mode = (config["runtimeMode"] as? String) ?? "always-on"
+        return Self.runtimeModes.contains(mode) ? mode : "always-on"
     }
 
     private func policy(from config: [String: Any]) -> DoryIdlePolicy {
@@ -358,7 +396,7 @@ public final class IdlePolicyStore: @unchecked Sendable {
 
     private func defaultConfig() -> [String: Any] {
         [
-            "runtimeMode": "auto-idle",
+            "runtimeMode": "always-on",
             "idle": defaultIdlePolicy(),
             "network": [
                 "probes": [],
@@ -412,9 +450,6 @@ public final class IdlePolicyStore: @unchecked Sendable {
         }
         if let number = value as? NSNumber {
             return number
-        }
-        if let bool = value as? Bool {
-            return bool
         }
         return "\(value)"
     }

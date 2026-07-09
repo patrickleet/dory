@@ -24,6 +24,8 @@ public final class DataplaneActivityServer: @unchecked Sendable {
     }
 
     public func start() throws {
+        // Idempotent: a second start() must not overwrite `source` and leak the prior fd.
+        guard source == nil else { return }
         try FileManager.default.createDirectory(
             atPath: (path as NSString).deletingLastPathComponent,
             withIntermediateDirectories: true,
@@ -38,15 +40,17 @@ public final class DataplaneActivityServer: @unchecked Sendable {
             close(fd)
             throw error
         }
-        guard listen(fd, 32) == 0 else {
-            let error = errno
-            close(fd)
-            throw ServerError.syscall("listen", error)
-        }
+        // Restrict the socket before it can accept connections (chmod before listen),
+        // so there is no window where it is listenable with default permissions.
         guard chmod(path, 0o600) == 0 else {
             let error = errno
             close(fd)
             throw ServerError.syscall("chmod", error)
+        }
+        guard listen(fd, 32) == 0 else {
+            let error = errno
+            close(fd)
+            throw ServerError.syscall("listen", error)
         }
         _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK)
 
@@ -71,12 +75,17 @@ public final class DataplaneActivityServer: @unchecked Sendable {
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
         let bytes = Array(path.utf8)
+        guard !bytes.isEmpty else { throw ServerError.syscall("bind", EINVAL) }
         guard bytes.count < MemoryLayout.size(ofValue: address.sun_path) else {
             throw ServerError.tooLong
         }
-        withUnsafeMutableBytes(of: &address.sun_path) { destination in
-            bytes.withUnsafeBytes { source in
-                destination.baseAddress!.copyMemory(from: source.baseAddress!, byteCount: bytes.count)
+        try withUnsafeMutableBytes(of: &address.sun_path) { destination in
+            try bytes.withUnsafeBytes { source in
+                guard let destinationBase = destination.baseAddress,
+                      let sourceBase = source.baseAddress else {
+                    throw ServerError.syscall("bind", EINVAL)
+                }
+                destinationBase.copyMemory(from: sourceBase, byteCount: bytes.count)
             }
         }
         let result = withUnsafePointer(to: &address) { pointer in
@@ -98,6 +107,10 @@ public final class DataplaneActivityServer: @unchecked Sendable {
             if flags >= 0 {
                 _ = fcntl(client, F_SETFL, flags & ~O_NONBLOCK)
             }
+            // Bound the blocking read: accept and per-client reads share this serial
+            // queue, so a silent client would otherwise freeze all idle tracking.
+            var receiveTimeout = timeval(tv_sec: 5, tv_usec: 0)
+            setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &receiveTimeout, socklen_t(MemoryLayout<timeval>.size))
             handle(client: client)
         }
     }

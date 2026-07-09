@@ -68,6 +68,8 @@ public enum VmmHandoffError: Error, Sendable, CustomStringConvertible {
 public final class VmmHandoffServer: @unchecked Sendable {
     public typealias Handler = @Sendable (Result<VmmHandoff, Error>) -> Void
 
+    private static let receiveTimeoutSeconds: TimeInterval = 30
+
     public let path: String
     private let handler: Handler
     private let lock = NSLock()
@@ -152,12 +154,22 @@ public final class VmmHandoffServer: @unchecked Sendable {
         }
         defer { close(accepted) }
 
+        // Bound the receive so a peer that connects but never finishes sending can't wedge
+        // this queue (or a caller blocked on stop()) forever; recvmsg then fails with EAGAIN.
+        Self.setReceiveTimeout(fd: accepted, seconds: Self.receiveTimeoutSeconds)
+
         do {
             let handoff = try Self.receive(from: accepted)
             handler(.success(handoff))
         } catch {
             handler(.failure(error))
         }
+    }
+
+    private static func setReceiveTimeout(fd: Int32, seconds: TimeInterval) {
+        let whole = max(0, Int(seconds))
+        var timeout = timeval(tv_sec: whole, tv_usec: 0)
+        _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
     }
 
     private static func receive(from fd: Int32) throws -> VmmHandoff {
@@ -205,9 +217,13 @@ public final class VmmHandoffServer: @unchecked Sendable {
         guard bytes.count < MemoryLayout.size(ofValue: address.sun_path) else {
             throw VmmHandoffError.pathTooLong(path)
         }
+        // An empty path yields a nil source base address; guard the copy so a malformed path
+        // fails cleanly at bind/connect rather than trapping on a force-unwrap.
         withUnsafeMutableBytes(of: &address.sun_path) { destination in
             bytes.withUnsafeBytes { source in
-                destination.baseAddress!.copyMemory(from: source.baseAddress!, byteCount: bytes.count)
+                guard let destinationBase = destination.baseAddress,
+                      let sourceBase = source.baseAddress else { return }
+                destinationBase.copyMemory(from: sourceBase, byteCount: bytes.count)
             }
         }
         return address

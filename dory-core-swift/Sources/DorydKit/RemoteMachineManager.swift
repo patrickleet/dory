@@ -144,34 +144,61 @@ public final class RemoteMachineManager: @unchecked Sendable {
             build: configuration.build
         )
 
+        let agent: any RemoteAgentClient
         do {
-            let agent = try connector(remoteConfig)
-            let info = try agent.info()
-            lock.lock()
-            machines[configuration.id]?.agent?.close()
-            machines[configuration.id] = RemoteMachineEntry(
-                configuration: configuration,
-                state: .connected,
-                agent: agent,
-                lastError: nil,
-                info: info,
-                telemetry: nil
-            )
-            lock.unlock()
-            return info
+            agent = try connector(remoteConfig)
         } catch {
-            lock.lock()
-            machines[configuration.id] = RemoteMachineEntry(
-                configuration: configuration,
-                state: .failed,
-                agent: nil,
-                lastError: "\(error)",
-                info: nil,
-                telemetry: nil
-            )
-            lock.unlock()
+            recordFailure(id: configuration.id, configuration: configuration, error: error)
             throw error
         }
+
+        let info: DoryAgentInfo
+        do {
+            // The FFI call carries its own deadline (Rust AgentClient enforces 30s control /
+            // 2min sync timeouts), so there is no host-side timeout to add here.
+            info = try agent.info()
+        } catch {
+            // connector() already handed us a live handle; close it before we drop it so a
+            // failing info() can't leak an fd/SSH session per retry.
+            agent.close()
+            recordFailure(id: configuration.id, configuration: configuration, error: error)
+            throw error
+        }
+
+        let previousAgent: (any RemoteAgentClient)?
+        lock.lock()
+        previousAgent = machines[configuration.id]?.agent
+        machines[configuration.id] = RemoteMachineEntry(
+            configuration: configuration,
+            state: .connected,
+            agent: agent,
+            lastError: nil,
+            info: info,
+            telemetry: nil
+        )
+        lock.unlock()
+        previousAgent?.close()
+        return info
+    }
+
+    private func recordFailure(
+        id: String,
+        configuration: RemoteMachineConfiguration,
+        error: Error
+    ) {
+        let previousAgent: (any RemoteAgentClient)?
+        lock.lock()
+        previousAgent = machines[id]?.agent
+        machines[id] = RemoteMachineEntry(
+            configuration: configuration,
+            state: .failed,
+            agent: nil,
+            lastError: "\(error)",
+            info: nil,
+            telemetry: nil
+        )
+        lock.unlock()
+        previousAgent?.close()
     }
 
     public func push(
@@ -180,11 +207,13 @@ public final class RemoteMachineManager: @unchecked Sendable {
         remoteRoot: String? = nil
     ) throws -> DoryPushStats {
         let (agent, root) = try connectedAgent(id: id, remoteRoot: remoteRoot)
+        // Per-call deadline is enforced in the Rust AgentClient; no host-side timeout to add.
         return try agent.push(localRoot: localRoot, remoteRoot: root)
     }
 
     public func telemetry(id: String) throws -> DoryTelemetry {
         let (agent, _) = try connectedAgent(id: id, remoteRoot: nil)
+        // Per-call deadline is enforced in the Rust AgentClient; no host-side timeout to add.
         let telemetry = try agent.telemetry()
         lock.lock()
         machines[id]?.telemetry = telemetry

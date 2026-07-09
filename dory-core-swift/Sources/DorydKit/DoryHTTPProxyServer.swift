@@ -135,9 +135,21 @@ public final class DoryHTTPProxyServer: @unchecked Sendable {
 
             let client = accept(socketFD, nil, nil)
             if client < 0 {
-                if errno == EINTR { continue }
-                return
+                switch errno {
+                case EINTR, ECONNABORTED, EAGAIN, EWOULDBLOCK:
+                    continue
+                case EMFILE, ENFILE:
+                    // fd table exhausted: back off rather than tearing down the listener.
+                    usleep(50_000)
+                    continue
+                default:
+                    return
+                }
             }
+            // Bound the header read so a client that connects and never speaks cannot
+            // pin a handler thread forever.
+            var headerTimeout = timeval(tv_sec: 15, tv_usec: 0)
+            setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &headerTimeout, socklen_t(MemoryLayout<timeval>.size))
             Thread.detachNewThread { [weak self] in
                 self?.handle(client)
             }
@@ -170,6 +182,11 @@ public final class DoryHTTPProxyServer: @unchecked Sendable {
             writeBadGateway(client, body: "Dory: backend unavailable\n")
             return
         }
+        // Relays get a generous idle timeout on both ends so a wedged connection is
+        // eventually reclaimed instead of leaking a pump thread and its fds forever.
+        var relayTimeout = timeval(tv_sec: 300, tv_usec: 0)
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &relayTimeout, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(upstream, SOL_SOCKET, SO_RCVTIMEO, &relayTimeout, socklen_t(MemoryLayout<timeval>.size))
         DoryTCP.bidirectionalCopy(client: client, upstream: upstream)
     }
 
@@ -260,7 +277,7 @@ private func httpProxyIPv4SocketAddress(bindAddress: String, port: UInt16) throw
 }
 
 enum DoryTCP {
-    static func connect(host: String, port: UInt16) -> Int32? {
+    static func connect(host: String, port: UInt16, timeout: TimeInterval = 10) -> Int32? {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { return nil }
         var address = sockaddr_in()
@@ -271,15 +288,36 @@ enum DoryTCP {
             close(fd)
             return nil
         }
+        // Non-blocking connect with a deadline so an unresponsive backend cannot hang
+        // the handler indefinitely.
+        let originalFlags = fcntl(fd, F_GETFL, 0)
+        _ = fcntl(fd, F_SETFL, originalFlags | O_NONBLOCK)
         let result = withUnsafePointer(to: &address) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { raw in
                 Darwin.connect(fd, raw, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
-        guard result == 0 else {
-            close(fd)
-            return nil
+        if result != 0 {
+            guard errno == EINPROGRESS else {
+                close(fd)
+                return nil
+            }
+            var pollDescriptor = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+            let milliseconds = Int32(max(0, min(timeout, 86_400)) * 1000)
+            let ready = poll(&pollDescriptor, 1, milliseconds)
+            guard ready > 0 else {
+                close(fd)
+                return nil
+            }
+            var socketError: Int32 = 0
+            var errorLength = socklen_t(MemoryLayout<Int32>.size)
+            guard getsockopt(fd, SOL_SOCKET, SO_ERROR, &socketError, &errorLength) == 0,
+                  socketError == 0 else {
+                close(fd)
+                return nil
+            }
         }
+        _ = fcntl(fd, F_SETFL, originalFlags)
         return fd
     }
 

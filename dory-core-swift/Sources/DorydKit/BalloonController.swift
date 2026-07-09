@@ -195,6 +195,7 @@ public final class SystemHostMemoryProbe: HostMemoryProbing, @unchecked Sendable
 
     public func snapshot() throws -> HostMemorySnapshot {
         let host = mach_host_self()
+        defer { mach_port_deallocate(mach_task_self_, host) }
         var pageSize = vm_size_t(0)
         let pageSizeResult = host_page_size(host, &pageSize)
         guard pageSizeResult == KERN_SUCCESS else {

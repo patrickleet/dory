@@ -68,6 +68,22 @@ final class HostWakeCoordinatorTests: XCTestCase {
         XCTAssertTrue(result[0].resolved, result[0].error ?? "unresolved")
         XCTAssertFalse(result[0].addresses.isEmpty)
     }
+
+    func testPolicyAwareSleepHandlerSkipsWhenPolicyDisablesManagedSleep() {
+        let handler = TestSleepHandler()
+        let wrapped = PolicyAwareHostSleepHandler(
+            name: "docker",
+            handler: handler,
+            shouldAttemptSleep: { false }
+        )
+
+        let result = wrapped.prepareForHostSleep(now: Date())
+
+        XCTAssertFalse(result.attempted)
+        XCTAssertFalse(result.slept)
+        XCTAssertEqual(result.name, "docker")
+        XCTAssertTrue(handler.sleepDates.isEmpty)
+    }
 }
 
 private final class TestPowerEventSource: PowerEventSource, @unchecked Sendable {

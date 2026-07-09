@@ -62,6 +62,108 @@ final class MachineManagerTests: XCTestCase {
         }
     }
 
+    func testRejectsDotAndDotDotMachineIDsForCreateAndDelete() throws {
+        let base = "/tmp/dory-machine-traversal-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: "\(base)/machines", withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+        let sentinel = "\(base)/sentinel"
+        try Data("keep".utf8).write(to: URL(fileURLWithPath: sentinel))
+        let manager = MachineManager(configuration: MachineManagerConfiguration(
+            vmmExecutablePath: "/bin/sleep",
+            stateDirectory: "\(base)/machines",
+            baseArguments: ["30"],
+            passMachineArguments: false,
+            requiresReadyHandoff: false
+        ))
+
+        for id in [".", "..", "..."] {
+            XCTAssertThrowsError(try manager.create(DoryMachineConfiguration(
+                id: id,
+                kernelPath: "/tmp/kernel",
+                rootfsPath: "/tmp/rootfs"
+            ))) { error in
+                XCTAssertEqual(error as? MachineManagerError, .invalidID(id))
+            }
+            XCTAssertThrowsError(try manager.delete(id: id)) { error in
+                XCTAssertEqual(error as? MachineManagerError, .invalidID(id))
+            }
+        }
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sentinel))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: "\(base)/machines"))
+    }
+
+    func testImportSnapshotRejectsTraversalMachineID() throws {
+        let base = "/tmp/dory-machine-import-traversal-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+        let manager = MachineManager(configuration: MachineManagerConfiguration(
+            vmmExecutablePath: "/bin/sleep",
+            stateDirectory: "\(base)/machines",
+            baseArguments: ["30"],
+            passMachineArguments: false,
+            requiresReadyHandoff: false
+        ))
+
+        let bundlePath = "\(base)/evil.dorymachine"
+        try writeMachineBundle(
+            toPath: bundlePath,
+            snapshot: DoryMachineSnapshot(
+                id: "s1",
+                machineID: "..",
+                note: "",
+                createdISO: "2026-07-07T00:00:00Z",
+                rootfsPath: "/ignored",
+                sizeBytes: 0,
+                kernelPath: "/tmp/kernel",
+                memoryMB: 2048,
+                cpuCount: 2
+            ),
+            rootfs: Data("evil".utf8)
+        )
+
+        XCTAssertThrowsError(try manager.importSnapshot(fromPath: bundlePath)) { error in
+            XCTAssertEqual(error as? MachineManagerError, .persistence("invalid snapshot metadata"))
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: "\(base)/machines/../snapshots"))
+    }
+
+    func testRestoreSnapshotLeavesLiveRootfsIntactWhenCopyFails() throws {
+        let base = "/tmp/dory-machine-restore-atomic-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+        let sourceRootfs = "\(base)/base-rootfs.ext4"
+        try Data("base-rootfs".utf8).write(to: URL(fileURLWithPath: sourceRootfs))
+        let manager = MachineManager(configuration: MachineManagerConfiguration(
+            vmmExecutablePath: "/bin/sleep",
+            stateDirectory: "\(base)/machines",
+            baseArguments: ["30"],
+            passMachineArguments: false,
+            requiresReadyHandoff: false
+        ))
+        defer { try? manager.delete(id: "dev") }
+
+        _ = try manager.create(DoryMachineConfiguration(id: "dev", kernelPath: "/tmp/kernel", rootfsPath: sourceRootfs))
+        let devRootfs = "\(base)/machines/dev/rootfs.ext4"
+        try Data("live-disk-v1".utf8).write(to: URL(fileURLWithPath: devRootfs))
+        let snapshot = try manager.snapshot(id: "dev", createdISO: "2026-07-07T00:00:00Z", snapshotID: "s1")
+
+        try FileManager.default.removeItem(atPath: snapshot.rootfsPath)
+        try FileManager.default.createDirectory(atPath: snapshot.rootfsPath, withIntermediateDirectories: true)
+        try Data("x".utf8).write(to: URL(fileURLWithPath: "\(snapshot.rootfsPath)/inner"))
+
+        try Data("live-disk-v2".utf8).write(to: URL(fileURLWithPath: devRootfs))
+        XCTAssertThrowsError(try manager.restoreSnapshot(machineID: "dev", snapshotID: "s1"))
+
+        var isDirectory: ObjCBool = false
+        XCTAssertTrue(FileManager.default.fileExists(atPath: devRootfs, isDirectory: &isDirectory))
+        XCTAssertFalse(isDirectory.boolValue)
+        XCTAssertEqual(
+            String(data: try Data(contentsOf: URL(fileURLWithPath: devRootfs)), encoding: .utf8),
+            "live-disk-v2"
+        )
+    }
+
     func testMachineDefinitionsPersistAcrossManagerRestart() throws {
         let base = "/tmp/dory-machine-persist-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
         let share = "\(base)-share"
@@ -786,6 +888,26 @@ private final class RecordingMachineBalloonController: MachineBalloonControlling
         applies.append(Apply(socketPath: socketPath, targetMB: targetMB))
         lock.unlock()
     }
+}
+
+private func writeMachineBundle(
+    toPath path: String,
+    snapshot: DoryMachineSnapshot,
+    rootfs: Data
+) throws {
+    let magic = Data("DORYMACHINE1\n".utf8)
+    let metadata = try JSONEncoder().encode(snapshot)
+    var length = Data()
+    let count = UInt64(metadata.count)
+    for shift in stride(from: 56, through: 0, by: -8) {
+        length.append(UInt8((count >> UInt64(shift)) & 0xff))
+    }
+    var bundle = Data()
+    bundle.append(magic)
+    bundle.append(length)
+    bundle.append(metadata)
+    bundle.append(rootfs)
+    try bundle.write(to: URL(fileURLWithPath: path))
 }
 
 private func waitForMachineState(

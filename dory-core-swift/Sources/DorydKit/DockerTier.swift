@@ -89,6 +89,7 @@ public final class DockerTier: @unchecked Sendable {
         case suspendFailed(pid: Int32?)
         case resumeFailed(pid: Int32?)
         case readyTimeout
+        case wakeFailed(String)
 
         public var description: String {
             switch self {
@@ -102,9 +103,19 @@ public final class DockerTier: @unchecked Sendable {
                 return "failed to resume dory-hv\(pid.map { " pid \($0)" } ?? "")"
             case .readyTimeout:
                 return "docker tier did not become ready after wake"
+            case .wakeFailed(let message):
+                return message.isEmpty ? "docker tier did not wake" : message
             }
         }
     }
+
+    // A cold fresh-start boots the kernel, mounts the rootfs, initializes the docker data disk on
+    // first use, and starts dockerd/containerd — legitimately tens of seconds. Too short a ready
+    // window tears the engine down mid-boot; the next request restarts the cold boot, so an empty
+    // engine never comes up (boot loop). Resume from a suspended helper is near-instant, so it keeps
+    // a short window.
+    private static let freshStartReadyTimeout: TimeInterval = 180
+    private static let resumeReadyTimeout: TimeInterval = 10
 
     private let configuration: DockerTierConfiguration
     private let containerActivityProbe: DockerContainerActivityProbe
@@ -183,8 +194,8 @@ public final class DockerTier: @unchecked Sendable {
 
     /// Publish the Docker socket and activity listener without starting the heavy VM.
     ///
-    /// This is doryd's default launch shape for auto-idle: Docker clients can connect to
-    /// `dory.sock`, and the first meaningful request asks the activity server to wake a helper.
+    /// This is doryd's lightweight launch shape: Docker clients can connect to `dory.sock`
+    /// immediately, and the app or the first meaningful Docker request promotes it to a live helper.
     public func armSleeping() throws {
         idleController?.beginControlOperation()
         defer { idleController?.endControlOperation() }
@@ -235,10 +246,15 @@ public final class DockerTier: @unchecked Sendable {
         defer { idleController?.endControlOperation() }
 
         lock.lock()
+        if state == .starting {
+            lock.unlock()
+            throw TierError.alreadyRunning
+        }
         if dataplane != nil {
             if state == .sleeping {
                 lock.unlock()
                 wakeSynchronously()
+                try requireRunningAfterWake()
                 return
             }
             lock.unlock()
@@ -253,6 +269,11 @@ public final class DockerTier: @unchecked Sendable {
             let helper = makeManagedProcess()
             try helper?.start()
             startedHelper = helper
+
+            if configuration.hasManagedHelper,
+               !dockerReadyWaiter(configuration, Self.freshStartReadyTimeout) {
+                throw TierError.readyTimeout
+            }
 
             let resources = try startDataplane()
 
@@ -270,6 +291,20 @@ public final class DockerTier: @unchecked Sendable {
             lastError = "\(error)"
             lock.unlock()
             throw error
+        }
+    }
+
+    private func requireRunningAfterWake() throws {
+        lock.lock()
+        let currentState = state
+        let currentError = lastError
+        lock.unlock()
+
+        guard currentState == .running else {
+            if currentError == TierError.readyTimeout.description {
+                throw TierError.readyTimeout
+            }
+            throw TierError.wakeFailed(currentError ?? "docker tier is \(currentState.rawValue)")
         }
     }
 
@@ -525,6 +560,11 @@ public final class DockerTier: @unchecked Sendable {
     }
 
     public func syncAgentClock(now: Date = Date()) -> AgentClockSyncResult {
+        // Reached on host wake via the wake coordinator's clock syncers. Reset the idle
+        // clock the way the engine-wake path does: a long host sleep otherwise leaves
+        // lastActivity far in the past, so the idle scheduler would sleep a just-woken
+        // engine almost immediately.
+        idleController?.touch(now: now)
         guard let agentControl else {
             return AgentClockSyncResult(name: "docker", attempted: false, synced: false)
         }
@@ -594,7 +634,19 @@ public final class DockerTier: @unchecked Sendable {
                 idleController?.setSleeping(true)
                 return
             }
-            if dockerReadyWaiter(configuration, 10) {
+            state = .starting
+            lastError = nil
+            lock.unlock()
+
+            let ready = dockerReadyWaiter(configuration, Self.resumeReadyTimeout)
+
+            lock.lock()
+            guard state == .starting else {
+                wakeTask = nil
+                lock.unlock()
+                return
+            }
+            if ready {
                 state = .running
                 lastError = nil
                 wakeTask = nil
@@ -613,12 +665,39 @@ public final class DockerTier: @unchecked Sendable {
             idleController?.setSleeping(true)
             return
         }
+        guard state == .sleeping else {
+            wakeTask = nil
+            lock.unlock()
+            return
+        }
+        state = .starting
+        lastError = nil
         lock.unlock()
 
         do {
             let helper = try startFreshManagedProcess()
             lock.lock()
-            if dockerReadyWaiter(configuration, 45) {
+            guard state == .starting else {
+                // Torn down while the fresh helper was starting; discard it rather than
+                // adopt it into a stopped tier.
+                wakeTask = nil
+                lock.unlock()
+                helper?.stop()
+                return
+            }
+            helperProcess = helper
+            lock.unlock()
+
+            let ready = dockerReadyWaiter(configuration, Self.freshStartReadyTimeout)
+
+            lock.lock()
+            guard state == .starting else {
+                wakeTask = nil
+                lock.unlock()
+                helper?.stop()
+                return
+            }
+            if ready {
                 helperProcess = helper
                 state = .running
                 lastError = nil
@@ -635,8 +714,8 @@ public final class DockerTier: @unchecked Sendable {
                 state = .sleeping
                 lastError = TierError.readyTimeout.description
                 wakeTask = nil
-                helper?.stop()
                 lock.unlock()
+                helper?.stop()
                 idleController?.setSleeping(true)
             }
         } catch {
@@ -740,10 +819,12 @@ public final class DockerTier: @unchecked Sendable {
         let currentDataplane: DoryDataplaneHandle?
         let currentHelper: (any DockerManagedProcess)?
         let currentActivityServer: DataplaneActivityServer?
+        let inFlightWake: Task<Void, Never>?
         lock.lock()
         currentDataplane = dataplane
         currentHelper = helperProcess ?? extraHelper
         currentActivityServer = activityServer
+        inFlightWake = wakeTask
         dataplane = nil
         helperProcess = nil
         activityServer = nil
@@ -753,6 +834,10 @@ public final class DockerTier: @unchecked Sendable {
             idleController?.setSleeping(false)
         }
         lock.unlock()
+
+        // Cancel any in-flight wake so it stops resuming; it also re-checks state under
+        // the lock and discards a freshly started helper now that state != .sleeping.
+        inFlightWake?.cancel()
 
         currentDataplane?.shutdown()
         currentActivityServer?.stop()

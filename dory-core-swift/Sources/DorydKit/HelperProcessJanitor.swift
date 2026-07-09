@@ -27,7 +27,19 @@ public enum HelperProcessJanitor {
             Thread.sleep(forTimeInterval: 0.02)
         }
 
-        for pid in pids where isProcessAlive(pid) {
+        // Re-scan and re-match immediately before SIGKILL: a PID that survived the grace could
+        // have exited and been recycled by an unrelated process. Only kill pids that still match
+        // the same executable + --state-dir; if we cannot refresh the scan, kill nothing.
+        let survivors = pids.filter(isProcessAlive)
+        guard !survivors.isEmpty else { return pids }
+        guard let refreshed = (psOutputProvider ?? processList)() else { return pids }
+        let stillStale = Set(staleHelperPIDs(
+            executablePath: executablePath,
+            stateDirectory: stateDirectory,
+            includeDescendants: includeDescendants,
+            psOutput: refreshed
+        ))
+        for pid in survivors where stillStale.contains(pid) {
             _ = kill(pid, SIGKILL)
         }
         return pids

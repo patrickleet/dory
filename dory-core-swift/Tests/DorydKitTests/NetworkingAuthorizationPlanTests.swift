@@ -70,6 +70,50 @@ final class NetworkingAuthorizationPlanTests: XCTestCase {
         }
     }
 
+    func testRejectsPublicDomainSuffix() {
+        XCTAssertThrowsError(try NetworkingAuthorizationPlan.make(configuration: NetworkingConfiguration(
+            suffix: "mybank.com",
+            dnsPort: 15353
+        ))) { error in
+            XCTAssertEqual(error as? NetworkingAuthorizationError, .invalidSuffix("mybank.com"))
+        }
+    }
+
+    func testRejectsNonLoopbackNameserver() {
+        XCTAssertThrowsError(try NetworkingAuthorizationPlan.make(configuration: NetworkingConfiguration(
+            dnsBindAddress: "10.0.0.5",
+            dnsPort: 15353
+        ))) { error in
+            XCTAssertEqual(error as? NetworkingAuthorizationError, .invalidBindAddress("10.0.0.5"))
+        }
+    }
+
+    func testAcceptsIPv6LoopbackNameserver() throws {
+        let plan = try NetworkingAuthorizationPlan.make(configuration: NetworkingConfiguration(
+            dnsBindAddress: "::1",
+            dnsPort: 15353
+        ))
+        XCTAssertEqual(plan.dnsBindAddress, "::1")
+    }
+
+    func testRejectsOutOfTreeLocalCAPath() {
+        XCTAssertThrowsError(try NetworkingAuthorizationPlan.make(configuration: NetworkingConfiguration(
+            dnsPort: 15353,
+            localCACertificatePath: "/Users/test/evil/ca.crt"
+        ))) { error in
+            XCTAssertEqual(error as? NetworkingAuthorizationError, .invalidPath("localCACertificatePath"))
+        }
+    }
+
+    func testRejectsProxyReservedPrivilegedForward() {
+        XCTAssertThrowsError(try NetworkingAuthorizationPlan.make(configuration: NetworkingConfiguration(
+            dnsPort: 15353,
+            privilegedTCPForwards: [PrivilegedTCPForward(listenPort: 443, targetPort: 9443)]
+        ))) { error in
+            XCTAssertEqual(error as? NetworkingAuthorizationError, .invalidPrivilegedForward("443:9443"))
+        }
+    }
+
     func testDecodesLegacyPlanWithoutPrivilegedForwards() throws {
         let json = Data("""
         {
