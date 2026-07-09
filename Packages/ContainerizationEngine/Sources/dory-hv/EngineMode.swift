@@ -44,6 +44,7 @@ enum EngineMode {
     /// gvproxy pid for the teardown path: stopping the helper must not orphan the sidecar.
     nonisolated(unsafe) private static var sidecarPID: pid_t = 0
     nonisolated(unsafe) private static var signalSources: [any DispatchSourceSignal] = []
+    nonisolated(unsafe) private static var memoryPressureSource: (any DispatchSourceMemoryPressure)?
 
     /// SIGTERM/SIGINT ask the guest to power off (sync + unmount + PSCI) through the shutdown
     /// socket; the run loop then returns and the process exits cleanly with a consistent disk.
@@ -73,6 +74,23 @@ enum EngineMode {
             source.resume()
             signalSources.append(source)
         }
+    }
+
+    static var reclaimModeIsSenpai: Bool {
+        (ProcessInfo.processInfo.environment["DORY_ENGINE_RECLAIM_MODE"]?.lowercased() ?? "dropcaches") == "senpai"
+    }
+
+    // P1.2 host-pressure tier: when macOS reports memory pressure, ping the guest's reclaim listener so
+    // it hands memory back exactly when the host needs it (the free-page-reporting moat, on demand).
+    // Mirrors the shutdown channel: a forwarded unix socket → guest tcp 2378. Gated to senpai mode.
+    private static func installHostPressureReclaim(reclaimSocket: String) {
+        let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .global())
+        source.setEventHandler {
+            note("host memory pressure — asking the guest to reclaim")
+            DispatchQueue.global().async { _ = touchUnixSocket(reclaimSocket) }
+        }
+        source.resume()
+        memoryPressureSource = source
     }
 
     private static func installClockSyncSignal(vsock: VirtioVsock) {
@@ -275,6 +293,11 @@ enum EngineMode {
         publishForward(local: shutdownSocket, guestPort: 2377, apiSocket: apiSocket, label: "shutdown channel")
         installGracefulShutdown(shutdownSocket: shutdownSocket)
         installClockSyncSignal(vsock: vsock)
+        if reclaimModeIsSenpai {
+            let reclaimSocket = state + "/reclaim.sock"
+            publishForward(local: reclaimSocket, guestPort: 2378, apiSocket: apiSocket, label: "host-pressure reclaim channel")
+            installHostPressureReclaim(reclaimSocket: reclaimSocket)
+        }
 
         // Keep gvproxy's forwards in sync with the ports containers publish, so `docker run -p` is
         // reachable from the host across the userspace network.
@@ -471,13 +494,13 @@ enum EngineMode {
             "dockerd -H unix:///var/run/docker.sock -H tcp://0.0.0.0:2375 --tls=false --log-level=warn --feature containerd-snapshotter=true $DORY_RUNTIME_ARGS >/var/log/dockerd.log 2>&1 & true",
             amd64Emulation ? BinfmtRegistration.dockerFallbackCommand() : "true",
             "( while true; do nc -l -p 2377 >/dev/null 2>&1; echo shutdown requested; sync; umount /var/lib/docker 2>/dev/null; sync; poweroff -f; done ) & true",
-            // Cache cap only. NO compaction (it migrates pages and re-faults the ones free page
-            // reporting already handed back to the host — pure churn) and NO root memory.reclaim
-            // (write-rejected on the root cgroup). A gentle pagecache-only drop fires when the guest
-            // is quiet, so idle containers can reclaim memory without evicting an active workload's
-            // page cache. /proc/stat's iowait is counted as busy by using idle-only as the quiet
-            // numerator.
-            "( prev_total=0; prev_idle=0; quiet_running_ticks=0; while true; do sleep 5; set -- $(awk '/^cpu /{t=0; for(i=2;i<=NF;i++) t+=$i; print t,$5; exit}' /proc/stat); total=${1:-0}; idle=${2:-0}; quiet=0; if [ ${prev_total:-0} -gt 0 ]; then dt=$((total-prev_total)); di=$((idle-prev_idle)); [ $dt -gt 0 ] && [ $((100 - (di * 100 / dt))) -le 8 ] && quiet=1; fi; prev_total=$total; prev_idle=$idle; running=$(docker -H unix:///var/run/docker.sock ps -q 2>/dev/null | wc -l | tr -d ' '); if [ ${running:-0} -gt 0 ] && [ $quiet -eq 1 ]; then quiet_running_ticks=$((quiet_running_ticks+1)); else quiet_running_ticks=0; fi; [ $quiet_running_ticks -ge 2 ] || continue; c=$(awk '/^Cached:/{print $2; exit}' /proc/meminfo); [ ${c:-0} -gt 327680 ] && echo 1 > /proc/sys/vm/drop_caches 2>/dev/null; done ) & true",
+            Self.hostPressureReclaimListener(),
+            // Idle memory reclaim. Default is a gentle pagecache-only drop_caches when the guest is
+            // quiet (no compaction — it re-faults the pages free-page reporting already handed back;
+            // no root memory.reclaim — write-rejected on the root cgroup). DORY_ENGINE_RECLAIM_MODE=senpai
+            // swaps in a coldest-first, working-set-protected feeder (MGLRU min_ttl_ms + DAMON_RECLAIM,
+            // memory.reclaim fallback) per the research §5. Kept opt-in until the memory A/B lands.
+            Self.reclaimLoopCommand(),
             // Hand PID 1 to tini (docker-init, shipped in docker:dind) as a reaping init. exec
             // replaces the boot shell in place, so tini keeps PID 1 while dockerd and the loops
             // above continue as its children. Container shims double-fork and orphan their exited
@@ -488,6 +511,34 @@ enum EngineMode {
             "while true; do sleep 2147483647; done",
         ]
         return script.joined(separator: "\n") + "\n"
+    }
+
+    // Emits the idle-reclaim daemon for the boot script. Default "dropcaches" is the proven, gentle
+    // pagecache-only drop. "senpai" (DORY_ENGINE_RECLAIM_MODE=senpai) swaps in the research §5 feeder:
+    // MGLRU working-set protection, then in-kernel DAMON_RECLAIM if available (coldest-first, rate- and
+    // watermark-limited), else a PSI-gated per-cgroup memory.reclaim fallback. Opt-in until A/B'd.
+    private static func reclaimLoopCommand() -> String {
+        let quietGate = "set -- $(awk '/^cpu /{t=0; for(i=2;i<=NF;i++) t+=$i; print t,$5; exit}' /proc/stat); total=${1:-0}; idle=${2:-0}; quiet=0; if [ ${prev_total:-0} -gt 0 ]; then dt=$((total-prev_total)); di=$((idle-prev_idle)); [ $dt -gt 0 ] && [ $((100 - (di * 100 / dt))) -le 8 ] && quiet=1; fi; prev_total=$total; prev_idle=$idle; running=$(docker -H unix:///var/run/docker.sock ps -q 2>/dev/null | wc -l | tr -d ' '); if [ ${running:-0} -gt 0 ] && [ $quiet -eq 1 ]; then quiet_running_ticks=$((quiet_running_ticks+1)); else quiet_running_ticks=0; fi"
+
+        let dropCaches = "( prev_total=0; prev_idle=0; quiet_running_ticks=0; while true; do sleep 5; \(quietGate); [ $quiet_running_ticks -ge 2 ] || continue; c=$(awk '/^Cached:/{print $2; exit}' /proc/meminfo); [ ${c:-0} -gt 327680 ] && echo 1 > /proc/sys/vm/drop_caches 2>/dev/null; done ) & true"
+
+        let mode = ProcessInfo.processInfo.environment["DORY_ENGINE_RECLAIM_MODE"]?.lowercased() ?? "dropcaches"
+        guard mode == "senpai" else { return dropCaches }
+
+        let senpaiSetup = "[ -w /sys/kernel/mm/lru_gen/min_ttl_ms ] && echo 2000 > /sys/kernel/mm/lru_gen/min_ttl_ms 2>/dev/null; if [ -d /sys/module/damon_reclaim/parameters ]; then echo 2000000 > /sys/module/damon_reclaim/parameters/min_age 2>/dev/null; echo Y > /sys/module/damon_reclaim/parameters/enabled 2>/dev/null; damon=1; else damon=0; fi"
+        let psiGate = "psi=$(awk '/^some /{for(i=1;i<=NF;i++) if($i ~ /^avg10=/){split($i,a,\"=\"); print a[2]}}' /proc/pressure/memory 2>/dev/null); awk -v p=\"${psi:-0}\" 'BEGIN{exit !(p+0 < 1.0)}' || continue"
+        let cgroupReclaim = "for r in $(find /sys/fs/cgroup -maxdepth 4 -name memory.reclaim 2>/dev/null | grep -Ei 'docker|containerd|kubepods|system.slice'); do echo 67108864 > \"$r\" 2>/dev/null; done"
+
+        return "( \(senpaiSetup); prev_total=0; prev_idle=0; quiet_running_ticks=0; while true; do sleep 5; [ ${damon:-0} -eq 1 ] && continue; \(quietGate); [ $quiet_running_ticks -ge 2 ] || continue; \(psiGate); \(cgroupReclaim); done ) & true"
+    }
+
+    // Guest half of the P1.2 host-pressure tier: a listener the host pings (via reclaim.sock → tcp 2378)
+    // when macOS is under memory pressure. On a ping it drops pagecache and reclaims a large chunk from
+    // each container cgroup so free-page reporting can hand the pages back to the host immediately.
+    // Senpai-mode only; returns "true" (a no-op boot line) otherwise so the default engine is unchanged.
+    private static func hostPressureReclaimListener() -> String {
+        guard reclaimModeIsSenpai else { return "true" }
+        return "( while true; do nc -l -p 2378 >/dev/null 2>&1; sync; echo 1 > /proc/sys/vm/drop_caches 2>/dev/null; for r in $(find /sys/fs/cgroup -maxdepth 4 -name memory.reclaim 2>/dev/null | grep -Ei 'docker|containerd|kubepods|system.slice'); do echo 268435456 > \"$r\" 2>/dev/null; done; done ) & true"
     }
 
     private static func guestAgentStartCommand(shares: [VirtioFSShareConfiguration]) -> String {
