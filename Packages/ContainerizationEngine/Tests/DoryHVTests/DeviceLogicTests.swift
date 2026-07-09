@@ -120,6 +120,106 @@ import Testing
         #expect(tooLow.queueCount == 1)
         #expect(tooHigh.queueCount == 16)
     }
+
+    @Test func advertisesDiscardAndWriteZeroesByDefault() throws {
+        let path = try makeDisk(byteCount: 1 << 20)
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let block = try VirtioBlk(path: path, identity: "test", queueCount: 1)
+
+        #expect(block.deviceFeatures & (1 << 13) != 0)  // VIRTIO_BLK_F_DISCARD
+        #expect(block.deviceFeatures & (1 << 14) != 0)  // VIRTIO_BLK_F_WRITE_ZEROES
+        #expect(block.configSpace.count >= 60)
+        #expect(block.configSpace.leUInt32(at: 36) > 0)  // max_discard_sectors
+        #expect(block.configSpace.leUInt32(at: 48) > 0)  // max_write_zeroes_sectors
+        #expect(block.configSpace[56] == 1)              // write_zeroes_may_unmap
+    }
+
+    @Test func readOnlyImageAdvertisesReadOnlyFeatureAndNoDiscard() throws {
+        let path = try makeDisk()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let ro = try VirtioBlk(path: path, identity: "test", readOnly: true, queueCount: 1)
+        let rw = try VirtioBlk(path: path, identity: "test", readOnly: false, queueCount: 1)
+
+        #expect(ro.deviceFeatures & (1 << 5) != 0)   // VIRTIO_BLK_F_RO advertised
+        #expect(ro.deviceFeatures & (1 << 13) == 0)  // discard off for read-only
+        #expect(rw.deviceFeatures & (1 << 5) == 0)   // writable image: no RO bit
+    }
+
+    @Test func discardCanBeDisabled() throws {
+        let path = try makeDisk()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let block = try VirtioBlk(path: path, identity: "test", queueCount: 1, discard: false)
+
+        #expect(block.deviceFeatures & (1 << 13) == 0)
+        #expect(block.deviceFeatures & (1 << 14) == 0)
+        #expect(block.configSpace.count == 36)
+    }
+
+    @Test func discardPunchesHoleReadingBackZeros() throws {
+        let path = try makeDisk(byteCount: 8192)
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        try Data(repeating: 0xFF, count: 8192).write(to: URL(fileURLWithPath: path))
+        let block = try VirtioBlk(path: path, identity: "test", queueCount: 1)
+
+        var range = [UInt8]()
+        range.appendLE(UInt64(2))   // start sector 2 -> byte 1024
+        range.appendLE(UInt32(4))   // 4 sectors -> 2048 bytes
+        range.appendLE(UInt32(0))   // flags
+        let status = range.withUnsafeMutableBytes { buffer -> VirtioBlk.RequestStatus in
+            let segment = VirtqueueSegment(pointer: buffer.baseAddress!, length: buffer.count, isDeviceWritable: false)
+            return block.applyDiscardOrWriteZeroes([segment][...], writeZeroes: false)
+        }
+
+        #expect(status == .ok)
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        #expect(data[1023] == 0xFF)
+        #expect(Array(data[1024..<3072]).allSatisfy { $0 == 0 })
+        #expect(data[3072] == 0xFF)
+    }
+
+    @Test func writeZeroesWithoutUnmapZerosRange() throws {
+        let path = try makeDisk(byteCount: 8192)
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        try Data(repeating: 0xAB, count: 8192).write(to: URL(fileURLWithPath: path))
+        let block = try VirtioBlk(path: path, identity: "test", queueCount: 1)
+
+        var range = [UInt8]()
+        range.appendLE(UInt64(0))
+        range.appendLE(UInt32(2))   // 1024 bytes
+        range.appendLE(UInt32(0))   // no unmap flag
+        let status = range.withUnsafeMutableBytes { buffer -> VirtioBlk.RequestStatus in
+            let segment = VirtqueueSegment(pointer: buffer.baseAddress!, length: buffer.count, isDeviceWritable: false)
+            return block.applyDiscardOrWriteZeroes([segment][...], writeZeroes: true)
+        }
+
+        #expect(status == .ok)
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        #expect(Array(data[0..<1024]).allSatisfy { $0 == 0 })
+        #expect(data[1024] == 0xAB)
+    }
+
+    @Test func discardBeyondCapacityIsRejected() throws {
+        let path = try makeDisk(byteCount: 4096)  // 8 sectors
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        try Data(repeating: 0xFF, count: 4096).write(to: URL(fileURLWithPath: path))
+        let block = try VirtioBlk(path: path, identity: "test", queueCount: 1)
+
+        var range = [UInt8]()
+        range.appendLE(UInt64(6))    // sector 6
+        range.appendLE(UInt32(10))   // 10 sectors overruns the 8-sector disk
+        range.appendLE(UInt32(0))
+        let status = range.withUnsafeMutableBytes { buffer -> VirtioBlk.RequestStatus in
+            let segment = VirtqueueSegment(pointer: buffer.baseAddress!, length: buffer.count, isDeviceWritable: false)
+            return block.applyDiscardOrWriteZeroes([segment][...], writeZeroes: false)
+        }
+
+        #expect(status == .ioError)
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        #expect(data.allSatisfy { $0 == 0xFF })
+    }
 }
 
 @Suite struct DataAbortInfoTests {
