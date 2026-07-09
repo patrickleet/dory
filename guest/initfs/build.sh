@@ -133,6 +133,15 @@ install_docker_static() {
   rm -rf "$tmp"
 }
 
+# crun is a single static ELF (no shared-lib deps); install it beside runc as dockerd's
+# default-runtime. runc stays available so `docker run --runtime runc` still works.
+install_crun() {
+  local arch="$1" dest="$2" bin
+  bin="$(fetch_pin "crun_${arch}")"
+  mkdir -p "$dest/usr/local/bin"
+  install -m0755 "$bin" "$dest/usr/local/bin/crun"
+}
+
 extract_apk() {
   local apk="$1" dest="$2"
   tar -xzf "$apk" -C "$dest" \
@@ -196,6 +205,7 @@ build_arch() {
   install_ext4_tools "$arch" "$rootfs"
   install_iptables "$arch" "$rootfs"
   install_docker_static "$docker_tar" "$rootfs"
+  install_crun "$arch" "$rootfs"
   write_runtime_files "$rootfs" "$arch"
 
   rm -f "$image"

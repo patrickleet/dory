@@ -465,7 +465,10 @@ enum EngineMode {
         }
         script += [
             guestAgentStartCommand(shares: shares),
-            "dockerd -H unix:///var/run/docker.sock -H tcp://0.0.0.0:2375 --tls=false --log-level=warn --feature containerd-snapshotter=true >/var/log/dockerd.log 2>&1 & true",
+            // Prefer crun (faster container create/start); fall back to dockerd's built-in runc if the
+            // binary is somehow absent so the engine still serves.
+            "[ -x /usr/local/bin/crun ] && DORY_RUNTIME_ARGS='--add-runtime crun=/usr/local/bin/crun --default-runtime crun' || DORY_RUNTIME_ARGS=''",
+            "dockerd -H unix:///var/run/docker.sock -H tcp://0.0.0.0:2375 --tls=false --log-level=warn --feature containerd-snapshotter=true $DORY_RUNTIME_ARGS >/var/log/dockerd.log 2>&1 & true",
             amd64Emulation ? BinfmtRegistration.dockerFallbackCommand() : "true",
             "( while true; do nc -l -p 2377 >/dev/null 2>&1; echo shutdown requested; sync; umount /var/lib/docker 2>/dev/null; sync; poweroff -f; done ) & true",
             // Cache cap only. NO compaction (it migrates pages and re-faults the ones free page

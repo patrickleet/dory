@@ -9,13 +9,14 @@ The builder is intentionally reproducible from pinned public inputs in `guest/in
 
 - Alpine minirootfs 3.21.7 for `arm64` and `amd64`
 - Docker static 29.6.1 for `arm64` and `amd64`
+- crun 1.28 static OCI runtime for `arm64` and `amd64` (dockerd's `--default-runtime`)
 - Dory's guest agent from `guest/out/dory-agent-<arch>`
 
 Runtime contents added by Dory:
 
 - `/sbin/init`: mounts `proc`, `sysfs`, `devtmpfs`, `devpts`, `tmpfs` for `/run` and `/tmp`, and cgroup v2, then execs `dory-agent` as PID 1.
 - `/usr/bin/dory-agent`: guest RPC agent listening on vsock port 1024.
-- `/usr/local/bin/dockerd`, `containerd`, `runc`, `docker-init`, `docker-proxy`, `ctr`, `docker`, and `containerd-shim-runc-v2`.
+- `/usr/local/bin/dockerd`, `containerd`, `runc`, `crun`, `docker-init`, `docker-proxy`, `ctr`, `docker`, and `containerd-shim-runc-v2`. dockerd runs with `--default-runtime crun` (runc stays selectable via `--runtime runc`).
 - `/etc/resolv.conf` and `/etc/hostname`.
 - Standard runtime directories: `/var/lib/docker`, `/var/run`, `/var/log`, `/run`, `/tmp`.
 

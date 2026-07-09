@@ -5,10 +5,13 @@
 #
 # Alpine minirootfs provides /bin/sh, BusyBox applets, udhcpc, nc, and base device/mount tooling.
 # Docker static provides dockerd, containerd, runc, docker-init, docker-proxy, ctr, and docker.
+# crun is a faster OCI runtime set as dockerd's default-runtime (runc stays as a fallback).
 alpine_arm64 https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.7-aarch64.tar.gz d1d1a3fae5f4d6146e9742790a47fcb116199622cfb8439f218a4d5fbe5000da
 alpine_amd64 https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.7-x86_64.tar.gz 8cba1ea3e8b500ea986a313d8eecf3d5952a2a0d23a69117bb81c023d9ceac05
 docker_arm64 https://download.docker.com/linux/static/stable/aarch64/docker-29.6.1.tgz 917a4bb83565bcacb38c430f08daae8b59db3256331ac23f22394f0542509881
 docker_amd64 https://download.docker.com/linux/static/stable/x86_64/docker-29.6.1.tgz b0df4a43a98d7ecb708acbdb5a34a3416e13b6e39bcbbdf296f51f0f3442b29f
+crun_arm64 https://github.com/containers/crun/releases/download/1.28/crun-1.28-linux-arm64 cc1e8ec89aef1422e0741be196f9ed099e2e09d2f48f30f27cd44a22ef1f0342
+crun_amd64 https://github.com/containers/crun/releases/download/1.28/crun-1.28-linux-amd64 2aa6b7024a9c9f153895c0d11ae233d3758f54844011c3a039e3e89048d01d42
 libeconf_arm64 https://dl-cdn.alpinelinux.org/alpine/v3.21/main/aarch64/libeconf-0.6.3-r0.apk db25f8abaf1ec61f5dcc0ff9b55271a3f6e43037e430b0c126ac000483e17dad
 libuuid_arm64 https://dl-cdn.alpinelinux.org/alpine/v3.21/main/aarch64/libuuid-2.40.4-r1.apk d392ac96027cbe5ca9bc270d2aa4e99747b0eae3cf65a0087f2c6f13a7382702
 libcom_err_arm64 https://dl-cdn.alpinelinux.org/alpine/v3.21/main/aarch64/libcom_err-1.47.1-r1.apk 0798fedbc002cada8e74a7cb4cdae885e5f0c1b5fd59b15af5b2903b95d30153

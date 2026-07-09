@@ -45,10 +45,16 @@ if [ -b /dev/vdb ]; then
 fi
 
 if [ -x /usr/local/bin/dockerd ]; then
+  if [ -x /usr/local/bin/crun ]; then
+    DORY_RUNTIME_ARGS="--add-runtime crun=/usr/local/bin/crun --default-runtime crun"
+  else
+    DORY_RUNTIME_ARGS=""
+  fi
+  # shellcheck disable=SC2086
   /usr/local/bin/dockerd \
     -H unix:///var/run/docker.sock \
     -H tcp://0.0.0.0:2375 \
-    --tls=false >/var/log/dockerd.log 2>&1 &
+    --tls=false $DORY_RUNTIME_ARGS >/var/log/dockerd.log 2>&1 &
 fi
 
 ( while true; do
