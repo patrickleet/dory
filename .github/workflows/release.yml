@@ -194,6 +194,14 @@ jobs:
           sed -i -E "s/  sha256 \"[0-9a-f]+\"/  sha256 \"$S\"/" Casks/dory.rb
           test -f appcast-artifact/appcast.xml
           cp appcast-artifact/appcast.xml website/public/appcast.xml
+          # The 0.2.0 cask shipped without a matching appcast item once; make that class of drift
+          # fail the job instead of passing silently.
+          grep -qF "version \"$V\"" Casks/dory.rb \
+            || { echo "cask version was not bumped to $V" >&2; exit 1; }
+          grep -qF "sha256 \"$S\"" Casks/dory.rb \
+            || { echo "cask sha256 was not bumped for $V" >&2; exit 1; }
+          grep -qF "<sparkle:shortVersionString>$V</sparkle:shortVersionString>" website/public/appcast.xml \
+            || { echo "appcast.xml carries no item for $V" >&2; exit 1; }
           git add Casks/dory.rb website/public/appcast.xml
           if git diff --cached --quiet; then echo "cask already current"; exit 0; fi
           git config user.name "github-actions[bot]"

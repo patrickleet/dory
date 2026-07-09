@@ -25,12 +25,12 @@ docker_e() {
 }
 
 compose_down() {
-  local output status remaining
-  if output="$(docker_e compose -p "$PROJECT" -f "$WORKDIR/compose.yaml" down -v --remove-orphans 2>&1)"; then
+  local output status=0 remaining
+  output="$(docker_e compose -p "$PROJECT" -f "$WORKDIR/compose.yaml" down -v --remove-orphans 2>&1)" || status=$?
+  if [ "$status" -eq 0 ]; then
     [ -z "$output" ] || printf '%s\n' "$output"
     return 0
   fi
-  status=$?
   remaining="$(docker_e ps -a --filter "label=com.docker.compose.project=$PROJECT" -q 2>/dev/null || true)"
   if printf '%s\n' "$output" | grep -q 'parsing time ""' && [ -z "$remaining" ]; then
     printf '%s\n' "$output" >&2

@@ -134,6 +134,27 @@ preflight_macos_floor() {
   done
 }
 
+# Fail in seconds, not after the full xcodebuild, when an engine-bundled release is requested on a
+# runner that never built/fetched the guest assets. bundle-engine.sh remains the authoritative
+# (hard-failing) check; this only covers the two classes every engine bundle needs.
+preflight_guest_assets() {
+  [ "${DORY_BUNDLE_ENGINE:-1}" = "1" ] || return 0
+  local missing=""
+  if [ -z "${DORY_HV_KERNEL_ARM64:-}${DORY_HV_KERNEL:-}" ] && [ ! -f guest/out/Image ]; then
+    missing="$missing arm64-kernel(guest/out/Image)"
+  fi
+  if [ -z "${DORY_INITFS_ARM64:-}${DORY_INITFS:-}" ] && [ ! -f guest/out/initfs-arm64.ext4 ]; then
+    missing="$missing arm64-initfs(guest/out/initfs-arm64.ext4)"
+  fi
+  if [ -z "${DORY_HV_KERNEL_AMD64:-}" ] && [ ! -f guest/out/vmlinux-x86 ]; then
+    missing="$missing amd64-kernel(guest/out/vmlinux-x86)"
+  fi
+  if [ -z "${DORY_INITFS_AMD64:-}" ] && [ ! -f guest/out/initfs-amd64.ext4 ]; then
+    missing="$missing amd64-initfs(guest/out/initfs-amd64.ext4)"
+  fi
+  [ -z "$missing" ] || release_error "engine-bundled release needs guest assets on this runner; missing:$missing. Build them with guest/kernel/build.sh and guest/initfs/build.sh (or set DORY_HV_KERNEL_*/DORY_INITFS_* overrides), or set DORY_BUNDLE_ENGINE=0 for an app-only dry-run"
+}
+
 preflight_release() {
   local requested
   echo "==> Release preflight..."
@@ -141,6 +162,7 @@ preflight_release() {
     require_tool "$tool"
   done
   preflight_macos_floor
+  preflight_guest_assets
   if [ "${DORY_MAKE_DMG:-1}" = "1" ]; then
     require_tool hdiutil
   fi
@@ -256,11 +278,36 @@ verify_full_bundle() {
 
 sign_app() {
   local app="$1"
+  local entitlements="Dory/Dory.entitlements"
   echo "==> Signing $(basename "$(dirname "$app")")/Dory.app (Developer ID + hardened runtime)..."
+  if [ "$SIGN_IDENTITY" = "-" ]; then
+    entitlements="$BUILD_DIR/local-adhoc-app.entitlements"
+    mkdir -p "$(dirname "$entitlements")"
+    /bin/cat > "$entitlements" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <key>com.apple.security.network.server</key>
+    <true/>
+    <key>com.apple.security.virtualization</key>
+    <true/>
+</dict>
+</plist>
+PLIST
+  fi
   # NOT --deep: bundle-engine.sh already signed nested helpers with their own entitlements
   # (dory-hv needs com.apple.security.hypervisor, dory-vmm needs virtualization), and --deep
   # would re-sign them without those entitlements.
-  codesign --force --options runtime --timestamp --entitlements Dory/Dory.entitlements --sign "$SIGN_IDENTITY" "$app"
+  codesign --force --options runtime --timestamp --entitlements "$entitlements" --sign "$SIGN_IDENTITY" "$app"
 }
 
 archive_variant() {
@@ -548,7 +595,19 @@ for artifact in "$LITE_ZIP" "$RUNTIME_TAR"; do
   echo "    $artifact  (sha256: $(sha256_file "$artifact"))"
 done
 
-MANIFEST="$(write_release_manifest "${ZIPS[@]}" "${DMGS[@]}" "$LITE_ZIP" "$RUNTIME_TAR" "$APPCAST")"
+MANIFEST_ARTIFACTS=()
+if [ "${#ZIPS[@]}" -gt 0 ]; then
+  for artifact in "${ZIPS[@]}"; do
+    MANIFEST_ARTIFACTS+=("$artifact")
+  done
+fi
+if [ "${#DMGS[@]}" -gt 0 ]; then
+  for artifact in "${DMGS[@]}"; do
+    MANIFEST_ARTIFACTS+=("$artifact")
+  done
+fi
+MANIFEST_ARTIFACTS+=("$LITE_ZIP" "$RUNTIME_TAR" "$APPCAST")
+MANIFEST="$(write_release_manifest "${MANIFEST_ARTIFACTS[@]}")"
 echo "    $MANIFEST  (release manifest)"
 [ -n "$APPCAST" ] && echo "    $APPCAST  (Sparkle appcast)"
 

@@ -239,6 +239,20 @@ scripts/benchmark-compare.sh \
   --memory-counts 0,1,3,5,10
 ```
 
+Latest local snapshot on an Apple M2 Pro, 16 GB RAM, macOS 27.0 build 26A5368g
+(July 8, 2026; runs were isolated one engine at a time):
+
+| Engine | Docker server | CPU median, 256 MiB sha256 | C2C network median | Bind mount, 2000 files |
+|---|---:|---:|---:|---:|
+| Dory 0.3.1 build 2 | 27.5.1 | 2.1020 s | 97.7721 Gbps | 0.6880 s |
+| OrbStack | 29.4.0 | 1.7190 s | 90.1203 Gbps | 0.2220 s |
+| Colima | 29.5.2 | 1.5750 s | 80.9901 Gbps | 0.1590 s |
+
+Raw artifacts are under `.benchmark-results/20260708T184829Z-32856`,
+`.benchmark-results/20260708T185520Z-45964`, and `.benchmark-results/20260708T185955Z-63870`.
+The same runs captured idle-memory rows, but those rows are intentionally not summarized here
+because macOS compression made several host-memory deltas negative during the sequential runs.
+
 ## Architecture
 
 ```

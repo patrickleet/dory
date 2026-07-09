@@ -64,6 +64,63 @@ fetch_url() {
     "$url" -o "$out"
 }
 
+debug_engine_rootfs_source() {
+  local arch="$1" upper release_arch env_arch env_lzfse cand host_guest_arch host_lzfse host_raw
+  case "$arch" in
+    arm64) upper="ARM64"; release_arch="arm64" ;;
+    amd64) upper="AMD64"; release_arch="x86_64" ;;
+    *) return 1 ;;
+  esac
+  case "$(uname -m)" in
+    x86_64) host_guest_arch="amd64" ;;
+    *) host_guest_arch="arm64" ;;
+  esac
+  if [ "$arch" = "$host_guest_arch" ]; then
+    host_lzfse="${DORY_ENGINE_ROOTFS_LZFSE:-}"
+    host_raw="${DORY_ENGINE_ROOTFS:-}"
+  else
+    host_lzfse=""
+    host_raw=""
+  fi
+  env_arch="DORY_ENGINE_ROOTFS_$upper"
+  env_lzfse="DORY_ENGINE_ROOTFS_${upper}_LZFSE"
+  for cand in \
+    "${!env_lzfse:-}" \
+    "${!env_arch:-}" \
+    "$host_lzfse" \
+    "$host_raw" \
+    "guest/out/dory-engine-rootfs-$arch.ext4.lzfse" \
+    "guest/out/dory-engine-rootfs-$arch.ext4" \
+    "guest/out/initfs-$arch.ext4.lzfse" \
+    "guest/out/initfs-$arch.ext4" \
+    "release-build/export-$release_arch/Dory.app/Contents/Resources/dory-engine-rootfs-$arch.ext4.lzfse" \
+    "release-build/export-$release_arch/Dory.app/Contents/Resources/dory-engine-rootfs.ext4.lzfse"; do
+    [ -n "$cand" ] && [ -f "$cand" ] && { printf '%s\n' "$cand"; return 0; }
+  done
+  return 1
+}
+
+bundle_debug_engine_rootfs() {
+  local app="$1" arch="$2" compressor="$3" src out host_guest_arch
+  src="$(debug_engine_rootfs_source "$arch" || true)"
+  [ -n "$src" ] || return 0
+  out="$app/Contents/Resources/dory-engine-rootfs-$arch.ext4.lzfse"
+  mkdir -p "$app/Contents/Resources"
+  case "$src" in
+    *.lzfse) cp "$src" "$out" ;;
+    *) "$compressor" lzfse compress "$src" "$out" ;;
+  esac
+  chmod 0644 "$out"
+  xattr -cr "$out" 2>/dev/null || true
+  case "$(uname -m)" in
+    x86_64) host_guest_arch="amd64" ;;
+    *) host_guest_arch="arm64" ;;
+  esac
+  if [ "$arch" = "$host_guest_arch" ]; then
+    ln -sf "dory-engine-rootfs-$arch.ext4.lzfse" "$app/Contents/Resources/dory-engine-rootfs.ext4.lzfse"
+  fi
+}
+
 bundle_debug_hv_helper() {
   local pkg configuration hv_bin entitlements app helper gvproxy_src gvproxy_version gvproxy_tmp
   [ "${DORY_BUILD_DEBUG_HELPERS:-1}" = "1" ] || return 0
@@ -145,6 +202,7 @@ PLIST
           cp "$app/Contents/Resources/dory-machine-rootfs-$arch.ext4" "$app/Contents/Resources/dory-machine-rootfs.ext4"
         fi
       fi
+      bundle_debug_engine_rootfs "$app" "$arch" "$hv_bin"
     done
     if [ -f "guest/out/Image" ]; then
       cp "guest/out/Image" "$app/Contents/Resources/dory-hv-kernel-arm64"
@@ -407,10 +465,18 @@ write_doryd_launch_agent() {
         <string>$rootfs</string>
         <key>DORYD_GVPROXY</key>
         <string>$gvproxy</string>
+        <key>DORYD_HELPERS_DIR</key>
+        <string>$helpers</string>
+        <key>DORYD_RESOURCES_DIR</key>
+        <string>$resources</string>
         <key>DORYD_AMD64</key>
         <string>$amd64</string>
+        <key>DORYD_HOST_CLI</key>
+        <string>1</string>
         <key>DORYD_NETWORKING</key>
         <string>1</string>
+        <key>DORYD_DOMAIN_SUFFIX</key>
+        <string>dory.local</string>
         <key>DORYD_IDLE_SLEEP_AFTER_SECONDS</key>
         <string>300</string>
         <key>DORYD_DNS_PORT</key>

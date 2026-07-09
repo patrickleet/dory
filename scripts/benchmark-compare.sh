@@ -76,6 +76,16 @@ RUNS="${BENCH_RUNS:-3}"
 CPU_MB="${BENCH_CPU_MB:-256}"
 FS_FILES="${BENCH_FS_FILES:-2000}"
 SETTLE="${BENCH_SETTLE:-12}"
+# Compile workload (the `build` metric). A small Alpine toolchain image (busybox wget+tar built in,
+# ~10 MiB) compiles a pinned Redis source. Setup (image pull, apk toolchain, source download+extract)
+# is UNTIMED; only `make` is timed, so the number is pure compile wall-clock, comparable across
+# engines. BUILD_MEM_SAMPLE samples host memory during the compile for the peak-under-load figure.
+BUILD_IMAGE="${BENCH_BUILD_IMAGE:-alpine:3.20}"
+BUILD_JOBS="${BENCH_BUILD_JOBS:-8}"
+BUILD_SRC_URL="${BENCH_BUILD_SRC_URL:-https://github.com/redis/redis/archive/refs/tags/7.4.1.tar.gz}"
+BUILD_SRC_DIR="${BENCH_BUILD_SRC_DIR:-redis-7.4.1}"
+BUILD_MAKE_ARGS="${BENCH_BUILD_MAKE_ARGS:-MALLOC=libc}"
+BUILD_MEM_SAMPLE="${BENCH_BUILD_MEM_SAMPLE:-2}"
 CONTAINER_BIN="${BENCH_CONTAINER_BIN:-$(command -v container 2>/dev/null || echo /opt/homebrew/bin/container)}"
 DORY_BENCH_APP="${DORY_BENCH_APP:-}"
 DORY_BENCH_APP_WAIT="${DORY_BENCH_APP_WAIT:-90}"
@@ -89,6 +99,7 @@ MEMORY_TSV="$WORKDIR/memory.tsv"
 NETWORK_TSV="$WORKDIR/network.tsv"
 FS_TSV="$WORKDIR/filesystem.tsv"
 CPU_TSV="$WORKDIR/cpu.tsv"
+BUILD_TSV="$WORKDIR/build.tsv"
 STATUS_TSV="$WORKDIR/status.tsv"
 SUMMARY_JSON="$WORKDIR/summary.json"
 SUMMARY_MD="$WORKDIR/summary.md"
@@ -196,6 +207,8 @@ engine_label() {
   case "$1" in
     dory) echo "Dory" ;;
     orbstack) echo "OrbStack" ;;
+    colima) echo "Colima" ;;
+    podman) echo "Podman" ;;
     docker-desktop|desktop) echo "Docker Desktop" ;;
     apple|apple-container|container) echo "Apple Container" ;;
     *) echo "$1" ;;
@@ -207,6 +220,10 @@ engine_socket() {
   case "$engine" in
     dory) echo "${DORY_SOCK:-$HOME/.dory/dory.sock}" ;;
     orbstack) echo "${ORBSTACK_SOCK:-$HOME/.orbstack/run/docker.sock}" ;;
+    colima) echo "${COLIMA_SOCK:-$HOME/.colima/default/docker.sock}" ;;
+    # Podman's docker-compatible socket path is instance-specific; the campaign resolves it via
+    # `podman machine inspect` and exports PODMAN_SOCK, so there is no static default here.
+    podman) echo "${PODMAN_SOCK:-}" ;;
     docker-desktop|desktop) echo "${DOCKER_DESKTOP_SOCK:-$HOME/.docker/run/docker.sock}" ;;
     *) echo "" ;;
   esac
@@ -325,7 +342,9 @@ process_rss_bytes() {
   local engine="$1" pattern
   case "$engine" in
     dory) pattern="${DORY_PROCESS_PATTERN:-Dory|doryd|dory-hv|dory-vmm|gvproxy}" ;;
-    orbstack) pattern="${ORBSTACK_PROCESS_PATTERN:-OrbStack}" ;;
+    orbstack) pattern="${ORBSTACK_PROCESS_PATTERN:-OrbStack|orbstack-helper|xbin/vmgr}" ;;
+    colima) pattern="${COLIMA_PROCESS_PATTERN:-colima|limactl|lima-guestagent|socket_vmnet}" ;;
+    podman) pattern="${PODMAN_PROCESS_PATTERN:-podman|vfkit|gvproxy}" ;;
     docker-desktop|desktop) pattern="${DOCKER_DESKTOP_PROCESS_PATTERN:-Docker|com.docker}" ;;
     apple|apple-container|container) pattern="${APPLE_CONTAINER_PROCESS_PATTERN:-container-runtime-linux|container-network-vmnet|containerization|com.apple.container}" ;;
     *) pattern="${GENERIC_ENGINE_PROCESS_PATTERN:-$engine}" ;;
@@ -588,15 +607,15 @@ cpu_workload_cmd() {
 time_docker_cpu() {
   local cmd
   cmd="$(cpu_workload_cmd)"
-  { time docker_e run --rm --label "$LABEL_KEY=$RUN_ID" \
-      "$ALPINE_IMAGE" sh -c "$cmd" >/dev/null 2>&1 ; } 2>&1 | parse_real_seconds
+  timed_real_seconds docker_e run --rm --label "$LABEL_KEY=$RUN_ID" \
+      "$ALPINE_IMAGE" sh -c "$cmd"
 }
 
 time_apple_cpu() {
   local cmd
   cmd="$(cpu_workload_cmd)"
-  { time "$CONTAINER_BIN" run --rm --name "$PREFIX-cpu-$RANDOM" \
-      "$ALPINE_IMAGE" sh -c "$cmd" >/dev/null 2>&1 ; } 2>&1 | parse_real_seconds
+  timed_real_seconds "$CONTAINER_BIN" run --rm --name "$PREFIX-cpu-$RANDOM" \
+      "$ALPINE_IMAGE" sh -c "$cmd"
 }
 
 metric_cpu() {
@@ -665,6 +684,154 @@ metric_cpu_apple() {
 }
 
 # --------------------------------------------------------------------------------------------------
+# Metric: bounded real compile (wall time + peak host memory under load)
+# --------------------------------------------------------------------------------------------------
+
+# The in-container script: fetch + extract the pinned source (untimed), then time only `make`. The
+# container prints BUILD_SECONDS=<n> so the host reads a pure compile time free of pull/download cost.
+build_workload_script() {
+  cat <<SH
+set -e
+apk add --no-cache build-base linux-headers >/dev/null 2>&1
+cd /tmp
+wget -q -O src.tar.gz "$BUILD_SRC_URL"
+tar xzf src.tar.gz
+cd "$BUILD_SRC_DIR"
+S=\$(date +%s.%N)
+make -j$BUILD_JOBS $BUILD_MAKE_ARGS >/dev/null 2>&1
+E=\$(date +%s.%N)
+awk -v s=\$S -v e=\$E 'BEGIN { printf "BUILD_SECONDS=%.3f\n", e - s }'
+SH
+}
+
+# Sample system-used and engine-RSS memory every BUILD_MEM_SAMPLE seconds until the marker file is
+# removed; write the observed maxima to $1. Baseline deltas are computed by the caller.
+build_memory_sampler() {
+  local out="$1" marker="$2" engine="$CURRENT_ENGINE" sys peak_sys=0 rss peak_rss=0
+  while [ -f "$marker" ]; do
+    sys="$(used_mem)"
+    rss="$(process_rss_bytes "$engine")"
+    awk -v a="$sys" -v b="$peak_sys" 'BEGIN { exit !(a+0 > b+0) }' && peak_sys="$sys"
+    awk -v a="$rss" -v b="$peak_rss" 'BEGIN { exit !(a+0 > b+0) }' && peak_rss="$rss"
+    sleep "$BUILD_MEM_SAMPLE"
+  done
+  printf '%s\t%s\n' "$peak_sys" "$peak_rss" > "$out"
+}
+
+metric_build() {
+  local engine="$CURRENT_ENGINE"
+  if is_apple_container "$engine"; then
+    metric_build_apple
+  else
+    metric_build_docker
+  fi
+}
+
+# Run the compile once, streaming BUILD_SECONDS from the container while a background sampler tracks
+# peak host memory. Returns via the build TSV: median compile seconds + peak memory deltas over the
+# pre-build baseline (settled). Peak-under-load is the figure a shared-VM engine is expected to win.
+metric_build_docker() {
+  local engine="$CURRENT_ENGINE"
+  if ! ensure_image_docker "$BUILD_IMAGE"; then
+    record_status SKIP "$engine" "build" "cannot pull $BUILD_IMAGE"
+    return
+  fi
+  if [ "$DRY_RUN" = "1" ]; then
+    printf '    [dry-run] compile %s (make -j%s %s) x%s; sample peak memory\n' "$BUILD_SRC_DIR" "$BUILD_JOBS" "$BUILD_MAKE_ARGS" "$RUNS"
+    record_status PASS "$engine" "build" "dry-run"
+    return
+  fi
+  local run_i samples="" peak_sys_max=0 peak_rss_max=0 base_sys base_rss
+  local script marker sampler_out t line
+  script="$(build_workload_script)"
+  for run_i in $(seq 1 "$RUNS"); do
+    sleep "$SETTLE"
+    base_sys="$(used_mem)"
+    base_rss="$(process_rss_bytes "$engine")"
+    marker="$(mktemp "${TMPDIR:-/tmp}/dorybench-build.XXXXXX")"
+    sampler_out="$(mktemp "${TMPDIR:-/tmp}/dorybench-buildmem.XXXXXX")"
+    build_memory_sampler "$sampler_out" "$marker" &
+    local sampler_pid=$!
+    t=""
+    while IFS= read -r line; do
+      case "$line" in BUILD_SECONDS=*) t="${line#BUILD_SECONDS=}" ;; esac
+    done < <(docker_e run --rm --label "$LABEL_KEY=$RUN_ID" "$BUILD_IMAGE" sh -c "$script" 2>/dev/null)
+    rm -f "$marker"
+    wait "$sampler_pid" 2>/dev/null
+    local psys prss
+    psys="$(awk -F'\t' 'NR==1{print $1}' "$sampler_out" 2>/dev/null)"
+    prss="$(awk -F'\t' 'NR==1{print $2}' "$sampler_out" 2>/dev/null)"
+    rm -f "$sampler_out"
+    [ -n "$t" ] && samples="$samples $t"
+    local d_sys d_rss
+    d_sys="$(awk -v p="${psys:-0}" -v b="$base_sys" 'BEGIN { d=p-b; printf "%.0f", d>0?d:0 }')"
+    d_rss="$(awk -v p="${prss:-0}" -v b="$base_rss" 'BEGIN { d=p-b; printf "%.0f", d>0?d:0 }')"
+    awk -v a="$d_sys" -v b="$peak_sys_max" 'BEGIN { exit !(a+0 > b+0) }' && peak_sys_max="$d_sys"
+    awk -v a="$d_rss" -v b="$peak_rss_max" 'BEGIN { exit !(a+0 > b+0) }' && peak_rss_max="$d_rss"
+  done
+  cleanup_docker_engine
+  if [ -z "$samples" ]; then
+    record_status FAIL "$engine" "build" "no compile-time samples captured"
+    return
+  fi
+  # shellcheck disable=SC2086
+  local med; med="$(median $samples)"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$engine" "$BUILD_SRC_DIR" "$BUILD_JOBS" "$RUNS" "$med" "$(mb "$peak_sys_max")" "$(mb "$peak_rss_max")" "$(sanitize "$samples")" >> "$BUILD_TSV"
+  record_status PASS "$engine" "build" "median=${med}s over $RUNS run(s), peak_sys=$(mb "$peak_sys_max")MB peak_rss=$(mb "$peak_rss_max")MB"
+}
+
+metric_build_apple() {
+  local engine="$CURRENT_ENGINE"
+  if ! ensure_image_apple "$BUILD_IMAGE"; then
+    record_status SKIP "$engine" "build" "cannot pull $BUILD_IMAGE"
+    return
+  fi
+  if [ "$DRY_RUN" = "1" ]; then
+    printf '    [dry-run] apple compile %s (make -j%s) x%s\n' "$BUILD_SRC_DIR" "$BUILD_JOBS" "$RUNS"
+    record_status PASS "$engine" "build" "dry-run"
+    return
+  fi
+  local run_i samples="" peak_sys_max=0 peak_rss_max=0 base_sys base_rss script marker sampler_out t line
+  script="$(build_workload_script)"
+  for run_i in $(seq 1 "$RUNS"); do
+    sleep "$SETTLE"
+    base_sys="$(used_mem)"
+    base_rss="$(process_rss_bytes "$engine")"
+    marker="$(mktemp "${TMPDIR:-/tmp}/dorybench-build.XXXXXX")"
+    sampler_out="$(mktemp "${TMPDIR:-/tmp}/dorybench-buildmem.XXXXXX")"
+    build_memory_sampler "$sampler_out" "$marker" &
+    local sampler_pid=$!
+    t=""
+    while IFS= read -r line; do
+      case "$line" in BUILD_SECONDS=*) t="${line#BUILD_SECONDS=}" ;; esac
+    done < <("$CONTAINER_BIN" run --rm --name "$PREFIX-build-$RANDOM" "$BUILD_IMAGE" sh -c "$script" 2>/dev/null)
+    rm -f "$marker"
+    wait "$sampler_pid" 2>/dev/null
+    local psys prss
+    psys="$(awk -F'\t' 'NR==1{print $1}' "$sampler_out" 2>/dev/null)"
+    prss="$(awk -F'\t' 'NR==1{print $2}' "$sampler_out" 2>/dev/null)"
+    rm -f "$sampler_out"
+    [ -n "$t" ] && samples="$samples $t"
+    local d_sys d_rss
+    d_sys="$(awk -v p="${psys:-0}" -v b="$base_sys" 'BEGIN { d=p-b; printf "%.0f", d>0?d:0 }')"
+    d_rss="$(awk -v p="${prss:-0}" -v b="$base_rss" 'BEGIN { d=p-b; printf "%.0f", d>0?d:0 }')"
+    awk -v a="$d_sys" -v b="$peak_sys_max" 'BEGIN { exit !(a+0 > b+0) }' && peak_sys_max="$d_sys"
+    awk -v a="$d_rss" -v b="$peak_rss_max" 'BEGIN { exit !(a+0 > b+0) }' && peak_rss_max="$d_rss"
+  done
+  cleanup_apple_container
+  if [ -z "$samples" ]; then
+    record_status FAIL "$engine" "build" "no compile-time samples captured"
+    return
+  fi
+  # shellcheck disable=SC2086
+  local med; med="$(median $samples)"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$engine" "$BUILD_SRC_DIR" "$BUILD_JOBS" "$RUNS" "$med" "$(mb "$peak_sys_max")" "$(mb "$peak_rss_max")" "$(sanitize "$samples")" >> "$BUILD_TSV"
+  record_status PASS "$engine" "build" "median=${med}s over $RUNS run(s), peak_sys=$(mb "$peak_sys_max")MB peak_rss=$(mb "$peak_rss_max")MB"
+}
+
+# --------------------------------------------------------------------------------------------------
 # Metric 3: container-to-container network throughput
 # --------------------------------------------------------------------------------------------------
 
@@ -725,8 +892,8 @@ metric_network() {
 
 # Workload: create FS_FILES tiny files in $target, timed with `time`, wall seconds parsed from stderr.
 fs_workload_cmd() {
-  printf 'rm -rf %s && mkdir -p %s && for i in $(seq 1 %s); do echo x > %s/f$i; done' \
-    "$1" "$1" "$FS_FILES" "$1"
+  printf 'target=%s/bench && rm -rf "$target" && mkdir -p "$target" && for i in $(seq 1 %s); do echo x > "$target/f$i"; done' \
+    "$1" "$FS_FILES"
 }
 
 parse_real_seconds() {
@@ -737,6 +904,21 @@ parse_real_seconds() {
         if ($i ~ /^[0-9.]+$/) { printf "%.4f", $i; exit }
       }
     }'
+}
+
+timed_real_seconds() {
+  local timing status seconds
+  timing="$(mktemp "${TMPDIR:-/tmp}/dorybench-time.XXXXXX")" || return 1
+  { time "$@" >/dev/null 2>&1; } 2>"$timing"
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    rm -f "$timing"
+    return "$status"
+  fi
+  seconds="$(parse_real_seconds < "$timing")"
+  rm -f "$timing"
+  [ -n "$seconds" ] || return 1
+  printf '%s' "$seconds"
 }
 
 metric_fs() {
@@ -751,15 +933,15 @@ metric_fs() {
 time_docker_host() {
   local hostdir="$1" cmd
   cmd="$(fs_workload_cmd /mnt/work)"
-  { time docker_e run --rm --label "$LABEL_KEY=$RUN_ID" -v "$hostdir:/mnt/work" \
-      "$ALPINE_IMAGE" sh -c "$cmd" >/dev/null 2>&1 ; } 2>&1 | parse_real_seconds
+  timed_real_seconds docker_e run --rm --label "$LABEL_KEY=$RUN_ID" -v "$hostdir:/mnt/work" \
+      "$ALPINE_IMAGE" sh -c "$cmd"
 }
 
 time_docker_incontainer() {
   local cmd
   cmd="$(fs_workload_cmd /work)"
-  { time docker_e run --rm --label "$LABEL_KEY=$RUN_ID" \
-      "$ALPINE_IMAGE" sh -c "$cmd" >/dev/null 2>&1 ; } 2>&1 | parse_real_seconds
+  timed_real_seconds docker_e run --rm --label "$LABEL_KEY=$RUN_ID" \
+      "$ALPINE_IMAGE" sh -c "$cmd"
 }
 
 metric_fs_docker() {
@@ -803,15 +985,15 @@ metric_fs_docker() {
 time_apple_host() {
   local hostdir="$1" cmd
   cmd="$(fs_workload_cmd /mnt/work)"
-  { time "$CONTAINER_BIN" run --rm --name "$PREFIX-fs-$RANDOM" -v "$hostdir:/mnt/work" \
-      "$ALPINE_IMAGE" sh -c "$cmd" >/dev/null 2>&1 ; } 2>&1 | parse_real_seconds
+  timed_real_seconds "$CONTAINER_BIN" run --rm --name "$PREFIX-fs-$RANDOM" -v "$hostdir:/mnt/work" \
+      "$ALPINE_IMAGE" sh -c "$cmd"
 }
 
 time_apple_incontainer() {
   local cmd
   cmd="$(fs_workload_cmd /work)"
-  { time "$CONTAINER_BIN" run --rm --name "$PREFIX-fs-$RANDOM" \
-      "$ALPINE_IMAGE" sh -c "$cmd" >/dev/null 2>&1 ; } 2>&1 | parse_real_seconds
+  timed_real_seconds "$CONTAINER_BIN" run --rm --name "$PREFIX-fs-$RANDOM" \
+      "$ALPINE_IMAGE" sh -c "$cmd"
 }
 
 metric_fs_apple() {
@@ -886,6 +1068,7 @@ run_engine() {
 
   if metric_enabled memory; then metric_memory; else record_status SKIP "$CURRENT_ENGINE" "memory" "disabled via --metrics"; fi
   if metric_enabled cpu; then metric_cpu; else record_status SKIP "$CURRENT_ENGINE" "cpu" "disabled via --metrics"; fi
+  if metric_enabled build; then metric_build; else record_status SKIP "$CURRENT_ENGINE" "build" "disabled via --metrics"; fi
   if metric_enabled network; then metric_network; else record_status SKIP "$CURRENT_ENGINE" "network" "disabled via --metrics"; fi
   if metric_enabled fs; then metric_fs; else record_status SKIP "$CURRENT_ENGINE" "fs" "disabled via --metrics"; fi
 
@@ -935,6 +1118,12 @@ print_table() {
     echo "CPU WORKLOAD ($CPU_MB MiB sha256, median of $RUNS)"
     printf '  %-16s %14s\n' "engine" "seconds"
     awk -F'\t' 'NR>1 { printf "  %-16s %14s\n", $1, $5 }' "$CPU_TSV"
+    echo ""
+  fi
+  if metric_enabled build && [ -s "$BUILD_TSV" ]; then
+    echo "COMPILE WORKLOAD ($BUILD_SRC_DIR, make -j$BUILD_JOBS, median of $RUNS)"
+    printf '  %-16s %12s %16s %18s\n' "engine" "compile_s" "peak_sys_MB" "peak_engine_rss_MB"
+    awk -F'\t' 'NR>1 { printf "  %-16s %12s %16s %18s\n", $1, $5, $6, $7 }' "$BUILD_TSV"
     echo ""
   fi
   if metric_enabled network && [ -s "$NETWORK_TSV" ]; then
@@ -1006,6 +1195,14 @@ write_summary_md() {
       echo '|---|---:|---|'
       awk -F'\t' 'NR>1 { printf "| %s | %s | `%s` |\n", $1, $5, $6 }' "$CPU_TSV"
     fi
+    if metric_enabled build && [ -s "$BUILD_TSV" ]; then
+      echo ""
+      echo "## Compile ($BUILD_SRC_DIR, make -j$BUILD_JOBS)"
+      echo ""
+      echo '| Engine | Compile seconds | Peak system MB | Peak engine RSS MB | Samples |'
+      echo '|---|---:|---:|---:|---|'
+      awk -F'\t' 'NR>1 { printf "| %s | %s | %s | %s | `%s` |\n", $1, $5, $6, $7, $8 }' "$BUILD_TSV"
+    fi
     if metric_enabled network && [ -s "$NETWORK_TSV" ]; then
       echo ""
       echo "## Network"
@@ -1033,6 +1230,7 @@ write_summary() {
   local mem_json cpu_json net_json fs_json status_json versions_json
   mem_json="$(tsv_to_json_array "$MEMORY_TSV")"
   cpu_json="$(tsv_to_json_array "$CPU_TSV")"
+  build_json="$(tsv_to_json_array "$BUILD_TSV")"
   net_json="$(tsv_to_json_array "$NETWORK_TSV")"
   fs_json="$(tsv_to_json_array "$FS_TSV")"
   status_json="$(tsv_to_json_array "$STATUS_TSV")"
@@ -1054,6 +1252,7 @@ write_summary() {
   "skip": $SKIP_COUNT,
   "memory": $mem_json,
   "cpu": $cpu_json,
+  "build": $build_json,
   "network": $net_json,
   "filesystem": $fs_json,
   "engineVersions": $versions_json,
@@ -1081,6 +1280,7 @@ mkdir -p "$WORKDIR"
 printf 'status\tengine\tmetric\tdetail\n' > "$STATUS_TSV"
 printf 'engine\tcontainers\timage\tsystem_delta_bytes\tsystem_delta_mb\tprocess_delta_bytes\tprocess_delta_mb\n' > "$MEMORY_TSV"
 printf 'engine\timage\truns\tworkload_mib\tmedian_seconds\tsamples_seconds\n' > "$CPU_TSV"
+printf 'engine\tsource\tjobs\truns\tmedian_seconds\tpeak_system_mb\tpeak_engine_rss_mb\tsamples_seconds\n' > "$BUILD_TSV"
 printf 'engine\timage\truns\tmedian_gbps\tsamples_gbps\n' > "$NETWORK_TSV"
 printf 'engine\tfiles\truns\tbind_seconds\tincontainer_seconds\tratio\n' > "$FS_TSV"
 printf 'engine\tlabel\tinterface\tendpoint\tversion\tname\tos_kernel\tarchitecture\n' > "$ENGINE_VERSIONS_TSV"

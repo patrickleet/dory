@@ -84,18 +84,53 @@ if [ -z "${DEVELOPER_DIR:-}" ]; then
   fi
 fi
 
+have_developer_id() {
+  security find-identity -v -p codesigning 2>/dev/null | grep -q "Developer ID Application"
+}
+
+# Sign one bundled helper. When a Developer ID identity is configured or present in the keychain, a
+# signing failure is FATAL: an ad-hoc fallback silently produces a "release" whose dory-hv/dory-vmm
+# helpers are denied their restricted hypervisor/virtualization entitlements at launch, i.e. a broken
+# engine that boots nowhere. Ad-hoc is only allowed on a dev machine with no Developer ID identity, or
+# explicitly via DORY_ALLOW_ADHOC_SIGN=1. Transient timestamp/keychain hiccups are retried first.
+codesign_helper() {
+  local path="$1" entitlements="${2:-}" id="${DORY_SIGN_ID:-Developer ID Application}"
+  local base=(--force --options runtime --timestamp)
+  [ -n "$entitlements" ] && base+=(--entitlements "$entitlements")
+
+  if [ "$id" = "-" ]; then
+    codesign "${base[@]}" -s - "$path"
+    return
+  fi
+
+  local attempt err
+  err="$(mktemp "${TMPDIR:-/tmp}/dory-codesign.XXXXXX")"
+  for attempt in 1 2 3; do
+    if codesign "${base[@]}" -s "$id" "$path" 2>"$err"; then
+      rm -f "$err"
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "    ERROR: Developer ID signing failed for $(basename "$path") (identity: $id):" >&2
+  sed 's/^/      /' "$err" >&2
+  rm -f "$err"
+  if [ "${DORY_ALLOW_ADHOC_SIGN:-0}" = "1" ] || ! have_developer_id; then
+    echo "    WARNING: ad-hoc signing $(basename "$path") — NOT distributable and its entitlements will be denied at launch." >&2
+    codesign --force ${entitlements:+--entitlements "$entitlements"} -s - "$path"
+    return
+  fi
+  echo "    A Developer ID identity is present but signing failed; refusing to ship an ad-hoc helper. Set DORY_ALLOW_ADHOC_SIGN=1 only for a throwaway local build." >&2
+  return 1
+}
+
 sign_runtime_payload() {
-  local path="$1"
-  codesign --force --options runtime --timestamp -s "${DORY_SIGN_ID:-Developer ID Application}" "$path" 2>/dev/null \
-    || codesign --force -s - "$path"
+  codesign_helper "$1"
 }
 
 sign_runtime_payload_with_entitlements() {
-  local path="$1" entitlements="$2"
-  codesign --force --options runtime --timestamp --entitlements "$entitlements" \
-    -s "${DORY_SIGN_ID:-Developer ID Application}" "$path" 2>/dev/null \
-    || codesign --force --options runtime --entitlements "$entitlements" -s - "$path" 2>/dev/null \
-    || codesign --force --entitlements "$entitlements" -s - "$path"
+  codesign_helper "$1" "$2"
 }
 
 normalize_darwin_arch() {
@@ -595,8 +630,16 @@ write_doryd_launch_agent() {
         <string>$hv</string>
         <key>DORYD_GVPROXY</key>
         <string>$gvproxy</string>
+        <key>DORYD_HELPERS_DIR</key>
+        <string>$HELPERS</string>
+        <key>DORYD_RESOURCES_DIR</key>
+        <string>$RESOURCES</string>
+        <key>DORYD_HOST_CLI</key>
+        <string>1</string>
         <key>DORYD_NETWORKING</key>
         <string>1</string>
+        <key>DORYD_DOMAIN_SUFFIX</key>
+        <string>dory.local</string>
         <key>DORYD_IDLE_SLEEP_AFTER_SECONDS</key>
         <string>300</string>
         <key>DORYD_DNS_PORT</key>

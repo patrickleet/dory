@@ -3095,19 +3095,29 @@ def cmd_repair(args: argparse.Namespace) -> int:
     all_targets = ["socket", "context", "dns", "routes", "ports", "domains", "dockerd", "guest-agent"]
     fan_out = args.target == "all"
     targets = all_targets if fan_out else [args.target]
+    restart_engine = getattr(args, "restart_engine", False)
     for target in targets:
         handler = handlers.get(target)
         if handler is None:
             continue
+        # Bouncing the engine stops running containers, so the engine restart is opt-in: `repair all`
+        # never escalates to it (allow_engine_escalation=False), and a direct engine/dockerd repair
+        # only performs it when --restart-engine is set.
+        extra: dict[str, Any] = {}
+        if target == "engine":
+            extra["restart_engine"] = restart_engine
+        elif target == "dockerd":
+            extra["restart_engine"] = restart_engine
+            extra["allow_engine_escalation"] = not fan_out
         # `repair all --apply` must not run side effects (DNS flush, SIGUSR1 to the engine) on a
         # healthy subsystem: probe each one dry first and only apply where it reports a problem.
         # A single explicit `dory repair <target> --apply` still forces the action.
         if fan_out and args.apply:
-            probe = handler(False)
+            probe = handler(False, **extra)
             if probe.get("status") in {"pass", "skip"}:
                 actions.append(probe)
                 continue
-        result = handler(args.apply)
+        result = handler(args.apply, **extra)
         actions.append(result)
         if args.apply and result.get("status") != "fail":
             applied_targets.append(target)
@@ -3170,17 +3180,43 @@ def repair_context(apply: bool) -> dict[str, Any]:
     return {"target": "context", "status": "pass", "detail": f"docker context dory now targets {host}"}
 
 
-def repair_engine(apply: bool) -> dict[str, Any]:
+def dockerd_ping_ok(timeout: float = 10.0) -> bool:
+    try:
+        status_code, _, body = unix_http(socket_path(), "GET", "/_ping", timeout=timeout)
+    except Exception:
+        return False
+    return status_code == 200 and body.strip() == b"OK"
+
+
+def repair_engine(apply: bool, restart_engine: bool = False) -> dict[str, Any]:
     script = dory_engine_script()
     if not script.exists():
         return {"target": "engine", "status": "skip", "detail": f"{script} not found"}
     if not apply:
-        return {"target": "engine", "status": "warn", "detail": "Headless engine restart available", "next": f"would run {script} stop && {script} start"}
+        # Only advertise a restart when the engine actually looks wedged; a healthy engine needs none.
+        if dockerd_ping_ok():
+            return {"target": "engine", "status": "pass", "detail": "engine reachable; no restart needed"}
+        return {
+            "target": "engine",
+            "status": "warn",
+            "detail": "Headless engine restart available (disruptive: stops running containers)",
+            "next": f"run `dory repair engine --restart-engine` to bounce the engine ({script} stop && {script} start)",
+            "dataPlaneDisruptive": True,
+        }
+    if not restart_engine:
+        # Restarting stops running containers, so --apply alone must not bounce the engine.
+        return {
+            "target": "engine",
+            "status": "warn",
+            "detail": "engine restart is available but disruptive (stops running containers); not performed without --restart-engine",
+            "next": f"re-run `dory repair engine --apply --restart-engine` to bounce the engine ({script} stop && {script} start)",
+            "dataPlaneDisruptive": True,
+        }
     stop = subprocess.run([str(script), "stop"], text=True, capture_output=True, timeout=60)
     start = subprocess.run([str(script), "start"], text=True, capture_output=True, timeout=180)
     if start.returncode != 0:
-        return {"target": "engine", "status": "fail", "detail": compact(start.stderr or start.stdout)}
-    return {"target": "engine", "status": "pass", "detail": compact(stop.stdout + " " + start.stdout)}
+        return {"target": "engine", "status": "fail", "detail": compact(start.stderr or start.stdout), "dataPlaneDisruptive": True}
+    return {"target": "engine", "status": "pass", "detail": compact(stop.stdout + " " + start.stdout), "dataPlaneDisruptive": True}
 
 
 def repair_routes(apply: bool) -> dict[str, Any]:
@@ -3264,9 +3300,11 @@ def repair_ports(apply: bool) -> dict[str, Any]:
     return {"target": "ports", "status": "pass", "detail": f"{len(table.get('ports', []))} published port route(s) readable; no conflicts"}
 
 
-def repair_dockerd(apply: bool) -> dict[str, Any]:
+def repair_dockerd(apply: bool, restart_engine: bool = False, allow_engine_escalation: bool = True) -> dict[str, Any]:
     try:
-        status_code, _, body = unix_http(socket_path(), "GET", "/_ping", timeout=3)
+        # Give a busy or still-booting dockerd time to answer before declaring it wedged and
+        # escalating to a disruptive engine bounce.
+        status_code, _, body = unix_http(socket_path(), "GET", "/_ping", timeout=10)
         if status_code == 200 and body.strip() == b"OK":
             return {"target": "dockerd", "status": "pass", "detail": "Docker API is reachable"}
     except Exception as exc:
@@ -3277,7 +3315,16 @@ def repair_dockerd(apply: bool) -> dict[str, Any]:
                 "detail": f"Docker API unreachable: {exc}",
                 "next": "would restart the headless engine when available; app-managed engines should be restarted from Dory",
             }
-    return repair_engine(apply)
+    if apply and not allow_engine_escalation:
+        # `repair all` must stay data-plane safe: never bounce the engine as an automatic escalation.
+        return {
+            "target": "dockerd",
+            "status": "warn",
+            "detail": "Docker API unreachable; `repair all` will not restart the engine (that stops running containers)",
+            "next": "run `dory repair engine --restart-engine` to bounce the engine",
+            "dataPlaneDisruptive": True,
+        }
+    return repair_engine(apply, restart_engine=restart_engine)
 
 
 def repair_guest_agent(apply: bool) -> dict[str, Any]:
@@ -3424,7 +3471,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--json", action="store_true")
     doctor.add_argument("--active", action="store_true", help="Run active container probes")
     doctor.add_argument("--timeout", type=float, default=5.0)
-    doctor.add_argument("--only", help="Comma-separated groups: socket,api,docker,context,registry,network,ports,domains,mounts,watch,clock,disk,memory,helpers")
+    doctor.add_argument("--only", help="Comma-separated groups: socket,api,docker,context,registry,proxy,exposure,network,ports,domains,mounts,filelock,watch,clock,disk,memory,helpers")
     doctor.add_argument("--bundle", nargs="?", const="", help="Also write a redacted diagnostic bundle")
     doctor.add_argument("--diff", action="store_true", help="Show what changed since the last healthy run")
     doctor.set_defaults(func=cmd_doctor)
@@ -3468,6 +3515,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="all",
     )
     repair.add_argument("--apply", action="store_true")
+    repair.add_argument(
+        "--restart-engine",
+        action="store_true",
+        help="Allow `repair engine`/`repair dockerd` --apply to bounce the engine (stops running containers)",
+    )
     repair.add_argument("--json", action="store_true")
     repair.set_defaults(func=cmd_repair)
 
@@ -3508,6 +3560,9 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(args)
     except KeyboardInterrupt:
         return 130
+    except (OSError, ValueError) as exc:
+        print(f"dory-doctor: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

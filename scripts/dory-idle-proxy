@@ -879,7 +879,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        return 130
+    except (OSError, ValueError) as exc:
+        print(f"dory-idle-proxy: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
