@@ -24,7 +24,7 @@ enum RuntimeKind: String, Sendable {
     case sharedVM
     case disconnected
 
-    var displayName: String {
+    nonisolated var displayName: String {
         switch self {
         case .mock: "Mock"
         case .docker: "Docker Engine"
@@ -35,7 +35,7 @@ enum RuntimeKind: String, Sendable {
 
     /// True when the runtime fronts a real Docker socket the shim can transparently proxy to —
     /// the Docker engine and Dory's own shared VM both do.
-    var isDockerCompatible: Bool { self == .docker || self == .sharedVM }
+    nonisolated var isDockerCompatible: Bool { self == .docker || self == .sharedVM }
 }
 
 struct ContainerSpec: Sendable {
@@ -251,6 +251,8 @@ protocol ContainerRuntime: Sendable {
     func containerExitCode(_ id: String) async -> Int?
     func copyOut(containerID: String, path: String) async -> Data?
     func copyIn(containerID: String, path: String, archive: Data) async -> Bool
+    func copyOutStream(containerID: String, path: String) -> AsyncThrowingStream<Data, Error>
+    func copyIn(containerID: String, path: String, archiveStream: AsyncThrowingStream<Data, Error>) async -> Bool
     func build(contextTar: Data, query: String, registryHeaders: [(name: String, value: String)]) -> AsyncStream<Data>
     func commit(containerID: String, repo: String, tag: String, labels: [String: String]) async throws -> String
     var supportsImageArchiveTransfer: Bool { get }
@@ -324,6 +326,25 @@ extension ContainerRuntime {
     func containerExitCode(_ id: String) async -> Int? { nil }
     func copyOut(containerID: String, path: String) async -> Data? { nil }
     func copyIn(containerID: String, path: String, archive: Data) async -> Bool { false }
+    func copyOutStream(containerID: String, path: String) -> AsyncThrowingStream<Data, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                if let data = await copyOut(containerID: containerID, path: path), !data.isEmpty {
+                    continuation.yield(data)
+                }
+                continuation.finish()
+            }
+        }
+    }
+    func copyIn(containerID: String, path: String, archiveStream: AsyncThrowingStream<Data, Error>) async -> Bool {
+        var archive = Data()
+        do {
+            for try await chunk in archiveStream { archive.append(chunk) }
+        } catch {
+            return false
+        }
+        return await copyIn(containerID: containerID, path: path, archive: archive)
+    }
     func build(contextTar: Data, query: String, registryHeaders: [(name: String, value: String)]) -> AsyncStream<Data> { AsyncStream { $0.finish() } }
     func build(contextTar: Data, query: String) -> AsyncStream<Data> { build(contextTar: contextTar, query: query, registryHeaders: []) }
     func commit(containerID: String, repo: String, tag: String, labels: [String: String]) async throws -> String { "" }

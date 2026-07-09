@@ -78,6 +78,11 @@ struct DockerSourceEngine: Identifiable, Sendable, Equatable {
     var id: String { socketPath }
     var label: String
     var socketPath: String
+    var socketExists: Bool = true
+
+    var pickerLabel: String {
+        socketExists ? label : "\(label) (not running)"
+    }
 }
 
 enum DockerEngineSocketDiscovery {
@@ -112,7 +117,13 @@ enum DockerEngineSocketDiscovery {
         var paths: [String] = []
         // Exclude both Dory sockets so a migration never picks Dory as its own source: the user-facing
         // shim socket (what the `dory` docker context points at) and the raw shared-VM engine socket.
-        let exclusions = Set(excludedPaths + [doryShimSocket(home: home), doryEngineSocket(home: home)])
+        // Compare both declared and symlink-resolved identities because `/var/run/docker.sock` and
+        // Docker contexts can be aliases for Dory's socket.
+        let exclusions = excludedSocketIdentities(
+            home: home,
+            fileManager: fileManager,
+            extraPaths: excludedPaths
+        )
 
         if let path = unixPath(from: environment["DOCKER_HOST"]) {
             paths.append(path)
@@ -127,7 +138,9 @@ enum DockerEngineSocketDiscovery {
         paths += contexts.map(\.path)
 
         paths += commonSockets(home: home)
-        return uniqued(paths).filter { !exclusions.contains($0) }
+        return uniqued(paths).filter { path in
+            socketIdentities(for: path, fileManager: fileManager).isDisjoint(with: exclusions)
+        }
     }
 
     private nonisolated static func doryShimSocket(home: String) -> String {
@@ -142,15 +155,23 @@ enum DockerEngineSocketDiscovery {
     /// pick which one to import from instead of the app silently auto-selecting the highest-priority
     /// socket (which is why "can't import from OrbStack" happened when Docker Desktop was also
     /// installed — `/var/run/docker.sock` outranked OrbStack and there was no way to override it).
-    /// Only sockets whose file exists are returned; readiness is confirmed by a later probe.
+    /// Installed engines are offered even before their socket exists. OrbStack, for example, only
+    /// creates `~/.orbstack/run/docker.sock` after the app is opened, but its data can still be
+    /// importable once Dory starts it.
     nonisolated static func availableSources(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         home: String = NSHomeDirectory(),
         fileManager: FileManager = .default
     ) -> [DockerSourceEngine] {
         candidates(environment: environment, home: home, fileManager: fileManager)
-            .filter { fileManager.fileExists(atPath: $0) }
-            .map { DockerSourceEngine(label: engineLabel(for: $0, home: home), socketPath: $0) }
+            .filter { sourceCanBeOffered(path: $0, home: home, fileManager: fileManager) }
+            .map {
+                DockerSourceEngine(
+                    label: engineLabel(for: $0, home: home),
+                    socketPath: $0,
+                    socketExists: fileManager.fileExists(atPath: $0)
+                )
+            }
     }
 
     nonisolated static func engineLabel(for path: String, home: String) -> String {
@@ -172,6 +193,87 @@ enum DockerEngineSocketDiscovery {
             "\(home)/.local/share/containers/podman/machine/podman-machine-default/podman.sock",
             "\(home)/.local/share/containers/podman/machine/default/podman.sock",
         ]
+    }
+
+    private nonisolated static func excludedSocketIdentities(
+        home: String,
+        fileManager: FileManager,
+        extraPaths: [String]
+    ) -> Set<String> {
+        (extraPaths + [doryShimSocket(home: home), doryEngineSocket(home: home)])
+            .reduce(into: Set<String>()) { result, path in
+                result.formUnion(socketIdentities(for: path, fileManager: fileManager))
+            }
+    }
+
+    private nonisolated static func socketIdentities(for path: String, fileManager: FileManager) -> Set<String> {
+        var identities = Set<String>()
+        var current = standardizedPath(path)
+        identities.insert(current)
+        identities.insert(URL(fileURLWithPath: current).resolvingSymlinksInPath().path)
+
+        var seen = Set<String>()
+        for _ in 0..<8 {
+            guard seen.insert(current).inserted,
+                  let destination = try? fileManager.destinationOfSymbolicLink(atPath: current) else { break }
+            let resolved = destination.hasPrefix("/")
+                ? destination
+                : URL(fileURLWithPath: current).deletingLastPathComponent().appendingPathComponent(destination).path
+            current = standardizedPath(resolved)
+            identities.insert(current)
+            identities.insert(URL(fileURLWithPath: current).resolvingSymlinksInPath().path)
+        }
+        return identities
+    }
+
+    private nonisolated static func standardizedPath(_ path: String) -> String {
+        URL(fileURLWithPath: path).standardizedFileURL.path
+    }
+
+    private nonisolated static func sourceCanBeOffered(
+        path: String,
+        home: String,
+        fileManager: FileManager
+    ) -> Bool {
+        if fileManager.fileExists(atPath: path) { return true }
+
+        switch engineLabel(for: path, home: home) {
+        case "OrbStack":
+            return anyExists([
+                "\(home)/.orbstack",
+                "\(home)/Applications/OrbStack.app",
+                "/Applications/OrbStack.app",
+            ], fileManager: fileManager)
+        case "Colima":
+            return anyExists([
+                "\(home)/.colima",
+                "\(home)/.colima/default",
+            ], fileManager: fileManager)
+        case "Docker":
+            return anyExists([
+                "\(home)/.docker/desktop",
+                "\(home)/Applications/Docker.app",
+                "/Applications/Docker.app",
+            ], fileManager: fileManager)
+        case "Rancher Desktop":
+            return anyExists([
+                "\(home)/.rd",
+                "\(home)/Applications/Rancher Desktop.app",
+                "/Applications/Rancher Desktop.app",
+            ], fileManager: fileManager)
+        case "Podman":
+            return anyExists([
+                "\(home)/.local/share/containers/podman",
+                "\(home)/Applications/Podman Desktop.app",
+                "/Applications/Podman Desktop.app",
+            ], fileManager: fileManager)
+        default:
+            return false
+        }
+    }
+
+    private nonisolated static func anyExists(_ paths: [String], fileManager: FileManager) -> Bool {
+        paths.contains { fileManager.fileExists(atPath: $0) }
     }
 
     private nonisolated static func currentDockerContext(home: String, fileManager: FileManager) -> String? {
@@ -216,13 +318,115 @@ enum DockerEngineSocketDiscovery {
     }
 }
 
+enum DockerEngineSourceActivator {
+    nonisolated static func readyRuntime(
+        for source: DockerSourceEngine,
+        waitTimeout: TimeInterval = 75,
+        probeTimeout: TimeInterval = 1.5
+    ) async -> DockerEngineRuntime? {
+        if let runtime = await detect(source: source, probeTimeout: probeTimeout) {
+            return runtime
+        }
+
+        await start(source)
+        let deadline = Date().addingTimeInterval(waitTimeout)
+        while Date() < deadline {
+            if let runtime = await detect(source: source, probeTimeout: probeTimeout) {
+                return runtime
+            }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        return nil
+    }
+
+    private nonisolated static func detect(
+        source: DockerSourceEngine,
+        probeTimeout: TimeInterval
+    ) async -> DockerEngineRuntime? {
+        await DockerEngineRuntime.detect(
+            candidates: [source.socketPath],
+            probeTimeout: probeTimeout,
+            labels: [source.socketPath: source.label]
+        )
+    }
+
+    private nonisolated static func start(_ source: DockerSourceEngine) async {
+        for command in startCommands(for: source) {
+            if await run(command) { return }
+        }
+    }
+
+    private nonisolated static func startCommands(for source: DockerSourceEngine) -> [(String, [String])] {
+        switch source.label {
+        case "OrbStack":
+            return [
+                ("/usr/bin/env", ["orb", "start"]),
+                ("/usr/bin/open", ["-g", "-a", "OrbStack"]),
+            ]
+        case "Colima":
+            return [
+                ("/usr/bin/env", ["colima", "start"]),
+            ]
+        case "Docker":
+            return [
+                ("/usr/bin/open", ["-g", "-a", "Docker"]),
+            ]
+        case "Rancher Desktop":
+            return [
+                ("\(NSHomeDirectory())/.rd/bin/rdctl", ["start"]),
+                ("/usr/bin/env", ["rdctl", "start"]),
+                ("/usr/bin/open", ["-g", "-a", "Rancher Desktop"]),
+            ]
+        case "Podman":
+            return [
+                ("/usr/bin/env", ["podman", "machine", "start"]),
+                ("/usr/bin/open", ["-g", "-a", "Podman Desktop"]),
+            ]
+        default:
+            return []
+        }
+    }
+
+    private nonisolated static func run(_ command: (String, [String]), timeout: TimeInterval = 60) async -> Bool {
+        let executable = command.0
+        let arguments = command.1
+        return await Task.detached(priority: .utility) {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: executable)
+            process.arguments = arguments
+            var environment = ProcessInfo.processInfo.environment
+            let prefix = "\(NSHomeDirectory())/.rd/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            environment["PATH"] = [prefix, environment["PATH"]].compactMap { $0 }.joined(separator: ":")
+            process.environment = environment
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            do { try process.run() } catch { return false }
+            let deadline = Date().addingTimeInterval(timeout)
+            while process.isRunning && Date() < deadline {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            guard !process.isRunning else {
+                process.terminate()
+                process.waitUntilExit()
+                return false
+            }
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        }.value
+    }
+}
+
 struct DockerEngineRuntime: ContainerRuntime {
     let kind: RuntimeKind
     let socketPath: String
+    let displayName: String
 
-    nonisolated init(socketPath: String, kind: RuntimeKind = .docker) {
+    nonisolated init(socketPath: String, kind: RuntimeKind = .docker, displayName: String? = nil) {
         self.socketPath = socketPath
         self.kind = kind
+        self.displayName = displayName ?? (kind == .docker
+            ? DockerEngineSocketDiscovery.engineLabel(for: socketPath, home: NSHomeDirectory())
+            : kind.displayName)
     }
 
     private var http: UnixSocketHTTP { UnixSocketHTTP(path: socketPath) }
@@ -235,14 +439,19 @@ struct DockerEngineRuntime: ContainerRuntime {
         await detect(candidates: DockerEngineSocketDiscovery.candidates())
     }
 
-    static func detect(candidates: [String], fileManager: FileManager = .default, probeTimeout: TimeInterval = detectionProbeTimeout) async -> DockerEngineRuntime? {
+    static func detect(
+        candidates: [String],
+        fileManager: FileManager = .default,
+        probeTimeout: TimeInterval = detectionProbeTimeout,
+        labels: [String: String] = [:]
+    ) async -> DockerEngineRuntime? {
         let existing = candidates.enumerated().filter { fileManager.fileExists(atPath: $0.element) }
         guard !existing.isEmpty else { return nil }
 
         return await withTaskGroup(of: (Int, DockerEngineRuntime?).self) { group in
             for (index, path) in existing {
                 group.addTask {
-                    let runtime = DockerEngineRuntime(socketPath: path)
+                    let runtime = DockerEngineRuntime(socketPath: path, displayName: labels[path])
                     let version = try? await runtime.get("/version", as: DockerVersion.self, ioTimeout: probeTimeout)
                     return (index, version == nil ? nil : runtime)
                 }
@@ -750,6 +959,45 @@ struct DockerEngineRuntime: ContainerRuntime {
         let encoded = DockerImageOps.queryValue(path)
         let response = try? await http.send(HTTPRequest(method: "PUT", path: "/containers/\(DockerImageOps.pathComponent(containerID))/archive?path=\(encoded)",
             headers: [(name: "Content-Type", value: "application/x-tar")], body: archive))
+        return response?.isSuccess ?? false
+    }
+
+    func copyOutStream(containerID: String, path: String) -> AsyncThrowingStream<Data, Error> {
+        let encoded = DockerImageOps.queryValue(path)
+        let request = HTTPRequest(method: "GET", path: "/containers/\(DockerImageOps.pathComponent(containerID))/archive?path=\(encoded)")
+        let client = http
+        return AsyncThrowingStream { continuation in
+            let handle = client.streamSuccessful(request, onChunk: { chunk in
+                if !chunk.isEmpty { continuation.yield(chunk) }
+            }, onComplete: { result in
+                switch result {
+                case .success: continuation.finish()
+                case .failure(let error): continuation.finish(throwing: error)
+                }
+            })
+            continuation.onTermination = { _ in handle.close() }
+        }
+    }
+
+    func copyIn(containerID: String, path: String, archiveStream: AsyncThrowingStream<Data, Error>) async -> Bool {
+        let encoded = DockerImageOps.queryValue(path)
+        let body = AsyncStream<Data> { continuation in
+            Task {
+                do {
+                    for try await chunk in archiveStream where !chunk.isEmpty {
+                        continuation.yield(chunk)
+                    }
+                } catch {
+                    // The chunked request will fail server-side if the archive stream ended mid-tar.
+                }
+                continuation.finish()
+            }
+        }
+        let response = try? await http.sendChunked(HTTPRequest(
+            method: "PUT",
+            path: "/containers/\(DockerImageOps.pathComponent(containerID))/archive?path=\(encoded)",
+            headers: [(name: "Content-Type", value: "application/x-tar")]
+        ), body: body)
         return response?.isSuccess ?? false
     }
 

@@ -122,6 +122,26 @@ struct DockerEngineSocketDiscoveryTests {
         #expect(!candidates.contains(engineSocket))
     }
 
+    @Test func dorySocketAliasIsExcluded() throws {
+        let home = try TempHome.make()
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let dorySocket = "\(home.path)/.dory/dory.sock"
+        let alias = "\(home.path)/.docker/run/docker.sock"
+        try FileManager.default.createDirectory(
+            at: URL(fileURLWithPath: alias).deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createSymbolicLink(atPath: alias, withDestinationPath: dorySocket)
+
+        let candidates = DockerEngineSocketDiscovery.candidates(
+            environment: ["DOCKER_HOST": "unix://\(alias)"],
+            home: home.path
+        )
+
+        #expect(!candidates.contains(alias))
+    }
+
     @Test func availableSourcesLabelsEachEngineByVendor() throws {
         let home = try TempHome.make()
         defer { try? FileManager.default.removeItem(at: home) }
@@ -133,21 +153,40 @@ struct DockerEngineSocketDiscoveryTests {
         }
 
         let sources = DockerEngineSocketDiscovery.availableSources(environment: [:], home: home.path)
-        let byLabel = Dictionary(uniqueKeysWithValues: sources.map { ($0.label, $0.socketPath) })
+        let byLabel = Dictionary(grouping: sources, by: \.label).mapValues { $0.map(\.socketPath) }
 
-        #expect(byLabel["OrbStack"] == "\(home.path)/.orbstack/run/docker.sock")
-        #expect(byLabel["Colima"] == "\(home.path)/.colima/default/docker.sock")
-        #expect(byLabel["Rancher Desktop"] == "\(home.path)/.rd/docker.sock")
+        #expect(byLabel["OrbStack"]?.contains("\(home.path)/.orbstack/run/docker.sock") == true)
+        #expect(byLabel["Colima"]?.contains("\(home.path)/.colima/default/docker.sock") == true)
+        #expect(byLabel["Rancher Desktop"]?.contains("\(home.path)/.rd/docker.sock") == true)
     }
 
-    @Test func availableSourcesOmitsSocketsThatDoNotExist() throws {
+    @Test func availableSourcesIncludesInstalledOrbStackBeforeSocketExists() throws {
         let home = try TempHome.make()
         defer { try? FileManager.default.removeItem(at: home) }
 
-        // No socket files created under this temp home → none of its per-home sockets are offered.
-        // (A real `/var/run/docker.sock` may exist on the host; that is global, not under this home.)
+        try FileManager.default.createDirectory(
+            at: home.appendingPathComponent(".orbstack"),
+            withIntermediateDirectories: true
+        )
+
         let sources = DockerEngineSocketDiscovery.availableSources(environment: [:], home: home.path)
-        #expect(!sources.contains { $0.socketPath.hasPrefix(home.path) })
+        let source = try #require(sources.first { $0.socketPath == "\(home.path)/.orbstack/run/docker.sock" })
+
+        #expect(source.label == "OrbStack")
+        #expect(source.socketExists == false)
+        #expect(source.pickerLabel == "OrbStack (not running)")
+    }
+
+    @Test func availableSourcesOmitsMissingCustomContextWithoutInstallFootprint() throws {
+        let home = try TempHome.make()
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let customSocket = "\(home.path)/custom/engine.sock"
+        try Self.writeDockerContext(home: home, id: "a", name: "custom", host: "unix://\(customSocket)")
+
+        let sources = DockerEngineSocketDiscovery.availableSources(environment: [:], home: home.path)
+
+        #expect(!sources.contains { $0.socketPath == customSocket })
     }
 
     @Test func engineLabelIdentifiesDockerAndFallsBackToPath() throws {
@@ -177,6 +216,28 @@ struct DockerEngineSocketDiscoveryTests {
 
         #expect(runtime?.socketPath == goodPath)
         #expect(Date().timeIntervalSince(started) < 6.0)
+    }
+
+    @MainActor
+    @Test func detectPreservesSelectedEngineDisplayName() async throws {
+        let goodPath = Self.shortSocketPath("dory-detect-label-good")
+        let server = ShimHTTPServer(socketPath: goodPath) { _ in
+            ShimResponse(
+                status: 200,
+                headers: [(name: "Content-Type", value: "application/json")],
+                body: Data(#"{"Version":"29.5.3","ApiVersion":"1.47"}"#.utf8)
+            )
+        }
+        try server.start()
+        defer { server.stop() }
+
+        let runtime = await DockerEngineRuntime.detect(
+            candidates: [goodPath],
+            labels: [goodPath: "OrbStack"]
+        )
+
+        #expect(runtime?.socketPath == goodPath)
+        #expect(runtime?.displayName == "OrbStack")
     }
 
     @MainActor

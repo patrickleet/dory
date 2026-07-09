@@ -114,6 +114,74 @@ struct UnixSocketHTTP: Sendable {
         return handle
     }
 
+    /// Streams only successful response bodies. Non-2xx responses complete with an HTTP status error
+    /// instead of yielding the daemon's JSON error as if it were archive bytes.
+    func streamSuccessful(_ request: HTTPRequest,
+                          onChunk: @escaping @Sendable (Data) -> Void,
+                          onComplete: @escaping @Sendable (Result<Void, Error>) -> Void) -> StreamHandle {
+        let handle = StreamHandle()
+        let path = self.path
+        let chunk = self.readChunk
+        Self.ioQueue.async {
+            var completion: Result<Void, Error> = .success(())
+            defer { handle.close(); onComplete(completion) }
+            do {
+                let fd = try Self.connectSocket(path)
+                handle.set(fd)
+                try Self.writeAll(fd, HTTPCodec.serialize(request))
+                var buffer = Data()
+                var bytes = [UInt8](repeating: 0, count: chunk)
+                var headersDone = false
+                var decoder: ChunkedStreamDecoder?
+                func emit(_ data: Data) {
+                    if let decoder { onChunk(decoder.feed(data)) } else { onChunk(data) }
+                }
+                while true {
+                    let count = bytes.withUnsafeMutableBytes { read(fd, $0.baseAddress, chunk) }
+                    if count < 0 { throw HTTPError.socket(Self.errnoMessage("read")) }
+                    if count == 0 { break }
+                    if headersDone {
+                        emit(Data(bytes[0..<count]))
+                    } else {
+                        buffer.append(contentsOf: bytes[0..<count])
+                        if let range = HTTPCodec.range(of: HTTPCodec.headerTerminator, in: buffer) {
+                            let headerText = String(data: buffer.subdata(in: buffer.startIndex..<range.lowerBound), encoding: .utf8) ?? ""
+                            let (statusCode, headers) = Self.parseResponseHead(headerText)
+                            guard (200..<300).contains(statusCode) else {
+                                completion = .failure(HTTPError.status(code: statusCode, message: "stream request failed"))
+                                return
+                            }
+                            headersDone = true
+                            if headers["transfer-encoding"]?.lowercased().contains("chunked") == true {
+                                decoder = ChunkedStreamDecoder()
+                            }
+                            let body = buffer.subdata(in: range.upperBound..<buffer.endIndex)
+                            if !body.isEmpty { emit(body) }
+                        }
+                    }
+                }
+            } catch {
+                completion = .failure(error)
+            }
+        }
+        return handle
+    }
+
+    nonisolated private static func parseResponseHead(_ text: String) -> (Int, [String: String]) {
+        var lines = text.components(separatedBy: "\r\n")
+        let statusParts = (lines.first ?? "").split(separator: " ", maxSplits: 2, omittingEmptySubsequences: false)
+        let status = statusParts.count >= 2 ? (Int(statusParts[1]) ?? 0) : 0
+        if !lines.isEmpty { lines.removeFirst() }
+        var headers: [String: String] = [:]
+        for line in lines where !line.isEmpty {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let name = line[line.startIndex..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+            let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            headers[name] = value
+        }
+        return (status, headers)
+    }
+
     nonisolated static func blockingSend(path: String, request: HTTPRequest, readChunk: Int, ioTimeout: TimeInterval? = nil) throws -> HTTPResponse {
         let fd = try connectSocket(path)
         defer { close(fd) }
