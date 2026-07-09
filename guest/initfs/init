@@ -45,10 +45,17 @@ if [ -b /dev/vdb ]; then
 fi
 
 if [ -x /usr/local/bin/dockerd ]; then
+  # crun is faster than runc but opens cgroup-v2 io.max unconditionally, so it only works on a kernel
+  # built with CONFIG_BLK_DEV_THROTTLING. Default to crun only when a probe cgroup exposes io.max;
+  # otherwise fall back to runc (which tolerates its absence).
+  DORY_RUNTIME_ARGS=""
   if [ -x /usr/local/bin/crun ]; then
-    DORY_RUNTIME_ARGS="--add-runtime crun=/usr/local/bin/crun --default-runtime crun"
-  else
-    DORY_RUNTIME_ARGS=""
+    echo +io > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null
+    mkdir -p /sys/fs/cgroup/.dory-crun-probe 2>/dev/null
+    if [ -e /sys/fs/cgroup/.dory-crun-probe/io.max ]; then
+      DORY_RUNTIME_ARGS="--add-runtime crun=/usr/local/bin/crun --default-runtime crun"
+    fi
+    rmdir /sys/fs/cgroup/.dory-crun-probe 2>/dev/null
   fi
   # shellcheck disable=SC2086
   /usr/local/bin/dockerd \

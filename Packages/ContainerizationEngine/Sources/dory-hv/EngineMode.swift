@@ -488,9 +488,12 @@ enum EngineMode {
         }
         script += [
             guestAgentStartCommand(shares: shares),
-            // Prefer crun (faster container create/start); fall back to dockerd's built-in runc if the
-            // binary is somehow absent so the engine still serves.
-            "[ -x /usr/local/bin/crun ] && DORY_RUNTIME_ARGS='--add-runtime crun=/usr/local/bin/crun --default-runtime crun' || DORY_RUNTIME_ARGS=''",
+            // Prefer crun (faster container create/start) ONLY when the guest kernel provides the
+            // cgroup-v2 io.max file: crun opens it unconditionally, so on a kernel built without
+            // CONFIG_BLK_DEV_THROTTLING it fails every container create with "open io.max: No such
+            // file". runc tolerates the absence, so we fall back to it there. Probe by delegating io
+            // and checking a throwaway cgroup; this auto-enables crun once the kernel gains throttling.
+            "if [ -x /usr/local/bin/crun ]; then echo +io > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null; mkdir -p /sys/fs/cgroup/.dory-crun-probe 2>/dev/null; [ -e /sys/fs/cgroup/.dory-crun-probe/io.max ] && DORY_RUNTIME_ARGS='--add-runtime crun=/usr/local/bin/crun --default-runtime crun' || DORY_RUNTIME_ARGS=''; rmdir /sys/fs/cgroup/.dory-crun-probe 2>/dev/null; else DORY_RUNTIME_ARGS=''; fi",
             "dockerd -H unix:///var/run/docker.sock -H tcp://0.0.0.0:2375 --tls=false --log-level=warn --feature containerd-snapshotter=true $DORY_RUNTIME_ARGS >/var/log/dockerd.log 2>&1 & true",
             amd64Emulation ? BinfmtRegistration.dockerFallbackCommand() : "true",
             "( while true; do nc -l -p 2377 >/dev/null 2>&1; echo shutdown requested; sync; umount /var/lib/docker 2>/dev/null; sync; poweroff -f; done ) & true",
