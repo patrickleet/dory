@@ -10,6 +10,16 @@ SIZE_MB="${DORY_INITFS_SIZE_MB:-1024}"
 
 mkdir -p "$OUT_DIR" "$CACHE_DIR"
 
+ACTIVE_STAGING=""
+ACTIVE_ROOTFS=""
+ACTIVE_LINK_TMP=""
+cleanup_build() {
+  [ -z "$ACTIVE_STAGING" ] || rm -rf "$ACTIVE_STAGING"
+  [ -z "$ACTIVE_ROOTFS" ] || rm -rf "$ACTIVE_ROOTFS"
+  [ -z "$ACTIVE_LINK_TMP" ] || rm -f "$ACTIVE_LINK_TMP"
+}
+trap cleanup_build EXIT
+
 find_mke2fs() {
   for cand in "${DORY_MKE2FS:-}" \
               "$(command -v mke2fs 2>/dev/null || true)" \
@@ -96,8 +106,7 @@ linux_linker_for_target() {
 }
 
 build_rust_agent() {
-  local arch="$1" target agent linker env_name rustflags
-  [ "${DORY_INITFS_SKIP_RUST_AGENT_BUILD:-0}" = "1" ] && return 0
+  local arch="$1" destination="$2" target agent linker env_name rustflags
   target="$(rust_target_for_arch "$arch")"
   linker="$(linux_linker_for_target "$target")"
   env_name="CARGO_TARGET_$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')_LINKER"
@@ -106,13 +115,10 @@ build_rust_agent() {
     rustflags="$rustflags -C linker-flavor=ld.lld"
   fi
   rustup target add "$target" >/dev/null
-  ( cd "$ROOT/dory-core" && env "$env_name=$linker" RUSTFLAGS="$rustflags" cargo build -p dory-agent --release --target "$target" )
+  ( cd "$ROOT/dory-core" && env "$env_name=$linker" RUSTFLAGS="$rustflags" cargo build --locked -p dory-agent --release --target "$target" )
   agent="$ROOT/dory-core/target/$target/release/dory-agent"
   [ -x "$agent" ] || { echo "Rust dory-agent was not produced for $target" >&2; exit 1; }
-  install -m0755 "$agent" "$OUT_DIR/dory-agent-$arch"
-  if [ "$arch" = "arm64" ]; then
-    ln -sf dory-agent-arm64 "$OUT_DIR/dory-agent"
-  fi
+  install -m0755 "$agent" "$destination"
 }
 
 extract_tar() {
@@ -171,7 +177,7 @@ install_iptables() {
 }
 
 write_runtime_files() {
-  local rootfs="$1" arch="$2" agent="$OUT_DIR/dory-agent-$arch"
+  local rootfs="$1" agent="$2"
   mkdir -p "$rootfs"/{dev,proc,sys,run,tmp,var/log,var/run,var/lib/docker,usr/bin,usr/local/bin,etc,sbin}
   rm -f "$rootfs/sbin/init"
   cp "$INITFS_DIR/init" "$rootfs/sbin/init"
@@ -192,13 +198,23 @@ EOF
 
 build_arch() {
   local arch="$1" alpine_key docker_key alpine_tar docker_tar rootfs image mke2fs
-  build_rust_agent "$arch"
+  local input_fingerprint final_fingerprint agent final_agent final_image final_stamp stamp stamp_tmp staging
+  if [ "${DORY_INITFS_SKIP_RUST_AGENT_BUILD:-0}" = "1" ]; then
+    echo "DORY_INITFS_SKIP_RUST_AGENT_BUILD cannot produce a provenance-verified initfs; use a DORY_INITFS_* release override together with DORY_ALLOW_UNVERIFIED_GUEST_ASSETS=1 for an explicit development-only escape" >&2
+    exit 64
+  fi
+  input_fingerprint="$($INITFS_DIR/input-fingerprint.sh "$arch")"
+  staging="$(mktemp -d "$OUT_DIR/.initfs-build-$arch.XXXXXX")"
+  ACTIVE_STAGING="$staging"
+  agent="$staging/dory-agent-$arch"
+  image="$staging/initfs-$arch.ext4"
+  build_rust_agent "$arch" "$agent"
   alpine_key="alpine_$arch"
   docker_key="docker_$arch"
   alpine_tar="$(fetch_pin "$alpine_key")"
   docker_tar="$(fetch_pin "$docker_key")"
   rootfs="$(mktemp -d)"
-  image="$OUT_DIR/initfs-$arch.ext4"
+  ACTIVE_ROOTFS="$rootfs"
   mke2fs="$(find_mke2fs)" || { echo "mke2fs not found; install e2fsprogs or Android platform-tools" >&2; exit 1; }
 
   extract_tar "$alpine_tar" "$rootfs"
@@ -206,13 +222,45 @@ build_arch() {
   install_iptables "$arch" "$rootfs"
   install_docker_static "$docker_tar" "$rootfs"
   install_crun "$arch" "$rootfs"
-  write_runtime_files "$rootfs" "$arch"
+  write_runtime_files "$rootfs" "$agent"
 
-  rm -f "$image"
   truncate -s "${SIZE_MB}m" "$image"
   "$mke2fs" -q -F -t ext4 -L dory-initfs -d "$rootfs" "$image"
   rm -rf "$rootfs"
-  echo "built $image ($(du -h "$image" | awk '{print $1}'))"
+  ACTIVE_ROOTFS=""
+  final_fingerprint="$($INITFS_DIR/input-fingerprint.sh "$arch")"
+  [ "$final_fingerprint" = "$input_fingerprint" ] || {
+    echo "initfs inputs changed during the $arch build; refusing to publish a mixed-source artifact" >&2
+    exit 1
+  }
+  final_agent="$OUT_DIR/dory-agent-$arch"
+  final_image="$OUT_DIR/initfs-$arch.ext4"
+  stamp="$staging/initfs-build-$arch.stamp"
+  final_stamp="$OUT_DIR/initfs-build-$arch.stamp"
+  stamp_tmp="$(mktemp "$staging/.initfs-build-$arch.XXXXXX")"
+  {
+    printf 'schema=2\narch=%s\ninput_sha256=%s\n' "$arch" "$input_fingerprint"
+    printf 'agent_sha256=%s\n' "$(sha256_file "$agent")"
+    printf 'image_sha256=%s\n' "$(sha256_file "$image")"
+  } > "$stamp_tmp"
+  mv -f "$stamp_tmp" "$stamp"
+  DORY_INITFS_OUT_DIR="$staging" "$INITFS_DIR/verify-build.sh" "$arch"
+  # Publish each immutable artifact with a same-filesystem rename, and the stamp last. A concurrent
+  # verifier can see the old valid set or fail closed during the two-renames window; it can never
+  # accept a new artifact under an old stamp.
+  mv -f "$agent" "$final_agent"
+  mv -f "$image" "$final_image"
+  mv -f "$stamp" "$final_stamp"
+  rmdir "$staging"
+  ACTIVE_STAGING=""
+  if [ "$arch" = arm64 ]; then
+    ACTIVE_LINK_TMP="$OUT_DIR/.dory-agent-link-$$"
+    ln -sfn dory-agent-arm64 "$ACTIVE_LINK_TMP"
+    mv -f "$ACTIVE_LINK_TMP" "$OUT_DIR/dory-agent"
+    ACTIVE_LINK_TMP=""
+  fi
+  "$INITFS_DIR/verify-build.sh" "$arch"
+  echo "built $final_image ($(du -h "$final_image" | awk '{print $1}'))"
 }
 
 case "${1:-all}" in
