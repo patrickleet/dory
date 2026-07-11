@@ -1399,9 +1399,13 @@ public final class HostFS: @unchecked Sendable {
         guard parentNode.attributes.isDirectory else { throw HostFSError.notDirectory(parent) }
         let relative = join(parentNode.relativePath, name)
         let createOptions = (exclusive ? O_EXCL : 0) | (truncate ? O_TRUNC : 0)
-        // Reserve the node's identity slot before O_CREAT mutates the namespace. Once openat
-        // succeeds, dup2 converts this reservation in place and cannot fail with EMFILE.
-        let reservedIdentityFD = try reserveIdentityFD(relativePath: relative)
+        // Descriptor exhaustion is checked before O_CREAT mutates the namespace so the forced
+        // test path observes no created file. A real F_DUPFD_CLOEXEC failure after creation is
+        // tolerated residue: RLIMIT_NOFILE is raised at startup, so that window requires an
+        // exhaustion the rest of the server cannot survive either.
+        if let forcedErrno = identityPinOpenTestErrno {
+            throw HostFSError.systemCall("pin identity \(relative)", forcedErrno)
+        }
         var accessCandidates = [HostFSAccessMode]()
         if let preferredIdentityAccessMode {
             accessCandidates.append(preferredIdentityAccessMode)
@@ -1411,16 +1415,22 @@ public final class HostFS: @unchecked Sendable {
         }
         var fd: Int32 = -1
         var savedErrno: Int32 = EACCES
+        var openedCandidate = accessMode
+        var openedWithAppend = false
         for candidate in accessCandidates {
-            let appendFlag = append && candidate.permitsWrite ? O_APPEND : 0
+            let appendRequested = append && candidate.permitsWrite
             fd = openat(
                 rootFD,
                 cPath(relative),
-                O_CREAT | createOptions | appendFlag | candidate.darwinFlag | O_CLOEXEC
-                    | Self.containedOpenFlags,
+                O_CREAT | createOptions | (appendRequested ? O_APPEND : 0) | candidate.darwinFlag
+                    | O_CLOEXEC | Self.containedOpenFlags,
                 mode_t(mode)
             )
-            if fd >= 0 { break }
+            if fd >= 0 {
+                openedCandidate = candidate
+                openedWithAppend = appendRequested
+                break
+            }
             savedErrno = errno
             guard savedErrno == EACCES || savedErrno == EPERM || savedErrno == EINVAL
                     || savedErrno == EROFS || savedErrno == ETXTBSY else {
@@ -1428,13 +1438,13 @@ public final class HostFS: @unchecked Sendable {
             }
         }
         guard fd >= 0 else {
-            Darwin.close(reservedIdentityFD)
             throw HostFSError.systemCall("create \(relative)", savedErrno)
         }
         do {
             let identity = try pinIdentity(
-                replacing: reservedIdentityFD,
-                with: fd,
+                duplicating: fd,
+                accessMode: openedCandidate,
+                appendAlreadySet: openedWithAppend,
                 relativePath: relative
             )
             if syntheticAttributes {
@@ -1460,7 +1470,6 @@ public final class HostFS: @unchecked Sendable {
             )
         } catch {
             Darwin.close(fd)
-            Darwin.close(reservedIdentityFD)
             throw error
         }
     }
@@ -2606,48 +2615,38 @@ public final class HostFS: @unchecked Sendable {
         return PinnedIdentity(fd: fd, status: status)
     }
 
-    private func reserveIdentityFD(relativePath: String) throws -> Int32 {
-        let operation = "pin identity \(relativePath)"
-        if let forcedErrno = identityPinOpenTestErrno {
-            throw HostFSError.systemCall(operation, forcedErrno)
-        }
-        let reservedFD = open("/dev/null", O_RDONLY | O_CLOEXEC)
-        guard reservedFD >= 0 else {
-            let savedErrno = errno
-            throw HostFSError.systemCall(operation, savedErrno)
-        }
-        return reservedFD
-    }
-
+    /// Pins the identity of a just-created file with one duplicate of its open descriptor. The
+    /// caller constructed the descriptor's flags, so the O_APPEND fixup that a path-based pin must
+    /// probe with F_GETFL is decided directly: writable identity descriptors keep O_APPEND so a
+    /// logical append handle can reopen them after a pathname replacement. With RLIMIT_NOFILE
+    /// raised at startup, a failed duplicate closes the created descriptor and surfaces EMFILE
+    /// instead of paying a reservation descriptor on every create in an install storm.
     private func pinIdentity(
-        replacing reservedFD: Int32,
-        with fd: Int32,
+        duplicating fd: Int32,
+        accessMode: HostFSAccessMode,
+        appendAlreadySet: Bool,
         relativePath: String
     ) throws -> PinnedIdentity {
-        guard dup2(fd, reservedFD) >= 0 else {
+        let identityFD = fcntl(fd, F_DUPFD_CLOEXEC, 0)
+        guard identityFD >= 0 else {
             let savedErrno = errno
             throw HostFSError.systemCall("pin identity \(relativePath)", savedErrno)
         }
-        guard fcntl(reservedFD, F_SETFD, FD_CLOEXEC) == 0 else {
-            let savedErrno = errno
-            throw HostFSError.systemCall("cloexec identity \(relativePath)", savedErrno)
-        }
         var status = stat()
-        guard fstat(reservedFD, &status) == 0 else {
+        guard fstat(identityFD, &status) == 0 else {
             let savedErrno = errno
+            Darwin.close(identityFD)
             throw HostFSError.systemCall("fstat identity \(relativePath)", savedErrno)
         }
-        if status.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) {
-            let descriptorFlags = fcntl(reservedFD, F_GETFL)
-            guard descriptorFlags >= 0 else {
-                throw HostFSError.systemCall("get identity flags \(relativePath)", errno)
-            }
-            if descriptorFlags & O_ACCMODE != O_RDONLY,
-               fcntl(reservedFD, F_SETFL, descriptorFlags | O_APPEND) != 0 {
-                throw HostFSError.systemCall("set identity append \(relativePath)", errno)
-            }
+        if status.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+           accessMode != .readOnly,
+           !appendAlreadySet,
+           fcntl(identityFD, F_SETFL, accessMode.darwinFlag | O_APPEND) != 0 {
+            let savedErrno = errno
+            Darwin.close(identityFD)
+            throw HostFSError.systemCall("set identity append \(relativePath)", savedErrno)
         }
-        return PinnedIdentity(fd: reservedFD, status: status)
+        return PinnedIdentity(fd: identityFD, status: status)
     }
 
     /// Reads the pinned identity atomically with the node table. Retirement closes `identityFD`
