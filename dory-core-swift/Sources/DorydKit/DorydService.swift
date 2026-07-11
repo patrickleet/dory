@@ -175,6 +175,29 @@ public final class DorydService: NSObject, DorydControl {
         }
     }
 
+    public func dockerAgentClockSync(reply: @escaping (NSDictionary, String) -> Void) {
+        guard let dockerTier else {
+            reply([:], "docker tier is not configured")
+            return
+        }
+        let result = dockerTier.syncAgentClock(now: Date())
+        let body: NSDictionary = [
+            "name": result.name,
+            "attempted": result.attempted,
+            "synced": result.synced,
+            "error": result.error ?? "",
+        ]
+        if let error = result.error {
+            reply(body, error)
+        } else if !result.attempted {
+            reply(body, "docker agent is not available or the docker tier is not running")
+        } else if !result.synced {
+            reply(body, "docker agent declined clock synchronization")
+        } else {
+            reply(body, "")
+        }
+    }
+
     public func machineCreate(
         _ config: NSDictionary,
         reply: @escaping (Bool, NSDictionary, String) -> Void

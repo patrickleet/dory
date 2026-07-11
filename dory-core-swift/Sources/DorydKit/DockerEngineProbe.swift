@@ -155,13 +155,15 @@ public enum DockerEngineProbe {
     public static func waitUntilReady(
         socketPath: String,
         timeout: TimeInterval = 45,
-        pollInterval: TimeInterval = 0.25
+        pollInterval: TimeInterval = 0.25,
+        shouldContinue: @escaping @Sendable () -> Bool = { true }
     ) -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
+        while Date() < deadline, shouldContinue() {
             if (try? ping(socketPath: socketPath, timeout: min(2, max(0.25, pollInterval * 2)))) == true {
                 return true
             }
+            guard shouldContinue() else { return false }
             Thread.sleep(forTimeInterval: pollInterval)
         }
         return false
@@ -172,10 +174,11 @@ public enum DockerEngineProbe {
         cid: UInt32,
         dockerPort: UInt32,
         timeout: TimeInterval = 45,
-        pollInterval: TimeInterval = 0.25
+        pollInterval: TimeInterval = 0.25,
+        shouldContinue: @escaping @Sendable () -> Bool = { true }
     ) -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
+        while Date() < deadline, shouldContinue() {
             if (try? ping(
                 forwardSocketPath: forwardSocketPath,
                 cid: cid,
@@ -184,6 +187,7 @@ public enum DockerEngineProbe {
             )) == true {
                 return true
             }
+            guard shouldContinue() else { return false }
             Thread.sleep(forTimeInterval: pollInterval)
         }
         return false

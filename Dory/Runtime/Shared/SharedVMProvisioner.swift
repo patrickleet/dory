@@ -148,10 +148,9 @@ nonisolated enum SharedVMProvisioner {
         /// Metal. Fails closed to headless when the host Venus runtime is missing, so it is a manual
         /// Settings toggle and takes effect on the next engine start.
         var gpuVenus: Bool
-        /// Opt-in DAX data shares (P2.4): host directories the user designates as mmap/DB-heavy get a
-        /// virtio-fs DAX window (`dax=always`) so page-cache-backed mmap reads land in host memory with
-        /// no per-page FUSE round trip. Deliberately NOT the home share — metadata-storm workloads churn
-        /// SETUPMAPPING and gain nothing from DAX. Each entry is mounted read-write at its host path.
+        /// Retained only to detect and reject the former hidden DAX preference explicitly. Direct DAX
+        /// mappings bypass the FUSE request fail-stop boundary, so neither read-write nor read-only host
+        /// shares may enter production until the VMM has a proven vCPU-quiesce protocol.
         var daxDataShares: [String]
 
         nonisolated static let rosettaX86Key = "dory.rosettaX86Enabled"
@@ -173,24 +172,6 @@ nonisolated enum SharedVMProvisioner {
             self.rosettaX86 = rosettaX86
             self.gpuVenus = gpuVenus
             self.daxDataShares = daxDataShares
-        }
-
-        /// The subset of `daxDataShares` that are safe to mount: existing directories, standardized,
-        /// de-duplicated, and never the home directory (which is already shared without DAX).
-        nonisolated func validatedDaxDataShares(home: String) -> [String] {
-            var seen = Set<String>()
-            var result = [String]()
-            for raw in daxDataShares {
-                let path = URL(fileURLWithPath: raw).standardizedFileURL.path
-                guard path != home, !seen.contains(path) else { continue }
-                var isDirectory: ObjCBool = false
-                guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
-                    continue
-                }
-                seen.insert(path)
-                result.append(path)
-            }
-            return result
         }
 
         var memoryMB: Int {
@@ -217,6 +198,7 @@ nonisolated enum SharedVMProvisioner {
 
     enum ProvisionError: Error, Sendable {
         case unsupportedHost(String)
+        case unsafeConfiguration(String)
         case engineUnavailable
         case engineStartFailed(String)
         case engineUnreachable(String?)
@@ -281,48 +263,119 @@ nonisolated enum SharedVMProvisioner {
 
     static func hostSupport(
         platform: MacHostPlatform = .current(),
-        engineAvailable: Bool = hvEngineAvailable(),
-        vzEngineAvailable: Bool = vmEngineAvailable(),
+        engineAvailable: Bool? = nil,
+        vzEngineAvailable: Bool? = nil,
         hypervisorSupported: Bool = hostHypervisorSupported()
     ) -> RuntimeSupport {
         engineSupport(
             platform: platform,
-            hvNativeAvailable: engineAvailable,
-            vzSharedAvailable: vzEngineAvailable,
+            hvNativeAvailable: engineAvailable ?? hvEngineAvailable(platform: platform),
+            vzSharedAvailable: vzEngineAvailable ?? vmEngineAvailable(arch: guestArch(for: platform)),
             hypervisorSupported: hypervisorSupported
         ).support
     }
 
     static func engineSupport(
         platform: MacHostPlatform = .current(),
-        hvNativeAvailable: Bool = hvEngineAvailable(),
-        vzSharedAvailable: Bool = vmEngineAvailable(),
+        hvNativeAvailable: Bool? = nil,
+        vzSharedAvailable: Bool? = nil,
         hypervisorSupported: Bool = hostHypervisorSupported()
     ) -> EngineSupportEvaluation {
         EngineSupport.evaluate(
             platform: platform,
-            hvNativeAvailable: hvNativeAvailable,
-            vzSharedAvailable: vzSharedAvailable,
+            hvNativeAvailable: hvNativeAvailable ?? hvEngineAvailable(platform: platform),
+            vzSharedAvailable: vzSharedAvailable ?? vmEngineAvailable(arch: guestArch(for: platform)),
             hypervisorSupported: hypervisorSupported
         )
+    }
+
+    nonisolated private static func guestArch(for platform: MacHostPlatform) -> String {
+        platform.isIntel ? "amd64" : "arm64"
     }
 
     /// Whether the dory-hv engine can run here: the signed helper, gvproxy, and a resolvable kernel
     /// (bundled compressed resource, or an installed kernel) are all present. Default on; set
     /// DORY_HV_ENGINE=0 to force-disable for debugging. Synchronous, so host-support can call it.
-    static func hvEngineAvailable(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+    static func hvEngineAvailable(
+        platform: MacHostPlatform = .current(),
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        arch: String? = nil
+    ) -> Bool {
+        let selectedArch = arch ?? guestArch(for: platform)
+        guard DoryHVSupport.evaluate(platform: platform).isSupported else { return false }
         guard environment["DORY_HV_ENGINE"] != "0" else { return false }
         guard hvHelperBinary() != nil, gvproxyBinary() != nil else { return false }
-        if Bundle.main.url(forResource: hvKernelResourceName(), withExtension: "lzfse") != nil { return true }
-        if engineArch == "arm64", Bundle.main.url(forResource: "dory-hv-kernel", withExtension: "lzfse") != nil { return true }
-        if engineArch == "arm64", Bundle.main.url(forResource: vmKernelResourceName(), withExtension: "lzfse") != nil { return true }
-        if engineArch == "arm64", Bundle.main.url(forResource: "dory-vm-kernel", withExtension: "lzfse") != nil { return true }
-        guard engineArch == "arm64" else { return false }
+        if Bundle.main.url(forResource: hvKernelResourceName(arch: selectedArch), withExtension: "lzfse") != nil { return true }
+        if selectedArch == "arm64", Bundle.main.url(forResource: "dory-hv-kernel", withExtension: "lzfse") != nil { return true }
+        if selectedArch == "arm64", Bundle.main.url(forResource: vmKernelResourceName(arch: selectedArch), withExtension: "lzfse") != nil { return true }
+        if selectedArch == "arm64", Bundle.main.url(forResource: "dory-vm-kernel", withExtension: "lzfse") != nil { return true }
+        guard selectedArch == "arm64" else { return false }
         return installedKernelPath() != nil
     }
 
-    static func vmEngineAvailable(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
-        false
+    static func vmEngineAvailable(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        arch: String = engineArch
+    ) -> Bool {
+        let helperAvailable = firstAvailablePath(
+            environmentKeys: ["DORYD_VMM_HELPER", "DORY_VMM_HELPER"],
+            environment: environment,
+            executable: true
+        ) != nil || bundledHelperPath(named: "dory-vmm") != nil
+        let kernelOverrideAvailable = firstAvailablePath(
+            environmentKeys: ["DORYD_VMM_KERNEL", "DORY_VMM_KERNEL"],
+            environment: environment
+        ) != nil
+        let rootfsOverrideAvailable = firstAvailablePath(
+            environmentKeys: ["DORYD_VMM_ROOTFS", "DORYD_ENGINE_ROOTFS", "DORY_ENGINE_ROOTFS"],
+            environment: environment
+        ) != nil
+
+        return vmEngineAssetsAvailable(
+            arch: arch,
+            helperAvailable: helperAvailable,
+            kernelOverrideAvailable: kernelOverrideAvailable,
+            rootfsOverrideAvailable: rootfsOverrideAvailable,
+            resourceAvailable: { name, pathExtension in
+                Bundle.main.url(forResource: name, withExtension: pathExtension) != nil
+            }
+        )
+    }
+
+    /// The exact dory-vmm asset contract doryd can boot. Require architecture-suffixed bundle
+    /// resources: a universal app's generic compatibility alias may point at the other CPU slice.
+    /// Explicit existing-file overrides remain valid for development and managed installations.
+    nonisolated static func vmEngineAssetsAvailable(
+        arch: String,
+        helperAvailable: Bool,
+        kernelOverrideAvailable: Bool = false,
+        rootfsOverrideAvailable: Bool = false,
+        resourceAvailable: (_ name: String, _ pathExtension: String) -> Bool
+    ) -> Bool {
+        guard helperAvailable, arch == "arm64" || arch == "amd64" else { return false }
+        let hasKernel = kernelOverrideAvailable
+            || resourceAvailable(vmKernelResourceName(arch: arch), "lzfse")
+        guard hasKernel else { return false }
+
+        return rootfsOverrideAvailable
+            || resourceAvailable("dory-engine-rootfs-\(arch).ext4", "lzfse")
+            || resourceAvailable(vmInitfsResourceName(arch: arch), "lzfse")
+            || resourceAvailable("dory-machine-rootfs-\(arch)", "ext4")
+    }
+
+    private static func firstAvailablePath(
+        environmentKeys: [String],
+        environment: [String: String],
+        executable: Bool = false
+    ) -> String? {
+        for key in environmentKeys {
+            guard let path = environment[key], !path.isEmpty else { continue }
+            let available = executable
+                ? FileManager.default.isExecutableFile(atPath: path)
+                : FileManager.default.fileExists(atPath: path)
+            if available { return path }
+        }
+        return nil
     }
 
     static func hostHypervisorSupported() -> Bool {
@@ -357,12 +410,20 @@ nonisolated enum SharedVMProvisioner {
     /// SMP, and a persistent journaled data disk. Reuses a live engine; otherwise spawns the helper
     /// and waits for the docker socket.
     private static func provisionWithHVEngine(config: Config) async throws -> String? {
+        try stopUnsafeLegacyDaxEngineIfNeeded(
+            config: config,
+            stopEngine: { SharedVMProvisioner.stopHelper() }
+        )
         guard let helper = hvHelperBinary(), let gvproxy = gvproxyBinary() else { return nil }
         guard let kernel = await hvKernelPath(gpu: config.gpuVenus || ProcessInfo.processInfo.environment["DORY_EXPERIMENTAL_GPU"] == "venus") else { return nil }
         let guestAgent = guestAgentSourceBinary()
         installGuestAgentForHVEngine()
 
-        if await isReachable(), helperProcessIsAlive() {
+        if try await shouldReuseHVEngine(
+            config: config,
+            reachability: { await SharedVMProvisioner.isReachable() },
+            liveness: { SharedVMProvisioner.helperProcessIsAlive() }
+        ) {
             return socketPath
         }
         stopHelper()
@@ -371,11 +432,11 @@ nonisolated enum SharedVMProvisioner {
         try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
         try? FileManager.default.removeItem(atPath: socketPath)
 
-        var arguments = engineArguments(config: config, kernel: kernel, gvproxy: gvproxy, rootfs: nil, guestAgent: guestAgent)
+        var arguments = try engineArguments(config: config, kernel: kernel, gvproxy: gvproxy, rootfs: nil, guestAgent: guestAgent)
         // Offline builds ship the engine image; hand it to the helper so first launch needs no
         // network. Online builds omit it and the engine fetches the image once.
         if let rootfs = await hvRootfsPath() {
-            arguments = engineArguments(config: config, kernel: kernel, gvproxy: gvproxy, rootfs: rootfs, guestAgent: guestAgent)
+            arguments = try engineArguments(config: config, kernel: kernel, gvproxy: gvproxy, rootfs: rootfs, guestAgent: guestAgent)
         }
 
         let process = Process()
@@ -411,7 +472,8 @@ nonisolated enum SharedVMProvisioner {
         gvproxy: String,
         rootfs: String?,
         guestAgent: String? = nil
-    ) -> [String] {
+    ) throws -> [String] {
+        try validateProductionHostShareSafety(config)
         var arguments = [
             "engine",
             "--engine-sock", socketPath,
@@ -442,11 +504,6 @@ nonisolated enum SharedVMProvisioner {
         // container as defense-in-depth; per-bind-mount on-demand sharing is the stronger follow-up.
         let home = NSHomeDirectory()
         arguments.append(contentsOf: ["--share", "home=\(home):rw:at=\(home):safe"])
-        // Opt-in DAX data shares (P2.4): each designated directory is mounted read-write at its host
-        // path with a DAX window, on top of the plain home share, for mmap/DB workloads.
-        for (index, path) in config.validatedDaxDataShares(home: home).enumerated() {
-            arguments.append(contentsOf: ["--share", "daxdata\(index)=\(path):rw:dax:at=\(path):safe"])
-        }
         // Opt-in LAN visibility: the engine binds published ports to 0.0.0.0 instead of loopback.
         // Off by default and read strictly (see lanVisibleFromConfig) so ports are never silently
         // exposed to the local network.
@@ -454,6 +511,37 @@ nonisolated enum SharedVMProvisioner {
             arguments.append(contentsOf: ["--publish-host", "0.0.0.0"])
         }
         return arguments
+    }
+
+    static func shouldReuseHVEngine(
+        config: Config,
+        reachability: () async -> Bool,
+        liveness: () -> Bool
+    ) async throws -> Bool {
+        // Validate before invoking either probe. A helper left running by an older build may itself
+        // own the unsafe DAX shares, so reachability must never bypass the migration rejection.
+        try validateProductionHostShareSafety(config)
+        guard await reachability() else { return false }
+        return liveness()
+    }
+
+    static func stopUnsafeLegacyDaxEngineIfNeeded(
+        config: Config,
+        stopEngine: () -> Void
+    ) throws {
+        guard !config.daxDataShares.isEmpty else { return }
+        // A helper launched by an older build may already own these direct mappings. Refusing to
+        // return its socket is insufficient: terminate it before surfacing the migration error.
+        stopEngine()
+        try validateProductionHostShareSafety(config)
+    }
+
+    private static func validateProductionHostShareSafety(_ config: Config) throws {
+        guard config.daxDataShares.isEmpty else {
+            throw ProvisionError.unsafeConfiguration(
+                "DAX host shares are disabled because direct guest mappings bypass the reverse-invalidation fail-stop boundary; remove the dory.daxDataShares preference"
+            )
+        }
     }
 
     /// Reads the opt-in `network.lanVisible` flag from the CLI-owned config (honoring DORY_CONFIG,

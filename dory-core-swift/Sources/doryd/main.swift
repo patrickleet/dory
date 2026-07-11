@@ -10,11 +10,6 @@ let machServiceName = "dev.dory.doryd"
 // Treat those as ordinary EPIPEs in the Rust dataplane instead of letting SIGPIPE terminate doryd.
 _ = signal(SIGPIPE, SIG_IGN)
 
-func fail(_ message: String) -> Never {
-    FileHandle.standardError.write(Data("doryd: \(message)\n".utf8))
-    exit(1)
-}
-
 let env = ProcessInfo.processInfo.environment
 let dorydEnvironment = DorydEnvironment(values: env)
 let socket = DorySocket(home: dorydEnvironment.home)
@@ -104,31 +99,6 @@ let shouldAutostartDockerTier = DockerTierStartupPolicy.shouldAutostartDockerTie
     environment: env,
     persistedRuntimeMode: idlePolicyStore.currentRuntimeMode()
 )
-if dockerTier == nil {
-    let socketFD: Int32
-    do {
-        socketFD = try socket.bind()
-    } catch {
-        fail("could not bind \(socket.path): \(error)")
-    }
-    _ = socketFD
-    FileHandle.standardError.write(Data("doryd: bound \(socket.path)\n".utf8))
-} else if shouldAutostartDockerTier {
-    do {
-        try dockerTier?.start()
-        FileHandle.standardError.write(Data("doryd: docker tier serving \(socketPath)\n".utf8))
-    } catch {
-        fail("could not start docker tier: \(error)")
-    }
-} else {
-    do {
-        try dockerTier?.armSleeping()
-        FileHandle.standardError.write(Data("doryd: docker tier sleeping at \(socketPath)\n".utf8))
-    } catch {
-        fail("could not arm docker tier socket: \(error)")
-    }
-}
-
 let idleSleepScheduler = dockerTier.flatMap { tier -> IdleSleepScheduler? in
     guard let baseConfiguration = dorydEnvironment.idleSleepConfiguration() else { return nil }
     return IdleSleepScheduler(
@@ -154,8 +124,6 @@ let service = DorydService(
 let delegate = DorydListenerDelegate(service: service)
 let listener = NSXPCListener(machServiceName: machServiceName)
 listener.delegate = delegate
-listener.resume()
-FileHandle.standardError.write(Data("doryd: serving XPC \(machServiceName)\n".utf8))
 
 private let shutdownCoordinator = DorydShutdownCoordinator(
     listener: listener,
@@ -169,7 +137,47 @@ private let shutdownCoordinator = DorydShutdownCoordinator(
     machineManager: machineManager,
     remoteManager: remoteManager
 )
-private let signalSources = installSignalHandlers(shutdownCoordinator: shutdownCoordinator)
+private let signalQueue = DispatchQueue(label: "dev.dory.doryd.signal-shutdown", qos: .userInitiated)
+private let signalSources = installSignalHandlers(
+    shutdownCoordinator: shutdownCoordinator,
+    queue: signalQueue
+)
+
+// Install termination handling before the first managed helper is started. Docker boot and VMM
+// handoff are deliberately synchronous, so a main-queue signal source would not run while either
+// wait is blocked. The dedicated signal queue cancels that startup through DockerTier.stop(), and
+// the tier publishes its in-flight helper early enough for the shutdown to reap it.
+if dockerTier == nil {
+    let socketFD: Int32
+    do {
+        socketFD = try socket.bind()
+    } catch {
+        shutdownCoordinator.run(reason: "could not bind \(socket.path): \(error)", exitCode: 1)
+    }
+    _ = socketFD
+    FileHandle.standardError.write(Data("doryd: bound \(socket.path)\n".utf8))
+} else if shouldAutostartDockerTier {
+    do {
+        try dockerTier?.start()
+        FileHandle.standardError.write(Data("doryd: docker tier serving \(socketPath)\n".utf8))
+    } catch {
+        shutdownCoordinator.run(reason: "could not start docker tier: \(error)", exitCode: 1)
+    }
+} else {
+    do {
+        try dockerTier?.armSleeping()
+        FileHandle.standardError.write(Data("doryd: docker tier sleeping at \(socketPath)\n".utf8))
+    } catch {
+        shutdownCoordinator.run(reason: "could not arm docker tier socket: \(error)", exitCode: 1)
+    }
+}
+
+// If SIGTERM/SIGINT raced the final return from startup, wait for the signal queue's cleanup and
+// exit instead of publishing XPC or starting another service after shutdown began.
+shutdownCoordinator.exitIfRequested()
+
+listener.resume()
+FileHandle.standardError.write(Data("doryd: serving XPC \(machServiceName)\n".utf8))
 
 if let idleSleepScheduler {
     idleSleepScheduler.start()
@@ -215,8 +223,14 @@ private final class DorydShutdownCoordinator {
     private let dockerTier: DockerTier?
     private let machineManager: MachineManager?
     private let remoteManager: RemoteMachineManager
-    private let lock = NSLock()
-    private var didRun = false
+    private let condition = NSCondition()
+    private enum State {
+        case active
+        case shuttingDown
+        case finished
+    }
+    private var state: State = .active
+    private var finalExitCode: Int32 = 0
 
     init(
         listener: NSXPCListener,
@@ -242,16 +256,25 @@ private final class DorydShutdownCoordinator {
         self.remoteManager = remoteManager
     }
 
-    func run(reason: String) -> Never {
-        lock.lock()
-        guard !didRun else {
-            lock.unlock()
-            exit(0)
+    func run(reason: String, exitCode: Int32 = 0) -> Never {
+        condition.lock()
+        guard state == .active else {
+            while state != .finished {
+                condition.wait()
+            }
+            let completedExitCode = finalExitCode
+            condition.unlock()
+            exit(completedExitCode)
         }
-        didRun = true
-        lock.unlock()
+        state = .shuttingDown
+        finalExitCode = exitCode
+        condition.unlock()
 
         FileHandle.standardError.write(Data("doryd: shutting down (\(reason))\n".utf8))
+        // Set the one-way tier latch before listener invalidation. Already-accepted XPC work may
+        // still be executing, but no engineStart/engineWake can spawn or resume a helper once this
+        // call begins; ordinary engineStop continues to use the reversible stop() path.
+        dockerTier?.shutdown()
         listener.invalidate()
         hostCLIReconciler?.stop()
         idleSleepScheduler?.stop()
@@ -261,18 +284,38 @@ private final class DorydShutdownCoordinator {
         networkingController?.stop()
         remoteManager.disconnectAll()
         machineManager?.stopAll()
-        dockerTier?.stop()
         FileHandle.standardError.write(Data("doryd: shutdown complete\n".utf8))
-        exit(0)
+
+        condition.lock()
+        state = .finished
+        condition.broadcast()
+        let completedExitCode = finalExitCode
+        condition.unlock()
+        exit(completedExitCode)
+    }
+
+    func exitIfRequested() {
+        condition.lock()
+        guard state != .active else {
+            condition.unlock()
+            return
+        }
+        while state != .finished {
+            condition.wait()
+        }
+        let completedExitCode = finalExitCode
+        condition.unlock()
+        exit(completedExitCode)
     }
 }
 
 private func installSignalHandlers(
-    shutdownCoordinator: DorydShutdownCoordinator
+    shutdownCoordinator: DorydShutdownCoordinator,
+    queue: DispatchQueue
 ) -> [DispatchSourceSignal] {
     [SIGTERM, SIGINT].map { signalNumber in
         _ = signal(signalNumber, SIG_IGN)
-        let source = DispatchSource.makeSignalSource(signal: signalNumber, queue: .main)
+        let source = DispatchSource.makeSignalSource(signal: signalNumber, queue: queue)
         source.setEventHandler {
             shutdownCoordinator.run(reason: signalNumber == SIGTERM ? "SIGTERM" : "SIGINT")
         }

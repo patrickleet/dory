@@ -1,4 +1,5 @@
 @testable import DorydKit
+import Darwin
 import XCTest
 
 final class HvProcessTests: XCTestCase {
@@ -73,5 +74,80 @@ final class HvProcessTests: XCTestCase {
             .count
         XCTAssertEqual(runs, 2)
         process.stop()
+    }
+
+    func testUnexpectedExitNotifiesSupervisor() throws {
+        let callback = expectation(description: "unexpected termination callback")
+        let captured = LockedTermination()
+        let process = HvProcess(
+            configuration: HvProcessConfiguration(
+                executablePath: "/bin/sleep",
+                arguments: ["10"]
+            ),
+            unexpectedTerminationHandler: { termination in
+                captured.set(termination)
+                callback.fulfill()
+            }
+        )
+        try process.start()
+        let pid = try XCTUnwrap(process.pid)
+
+        XCTAssertEqual(kill(pid, SIGKILL), 0)
+        wait(for: [callback], timeout: 1)
+
+        XCTAssertEqual(captured.value?.status, SIGKILL)
+        XCTAssertEqual(captured.value?.wasUncaughtSignal, true)
+        XCTAssertFalse(process.isRunning)
+    }
+
+    func testExplicitStopDoesNotNotifyUnexpectedTerminationHandler() throws {
+        let callback = expectation(description: "no unexpected callback")
+        callback.isInverted = true
+        let process = HvProcess(
+            configuration: HvProcessConfiguration(
+                executablePath: "/bin/sleep",
+                arguments: ["10"]
+            ),
+            unexpectedTerminationHandler: { _ in callback.fulfill() }
+        )
+        try process.start()
+
+        process.stop()
+        wait(for: [callback], timeout: 0.15)
+
+        XCTAssertFalse(process.isRunning)
+        XCTAssertNil(process.pid)
+    }
+
+    func testStopBeforeFirstStartPreventsLateSpawn() throws {
+        let process = HvProcess(configuration: HvProcessConfiguration(
+            executablePath: "/bin/sleep",
+            arguments: ["30"]
+        ))
+
+        process.stop()
+
+        XCTAssertThrowsError(try process.start()) { error in
+            XCTAssertTrue("\(error)".contains("start was cancelled"), "\(error)")
+        }
+        XCTAssertFalse(process.isRunning)
+        XCTAssertNil(process.pid)
+    }
+}
+
+private final class LockedTermination: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: HvProcessTermination?
+
+    var value: HvProcessTermination? {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
+
+    func set(_ termination: HvProcessTermination) {
+        lock.lock()
+        stored = termination
+        lock.unlock()
     }
 }

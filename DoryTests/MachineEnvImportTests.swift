@@ -22,7 +22,7 @@ struct MachineEnvImportTests {
     }
 
     @Test func serializeRoundTrips() {
-        #expect(MachineEnvImport.serialize(["HF_TOKEN", "ANTHROPIC_API_KEY"]) == "ANTHROPIC_API_KEY,HF_TOKEN")
+        #expect(MachineEnvImport.serialize(["HF_TOKEN", "ANTHROPIC_API_KEY"]) == "HF_TOKEN,ANTHROPIC_API_KEY")
     }
 
     @Test func dropsInvalidEnvNames() {

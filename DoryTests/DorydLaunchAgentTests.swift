@@ -145,10 +145,15 @@ struct DorydLaunchAgentTests {
         #expect(plist.contains("<string>\(contentsURL.appendingPathComponent("Resources").path)</string>"))
         #expect(plist.contains("<key>DORYD_HOST_CLI</key>"))
         #expect(plist.contains("<string>1</string>"))
+        let sizing = DorydLaunchAgent.Configuration()
         #expect(plist.contains("<key>DORYD_CPUS</key>"))
-        #expect(plist.contains("<string>2</string>"))
+        #expect(plist.contains("<string>\(sizing.cpuCount)</string>"))
         #expect(plist.contains("<key>DORYD_MEMORY_MB</key>"))
-        #expect(plist.contains("<string>2048</string>"))
+        #expect(plist.contains("<string>\(sizing.memoryMB)</string>"))
+        #expect(plist.contains("<key>DORYD_HV_RESTART_LIMIT</key>"))
+        #expect(plist.contains("<string>3</string>"))
+        #expect(plist.contains("<key>DORYD_HV_RESTART_DELAY</key>"))
+        #expect(plist.contains("<string>0.5</string>"))
         #expect(!plist.contains("<key>DORYD_AUTOSTART_DOCKER_TIER</key>"))
         #expect(plist.contains("<key>DORYD_DOMAIN_SUFFIX</key>"))
         #expect(plist.contains("<string>dory.local</string>"))
@@ -156,6 +161,14 @@ struct DorydLaunchAgentTests {
         #expect(plist.contains("<string>\(DorydLaunchAgent.logPath)</string>"))
         #expect(recorder.commands.map { $0.first ?? "" } == ["print", "bootstrap", "kickstart"])
         #expect(recorder.commands.first { $0.first == "bootstrap" }?.last == plistURL.path)
+    }
+
+    @Test func defaultEngineResourcesScaleWithHostCapacity() {
+        #expect(DorydLaunchAgent.Configuration.hostScaledCPUCount(activeProcessorCount: 12) == 10)
+        #expect(DorydLaunchAgent.Configuration.hostScaledCPUCount(activeProcessorCount: 4) == 4)
+        #expect(DorydLaunchAgent.Configuration.hostScaledCPUCount(activeProcessorCount: 2) == 2)
+        #expect(DorydLaunchAgent.Configuration.hostScaledMemoryMB(physicalMemory: 16 * 1024 * 1024 * 1024) == 8192)
+        #expect(DorydLaunchAgent.Configuration.hostScaledMemoryMB(physicalMemory: 8 * 1024 * 1024 * 1024) == 4096)
     }
 
     @Test func ensureCurrentRestartsWhenLaunchAgentEnvironmentChanges() async throws {

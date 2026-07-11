@@ -1,11 +1,72 @@
 import Darwin
 import Foundation
 
+struct DorydHostPlatform: Sendable, Equatable {
+    enum Architecture: Sendable, Equatable {
+        case arm64
+        case x86_64
+        case unsupported(String)
+
+        init(machineHardwareName: String) {
+            switch machineHardwareName {
+            case "arm64", "arm64e": self = .arm64
+            case "x86_64": self = .x86_64
+            default: self = .unsupported(machineHardwareName)
+            }
+        }
+
+        var darwinName: String {
+            switch self {
+            case .arm64: "arm64"
+            case .x86_64: "x86_64"
+            case let .unsupported(name): name
+            }
+        }
+
+        var supportsRawHV: Bool {
+            switch self {
+            case .arm64, .x86_64: true
+            case .unsupported: false
+            }
+        }
+    }
+
+    var architecture: Architecture
+    var macOSMajorVersion: Int
+    var macOSMinorVersion: Int
+
+    init(
+        architecture: Architecture,
+        macOSMajorVersion: Int,
+        macOSMinorVersion: Int = 0
+    ) {
+        self.architecture = architecture
+        self.macOSMajorVersion = macOSMajorVersion
+        self.macOSMinorVersion = macOSMinorVersion
+    }
+
+    static var current: DorydHostPlatform {
+        let version = ProcessInfo.processInfo.operatingSystemVersion
+        return DorydHostPlatform(
+            architecture: Architecture(machineHardwareName: ProcessInfo.processInfo.machineHardwareName),
+            macOSMajorVersion: version.majorVersion,
+            macOSMinorVersion: version.minorVersion
+        )
+    }
+
+    /// The shipped dory-hv slices declare macOS 15.0 in LC_BUILD_VERSION. Keep the runtime gate
+    /// at least as strict so a Sonoma host always selects the macOS 14 dory-vmm fallback.
+    var supportsRawHV: Bool {
+        architecture.supportsRawHV && macOSMajorVersion >= 15
+    }
+}
+
 public struct DorydEnvironment: Sendable {
     public var values: [String: String]
     public var home: String
     public var cwd: String
     public var executablePath: String
+    private var hostPlatform: DorydHostPlatform
 
     public init(
         values: [String: String] = ProcessInfo.processInfo.environment,
@@ -13,10 +74,27 @@ public struct DorydEnvironment: Sendable {
         cwd: String = FileManager.default.currentDirectoryPath,
         executablePath: String = ProcessInfo.processInfo.arguments.first ?? ""
     ) {
+        self.init(
+            values: values,
+            home: home,
+            cwd: cwd,
+            executablePath: executablePath,
+            hostPlatform: .current
+        )
+    }
+
+    init(
+        values: [String: String],
+        home: String? = nil,
+        cwd: String = FileManager.default.currentDirectoryPath,
+        executablePath: String = ProcessInfo.processInfo.arguments.first ?? "",
+        hostPlatform: DorydHostPlatform
+    ) {
         self.values = values
         self.home = home ?? values["DORYD_HOME"] ?? NSHomeDirectory()
         self.cwd = cwd
         self.executablePath = executablePath
+        self.hostPlatform = hostPlatform
     }
 
     public func dockerTierConfiguration() -> DockerTierConfiguration? {
@@ -222,7 +300,9 @@ public struct DorydEnvironment: Sendable {
             logPath: string("DORYD_HV_LOG") ?? "\(stateDirectory)/dory-hv.log",
             restartPolicy: HvRestartPolicy(
                 maxRestarts: int("DORYD_HV_RESTART_LIMIT") ?? 3,
-                delaySeconds: double("DORYD_HV_RESTART_DELAY") ?? 0.5
+                delaySeconds: double("DORYD_HV_RESTART_DELAY") ?? 0.5,
+                maximumDelaySeconds: double("DORYD_HV_RESTART_MAX_DELAY") ?? 5,
+                stableRunSeconds: double("DORYD_HV_RESTART_STABLE_SECONDS") ?? 30
             )
         )
     }
@@ -271,7 +351,13 @@ public struct DorydEnvironment: Sendable {
             stateDirectory: stateDirectory,
             handoffSocketPath: handoffSocket,
             logPath: string("DORYD_VMM_DOCKER_LOG") ?? "\(stateDirectory)/dory-vmm-docker.log",
-            readyTimeoutSeconds: double("DORYD_VMM_DOCKER_READY_TIMEOUT") ?? 90
+            readyTimeoutSeconds: double("DORYD_VMM_DOCKER_READY_TIMEOUT") ?? 90,
+            restartPolicy: HvRestartPolicy(
+                maxRestarts: int("DORYD_HV_RESTART_LIMIT") ?? 3,
+                delaySeconds: double("DORYD_HV_RESTART_DELAY") ?? 0.5,
+                maximumDelaySeconds: double("DORYD_HV_RESTART_MAX_DELAY") ?? 5,
+                stableRunSeconds: double("DORYD_HV_RESTART_STABLE_SECONDS") ?? 30
+            )
         )
     }
 
@@ -345,7 +431,7 @@ public struct DorydEnvironment: Sendable {
     }
 
     private var hostDarwinArch: String {
-        ProcessInfo.processInfo.machineHardwareName == "x86_64" ? "x86_64" : "arm64"
+        hostPlatform.architecture.darwinName
     }
 
     private var hostGuestArch: String {
@@ -353,14 +439,9 @@ public struct DorydEnvironment: Sendable {
     }
 
     private var rawHVSupported: Bool {
+        guard hostPlatform.supportsRawHV else { return false }
         if string("DORYD_RAW_HV_SUPPORTED") != nil {
             return bool("DORYD_RAW_HV_SUPPORTED", default: true)
-        }
-        if hostDarwinArch == "arm64" {
-            if #available(macOS 15, *) {
-                return true
-            }
-            return false
         }
         return true
     }
@@ -394,11 +475,23 @@ public struct DorydEnvironment: Sendable {
     }
 
     private func clampedCPUs() -> Int {
-        max(1, int("DORYD_CPUS") ?? 4)
+        max(1, int("DORYD_CPUS") ?? Self.hostScaledCPUCount())
     }
 
     private func clampedMemoryMB() -> Int {
-        max(256, int("DORYD_MEMORY_MB") ?? 2048)
+        max(256, int("DORYD_MEMORY_MB") ?? Self.hostScaledMemoryMB())
+    }
+
+    /// Keep standalone doryd launches on the same elastic host-scaled defaults as Dory.app's
+    /// LaunchAgent. Explicit DORYD_CPUS / DORYD_MEMORY_MB values always win.
+    public static func hostScaledCPUCount(activeProcessorCount: Int = ProcessInfo.processInfo.activeProcessorCount) -> Int {
+        let available = max(1, activeProcessorCount)
+        return min(available, max(4, available - 2))
+    }
+
+    public static func hostScaledMemoryMB(physicalMemory: UInt64 = ProcessInfo.processInfo.physicalMemory) -> Int {
+        let hostMB = Int(clamping: physicalMemory / (1024 * 1024))
+        return max(2048, min(hostMB / 2, hostMB - 4096))
     }
 
     private func clampedDockerPort() -> UInt32 {

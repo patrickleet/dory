@@ -4,14 +4,45 @@ import Foundation
 public struct HvRestartPolicy: Sendable, Equatable {
     public var maxRestarts: Int
     public var delaySeconds: TimeInterval
+    public var maximumDelaySeconds: TimeInterval
+    public var stableRunSeconds: TimeInterval
 
-    public init(maxRestarts: Int = 0, delaySeconds: TimeInterval = 0.25) {
+    public init(
+        maxRestarts: Int = 0,
+        delaySeconds: TimeInterval = 0.25,
+        maximumDelaySeconds: TimeInterval = 5,
+        stableRunSeconds: TimeInterval = 30
+    ) {
         self.maxRestarts = max(0, maxRestarts)
         self.delaySeconds = max(0, delaySeconds)
+        self.maximumDelaySeconds = max(self.delaySeconds, maximumDelaySeconds)
+        self.stableRunSeconds = max(0, stableRunSeconds)
     }
 
     public static let none = HvRestartPolicy()
+
+    public func delay(forAttempt attempt: Int) -> TimeInterval {
+        guard attempt > 0, delaySeconds > 0 else { return 0 }
+        let exponent = min(attempt - 1, 20)
+        return min(maximumDelaySeconds, delaySeconds * pow(2, Double(exponent)))
+    }
 }
+
+public struct HvProcessTermination: Sendable, Equatable {
+    public var status: Int32
+    public var wasUncaughtSignal: Bool
+
+    public init(status: Int32, wasUncaughtSignal: Bool) {
+        self.status = status
+        self.wasUncaughtSignal = wasUncaughtSignal
+    }
+
+    public var description: String {
+        wasUncaughtSignal ? "terminated by signal \(status)" : "exited with status \(status)"
+    }
+}
+
+public typealias HvProcessUnexpectedTerminationHandler = @Sendable (HvProcessTermination) -> Void
 
 public struct HvProcessConfiguration: Sendable {
     public var executablePath: String
@@ -39,6 +70,7 @@ public final class HvProcess: @unchecked Sendable {
     public enum ProcessError: Error, CustomStringConvertible {
         case alreadyRunning
         case executableMissing(String)
+        case startCancelled
 
         public var description: String {
             switch self {
@@ -46,22 +78,30 @@ public final class HvProcess: @unchecked Sendable {
                 return "dory-hv is already running"
             case .executableMissing(let path):
                 return "dory-hv executable missing: \(path)"
+            case .startCancelled:
+                return "dory-hv start was cancelled"
             }
         }
     }
 
     private let configuration: HvProcessConfiguration
+    private let unexpectedTerminationHandler: HvProcessUnexpectedTerminationHandler?
     private let lock = NSLock()
     private var process: Process?
     private var logHandle: FileHandle?
     private var stopping = false
+    private var hasStarted = false
     private var suspended = false
     private var restartCount = 0
     private var lastTerminationStatus: Int32?
     private var lastLaunchError: String?
 
-    public init(configuration: HvProcessConfiguration) {
+    public init(
+        configuration: HvProcessConfiguration,
+        unexpectedTerminationHandler: HvProcessUnexpectedTerminationHandler? = nil
+    ) {
         self.configuration = configuration
+        self.unexpectedTerminationHandler = unexpectedTerminationHandler
     }
 
     public var pid: Int32? {
@@ -95,6 +135,13 @@ public final class HvProcess: @unchecked Sendable {
         if process?.isRunning == true {
             throw ProcessError.alreadyRunning
         }
+        // A DockerTier shutdown can publish and stop this newly-created process object just
+        // before the startup thread enters start(). Do not erase that cancellation and spawn a
+        // child after the shutdown caller has already returned.
+        if stopping, !hasStarted {
+            throw ProcessError.startCancelled
+        }
+        hasStarted = true
         stopping = false
         suspended = false
         restartCount = 0
@@ -137,6 +184,11 @@ public final class HvProcess: @unchecked Sendable {
         let oldLog: FileHandle?
         let shouldRestart: Bool
         let delay: TimeInterval
+        let wasUnexpected: Bool
+        let termination = HvProcessTermination(
+            status: task.terminationStatus,
+            wasUncaughtSignal: task.terminationReason == .uncaughtSignal
+        )
         lock.lock()
         guard process === task else {
             lock.unlock()
@@ -147,13 +199,18 @@ public final class HvProcess: @unchecked Sendable {
         suspended = false
         oldLog = logHandle
         logHandle = nil
-        shouldRestart = !stopping && restartCount < configuration.restartPolicy.maxRestarts
+        wasUnexpected = !stopping
+        shouldRestart = wasUnexpected && restartCount < configuration.restartPolicy.maxRestarts
         if shouldRestart {
             restartCount += 1
         }
-        delay = configuration.restartPolicy.delaySeconds
+        delay = configuration.restartPolicy.delay(forAttempt: restartCount)
         lock.unlock()
         try? oldLog?.close()
+
+        if wasUnexpected {
+            unexpectedTerminationHandler?(termination)
+        }
 
         guard shouldRestart else { return }
         DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in

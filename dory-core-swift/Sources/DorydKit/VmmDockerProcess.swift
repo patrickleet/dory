@@ -8,6 +8,7 @@ public struct VmmDockerProcessConfiguration: Sendable {
     public var handoffSocketPath: String
     public var logPath: String?
     public var readyTimeoutSeconds: TimeInterval
+    public var restartPolicy: HvRestartPolicy
 
     public init(
         executablePath: String,
@@ -15,7 +16,8 @@ public struct VmmDockerProcessConfiguration: Sendable {
         stateDirectory: String,
         handoffSocketPath: String,
         logPath: String? = nil,
-        readyTimeoutSeconds: TimeInterval = 90
+        readyTimeoutSeconds: TimeInterval = 90,
+        restartPolicy: HvRestartPolicy = HvRestartPolicy(maxRestarts: 3, delaySeconds: 0.5)
     ) {
         self.executablePath = executablePath
         self.arguments = arguments
@@ -23,6 +25,7 @@ public struct VmmDockerProcessConfiguration: Sendable {
         self.handoffSocketPath = handoffSocketPath
         self.logPath = logPath
         self.readyTimeoutSeconds = readyTimeoutSeconds
+        self.restartPolicy = restartPolicy
     }
 }
 
@@ -30,6 +33,7 @@ public final class VmmDockerProcess: @unchecked Sendable {
     public enum ProcessError: Error, CustomStringConvertible {
         case alreadyRunning
         case executableMissing(String)
+        case startCancelled
         case handoffTimeout
         case handoffFailed(String)
 
@@ -39,6 +43,8 @@ public final class VmmDockerProcess: @unchecked Sendable {
                 return "dory-vmm docker helper is already running"
             case .executableMissing(let path):
                 return "dory-vmm executable missing: \(path)"
+            case .startCancelled:
+                return "dory-vmm docker helper start was cancelled"
             case .handoffTimeout:
                 return "dory-vmm docker helper did not become ready before timeout"
             case .handoffFailed(let message):
@@ -48,16 +54,24 @@ public final class VmmDockerProcess: @unchecked Sendable {
     }
 
     private let configuration: VmmDockerProcessConfiguration
+    private let unexpectedTerminationHandler: HvProcessUnexpectedTerminationHandler?
     private let lock = NSLock()
     private var process: Process?
     private var handoffServer: VmmHandoffServer?
+    private var handoffWaiter: DispatchSemaphore?
     private var logHandle: FileHandle?
     private var suspended = false
     private var starting = false
+    private var stopping = false
+    private var hasStarted = false
     private var lastReady: VmmReadyMessage?
 
-    public init(configuration: VmmDockerProcessConfiguration) {
+    public init(
+        configuration: VmmDockerProcessConfiguration,
+        unexpectedTerminationHandler: HvProcessUnexpectedTerminationHandler? = nil
+    ) {
         self.configuration = configuration
+        self.unexpectedTerminationHandler = unexpectedTerminationHandler
     }
 
     public var pid: Int32? {
@@ -87,7 +101,16 @@ public final class VmmDockerProcess: @unchecked Sendable {
             lock.unlock()
             throw ProcessError.alreadyRunning
         }
+        // Preserve a stop that won the race before this first start. Clearing it here would let
+        // the VMM spawn after DockerTier.stop() had already completed, recreating the launchd
+        // orphan window this class is responsible for closing.
+        if stopping, !hasStarted {
+            lock.unlock()
+            throw ProcessError.startCancelled
+        }
+        hasStarted = true
         starting = true
+        stopping = false
         lock.unlock()
 
         do {
@@ -99,6 +122,12 @@ public final class VmmDockerProcess: @unchecked Sendable {
             throw error
         }
         lock.lock()
+        guard !stopping, process?.isRunning == true else {
+            starting = false
+            lock.unlock()
+            stop(signal: SIGTERM, timeout: 5)
+            throw ProcessError.startCancelled
+        }
         starting = false
         lock.unlock()
     }
@@ -117,6 +146,16 @@ public final class VmmDockerProcess: @unchecked Sendable {
         }
         try server.start()
 
+        lock.lock()
+        guard starting, !stopping else {
+            lock.unlock()
+            server.stop()
+            throw ProcessError.startCancelled
+        }
+        handoffServer = server
+        handoffWaiter = semaphore
+        lock.unlock()
+
         let task = Process()
         task.executableURL = URL(fileURLWithPath: configuration.executablePath)
         task.arguments = configuration.arguments
@@ -127,37 +166,69 @@ public final class VmmDockerProcess: @unchecked Sendable {
             self?.handleTermination(task)
         }
 
+        // Keep the process assignment atomic with run() relative to the termination callback. A
+        // helper that exits immediately must not leave a dead Process installed after its callback
+        // already observed `process == nil`.
         lock.lock()
-        handoffServer = server
+        guard starting, !stopping else {
+            if handoffServer === server {
+                handoffServer = nil
+            }
+            if handoffWaiter === semaphore {
+                handoffWaiter = nil
+            }
+            lock.unlock()
+            server.stop()
+            try? log?.close()
+            throw ProcessError.startCancelled
+        }
         logHandle = log
-        lock.unlock()
-
         do {
             try task.run()
         } catch {
+            lock.unlock()
             server.stop()
             try? log?.close()
             lock.lock()
             handoffServer = nil
+            handoffWaiter = nil
             logHandle = nil
             lock.unlock()
             throw error
         }
-
-        lock.lock()
         process = task
         suspended = false
         lock.unlock()
 
         let timeoutMilliseconds = Int(configuration.readyTimeoutSeconds * 1000)
         let deadline = DispatchTime.now() + .milliseconds(max(1, timeoutMilliseconds))
-        guard semaphore.wait(timeout: deadline) == .success else {
+        let waitResult = semaphore.wait(timeout: deadline)
+        lock.lock()
+        if handoffWaiter === semaphore {
+            handoffWaiter = nil
+        }
+        let startWasCancelled = stopping || !starting
+        lock.unlock()
+        guard !startWasCancelled else {
+            server.stop()
+            throw ProcessError.startCancelled
+        }
+        guard waitResult == .success else {
             stop(signal: SIGTERM, timeout: 5)
             throw ProcessError.handoffTimeout
         }
         switch result.value {
         case .success(let handoff)?:
             lock.lock()
+            guard !stopping, starting, process?.isRunning == true else {
+                lastReady = nil
+                let cancelled = stopping || !starting
+                lock.unlock()
+                if cancelled {
+                    throw ProcessError.startCancelled
+                }
+                throw ProcessError.handoffFailed("helper exited immediately after handoff")
+            }
             lastReady = handoff.ready
             lock.unlock()
             return
@@ -173,6 +244,12 @@ public final class VmmDockerProcess: @unchecked Sendable {
     private func handleTermination(_ task: Process) {
         let oldLog: FileHandle?
         let server: VmmHandoffServer?
+        let waiter: DispatchSemaphore?
+        let wasUnexpected: Bool
+        let termination = HvProcessTermination(
+            status: task.terminationStatus,
+            wasUncaughtSignal: task.terminationReason == .uncaughtSignal
+        )
         lock.lock()
         guard process === task else {
             lock.unlock()
@@ -184,10 +261,17 @@ public final class VmmDockerProcess: @unchecked Sendable {
         logHandle = nil
         server = handoffServer
         handoffServer = nil
+        waiter = handoffWaiter
+        handoffWaiter = nil
         lastReady = nil
+        wasUnexpected = !stopping
         lock.unlock()
         server?.stop()
+        waiter?.signal()
         try? oldLog?.close()
+        if wasUnexpected {
+            unexpectedTerminationHandler?(termination)
+        }
     }
 
     @discardableResult
@@ -217,11 +301,15 @@ public final class VmmDockerProcess: @unchecked Sendable {
         let server: VmmHandoffServer?
         let log: FileHandle?
         let wasSuspended: Bool
+        let waiter: DispatchSemaphore?
         lock.lock()
+        stopping = true
         task = process
         process = nil
         server = handoffServer
         handoffServer = nil
+        waiter = handoffWaiter
+        handoffWaiter = nil
         log = logHandle
         logHandle = nil
         wasSuspended = suspended
@@ -230,6 +318,7 @@ public final class VmmDockerProcess: @unchecked Sendable {
         lock.unlock()
 
         server?.stop()
+        waiter?.signal()
         defer { try? log?.close() }
         guard let task, task.isRunning else { return }
         if wasSuspended {

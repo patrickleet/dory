@@ -148,7 +148,7 @@ func usage(exitCode: Int32 = 2) -> Never {
           dorydctl [--mach-service NAME] [--timeout SECONDS] protocol-version
           dorydctl [global] socket-path
           dorydctl [global] engine status|start|stop|sleep|wake
-          dorydctl [global] docker agent-info|ports|telemetry
+          dorydctl [global] docker agent-info|ports|telemetry|clock-sync
           dorydctl [global] machine list
           dorydctl [global] machine status NAME
           dorydctl [global] machine create NAME --kernel PATH --rootfs PATH [--memory-mb N] [--cpus N] [--address IPv4] [--share TAG=HOST:GUEST[:ro|rw]] [--env KEY=VALUE]
@@ -426,7 +426,7 @@ func runIdle(cursor: inout ArgumentCursor, client: DorydCtlClient) throws {
 }
 
 func runDocker(cursor: inout ArgumentCursor, client: DorydCtlClient) throws {
-    let subcommand = try cursor.take("usage: dorydctl docker agent-info|ports|telemetry")
+    let subcommand = try cursor.take("usage: dorydctl docker agent-info|ports|telemetry|clock-sync")
     let response: NSDictionary
     switch subcommand {
     case "agent-info", "info":
@@ -444,6 +444,12 @@ func runDocker(cursor: inout ArgumentCursor, client: DorydCtlClient) throws {
     case "telemetry":
         response = try client.call { proxy, finish in
             proxy.dockerAgentTelemetry { body, message in
+                message.isEmpty ? finish(.success(body)) : finish(.failure(DorydCtlError.daemon(message)))
+            }
+        }
+    case "clock-sync":
+        response = try client.call { proxy, finish in
+            proxy.dockerAgentClockSync { body, message in
                 message.isEmpty ? finish(.success(body)) : finish(.failure(DorydCtlError.daemon(message)))
             }
         }

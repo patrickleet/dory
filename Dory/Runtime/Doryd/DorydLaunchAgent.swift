@@ -30,8 +30,8 @@ enum DorydLaunchAgent {
             httpProxyPort: UInt16 = 8080,
             httpsProxyPort: UInt16 = 8443,
             hostCLIEnabled: Bool = true,
-            cpuCount: UInt16 = 2,
-            memoryMB: UInt32 = 2048
+            cpuCount: UInt16? = nil,
+            memoryMB: UInt32? = nil
         ) {
             self.domainSuffix = domainSuffix
             self.idleSleepAfterSeconds = idleSleepAfterSeconds
@@ -39,8 +39,21 @@ enum DorydLaunchAgent {
             self.httpProxyPort = httpProxyPort
             self.httpsProxyPort = httpsProxyPort
             self.hostCLIEnabled = hostCLIEnabled
-            self.cpuCount = max(1, cpuCount)
-            self.memoryMB = max(256, memoryMB)
+            self.cpuCount = max(1, cpuCount ?? Self.hostScaledCPUCount())
+            self.memoryMB = max(256, memoryMB ?? Self.hostScaledMemoryMB())
+        }
+
+        /// Reserve two logical cores for macOS. The memory value is a ceiling, not an idle
+        /// reservation: dory-hv's free-page reporting returns unused guest pages to the host.
+        nonisolated static func hostScaledCPUCount(activeProcessorCount: Int = ProcessInfo.processInfo.activeProcessorCount) -> UInt16 {
+            let available = max(1, activeProcessorCount)
+            return UInt16(clamping: min(available, max(4, available - 2)))
+        }
+
+        nonisolated static func hostScaledMemoryMB(physicalMemory: UInt64 = ProcessInfo.processInfo.physicalMemory) -> UInt32 {
+            let hostMB = Int(clamping: physicalMemory / (1024 * 1024))
+            let ceiling = max(2048, min(hostMB / 2, hostMB - 4096))
+            return UInt32(clamping: ceiling)
         }
     }
 
@@ -337,6 +350,10 @@ enum DorydLaunchAgent {
                 <string>\(configuration.cpuCount)</string>
                 <key>DORYD_MEMORY_MB</key>
                 <string>\(configuration.memoryMB)</string>
+                <key>DORYD_HV_RESTART_LIMIT</key>
+                <string>3</string>
+                <key>DORYD_HV_RESTART_DELAY</key>
+                <string>0.5</string>
                 <key>DORYD_NETWORKING</key>
                 <string>1</string>
                 <key>DORYD_DOMAIN_SUFFIX</key>

@@ -12,6 +12,7 @@ public final class DataplaneActivityServer: @unchecked Sendable {
     private let onWake: @Sendable () async -> Void
     private let queue = DispatchQueue(label: "dev.dory.doryd.activity")
     private var source: DispatchSourceRead?
+    private var boundIdentity: (device: dev_t, inode: ino_t)?
 
     public init(
         path: String,
@@ -58,17 +59,32 @@ public final class DataplaneActivityServer: @unchecked Sendable {
         readSource.setEventHandler { [weak self] in
             self?.acceptAvailable(listener: fd)
         }
-        readSource.setCancelHandler { [path] in
+        readSource.setCancelHandler {
             close(fd)
-            unlink(path)
+        }
+        var info = stat()
+        if lstat(path, &info) == 0 {
+            boundIdentity = (info.st_dev, info.st_ino)
+        } else {
+            boundIdentity = nil
         }
         source = readSource
         readSource.resume()
     }
 
     public func stop() {
-        source?.cancel()
+        guard let currentSource = source else { return }
         source = nil
+        if let boundIdentity {
+            var info = stat()
+            if lstat(path, &info) == 0,
+               info.st_dev == boundIdentity.device,
+               info.st_ino == boundIdentity.inode {
+                unlink(path)
+            }
+        }
+        self.boundIdentity = nil
+        currentSource.cancel()
     }
 
     private func bind(fd: Int32, path: String) throws {

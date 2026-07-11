@@ -134,6 +134,52 @@ final class HealthReporterTests: XCTestCase {
         XCTAssertEqual(report.results.first { $0.id == "disk.docker" }?.code, "disk.docker_df_ok")
     }
 
+    func testReportNeverPassesEngineAfterManagedChildExit() throws {
+        let base = "/tmp/dory-health-dead-helper-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+        let tier = DockerTier(
+            configuration: DockerTierConfiguration(
+                home: base + "/home",
+                forwardSocketPath: base + "/forward.sock",
+                activitySocketPath: base + "/activity.sock",
+                hvProcess: HvProcessConfiguration(
+                    executablePath: "/bin/sleep",
+                    arguments: ["30"],
+                    restartPolicy: .none
+                )
+            ),
+            idleController: IdleController(),
+            dockerReadyWaiter: { _, _, _ in true }
+        )
+        try tier.start()
+        defer { tier.stop() }
+        let helperPID = try XCTUnwrap(tier.status().hvPID)
+        XCTAssertEqual(kill(helperPID, SIGKILL), 0)
+
+        let deadline = Date().addingTimeInterval(1)
+        while tier.status().state != .failed, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+        XCTAssertEqual(tier.status().state, .failed)
+        XCTAssertNil(tier.status().hvPID)
+
+        let reporter = HealthReporter(
+            socketPath: tier.socketPath,
+            dockerTier: tier,
+            remoteManager: nil,
+            dockerAPIProbe: HealthFakeDockerAPIProbe(result: .unreachable("missing")),
+            commandRunner: HealthFakeCommandRunner(),
+            registryProbe: HealthFakeRegistryProbe(),
+            environment: ["PATH": base + "/bin", "DORY_CONFIG": base + "/config.json"],
+            home: base
+        )
+        let engine = try XCTUnwrap(reporter.report().results.first { $0.id == "engine.status" })
+        XCTAssertEqual(engine.status, .fail)
+        XCTAssertEqual(engine.code, "engine.failed")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tier.socketPath))
+    }
+
     func testDoctorReportSkipsDockerVersionWhenDorydEngineIsSleeping() throws {
         let base = "/tmp/dory-health-sleeping-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
         let bin = base + "/bin"
@@ -154,7 +200,7 @@ final class HealthReporterTests: XCTestCase {
                 )
             ),
             idleController: IdleController(now: Date(timeIntervalSince1970: 0)),
-            dockerReadyWaiter: { _, _ in true }
+            dockerReadyWaiter: { _, _, _ in true }
         )
         try tier.armSleeping()
         defer { tier.stop() }
@@ -261,6 +307,161 @@ final class HealthReporterTests: XCTestCase {
         XCTAssertEqual(codesByID["docker.context.current"], "context.active")
         XCTAssertEqual(codesByID["docker.context.dory"], "context.dory_ok")
     }
+
+    func testMemoryCheckReportsCompletePhysicalFootprintForWholeProcessSet() throws {
+        let daemonPID = getpid()
+        let reporter = HealthReporter(
+            socketPath: "/tmp/dory-health-memory-missing.sock",
+            dockerTier: nil,
+            remoteManager: nil,
+            dockerAPIProbe: HealthFakeDockerAPIProbe(result: .unreachable("missing")),
+            commandRunner: HealthFakeCommandRunner(),
+            registryProbe: HealthFakeRegistryProbe(),
+            environment: ["PATH": "/nonexistent"],
+            home: "/tmp",
+            memorySampler: HealthFakeMemorySampler(snapshot: DoryProcessMemorySnapshot(
+                usages: [
+                    DoryProcessMemoryUsage(
+                        pid: daemonPID,
+                        residentSizeBytes: 100,
+                        physicalFootprintBytes: 200
+                    ),
+                    DoryProcessMemoryUsage(
+                        pid: 91_001,
+                        residentSizeBytes: 300,
+                        physicalFootprintBytes: 500
+                    ),
+                    DoryProcessMemoryUsage(
+                        pid: 91_002,
+                        residentSizeBytes: 700,
+                        physicalFootprintBytes: 1_100
+                    ),
+                ],
+                managedHelperTreePIDs: [91_001, 91_002],
+                complete: true,
+                errors: []
+            ))
+        )
+
+        let memory = try XCTUnwrap(reporter.doctorReport().results.first { $0.id == "memory.footprint" })
+        XCTAssertEqual(memory.status, .pass)
+        XCTAssertEqual(memory.code, "memory.footprint_ok")
+        XCTAssertTrue(memory.detail.contains("summed physical footprint"))
+        XCTAssertTrue(memory.detail.contains("shared pages may be counted more than once"))
+        XCTAssertFalse(memory.detail.contains("host RSS"))
+        XCTAssertEqual(memory.data["phys_footprint_bytes"], "1800")
+        XCTAssertEqual(memory.data["daemon_phys_footprint_bytes"], "200")
+        XCTAssertEqual(memory.data["managed_helper_tree_phys_footprint_bytes"], "1600")
+        XCTAssertEqual(memory.data["rss_bytes"], "1100")
+        XCTAssertEqual(memory.data["rss_kind"], "current_resident_size")
+        XCTAssertEqual(memory.data["rss_scope"], "dory_process_set")
+        XCTAssertEqual(memory.data["process_set_complete"], "true")
+        XCTAssertEqual(
+            memory.data["phys_footprint_aggregation"],
+            "sum_of_per_process_charges_may_double_count_shared_pages"
+        )
+    }
+
+    func testMemoryCheckLabelsPartialPhysicalFootprintAndWarns() throws {
+        let daemonPID = getpid()
+        let reporter = HealthReporter(
+            socketPath: "/tmp/dory-health-memory-partial.sock",
+            dockerTier: nil,
+            remoteManager: nil,
+            dockerAPIProbe: HealthFakeDockerAPIProbe(result: .unreachable("missing")),
+            commandRunner: HealthFakeCommandRunner(),
+            registryProbe: HealthFakeRegistryProbe(),
+            environment: ["PATH": "/nonexistent"],
+            home: "/tmp",
+            memorySampler: HealthFakeMemorySampler(snapshot: DoryProcessMemorySnapshot(
+                usages: [DoryProcessMemoryUsage(
+                    pid: daemonPID,
+                    residentSizeBytes: 100,
+                    physicalFootprintBytes: 200
+                )],
+                managedHelperTreePIDs: [],
+                complete: false,
+                errors: ["pid 91001: No such process"]
+            ))
+        )
+
+        let memory = try XCTUnwrap(reporter.doctorReport().results.first { $0.id == "memory.footprint" })
+        XCTAssertEqual(memory.status, .warn)
+        XCTAssertEqual(memory.code, "memory.footprint_partial")
+        XCTAssertTrue(memory.detail.hasPrefix("at least 200 B summed physical footprint"))
+        XCTAssertEqual(memory.data["phys_footprint_scope"], "partial_dory_process_set")
+        XCTAssertEqual(memory.data["rss_scope"], "partial_dory_process_set")
+        XCTAssertEqual(memory.data["process_set_complete"], "false")
+        XCTAssertEqual(memory.data["sampling_errors"], "pid 91001: No such process")
+    }
+
+    func testMemoryCheckLabelsDaemonPeakRSSAsFallbackWhenFootprintUnavailable() throws {
+        let reporter = HealthReporter(
+            socketPath: "/tmp/dory-health-memory-unavailable.sock",
+            dockerTier: nil,
+            remoteManager: nil,
+            dockerAPIProbe: HealthFakeDockerAPIProbe(result: .unreachable("missing")),
+            commandRunner: HealthFakeCommandRunner(),
+            registryProbe: HealthFakeRegistryProbe(),
+            environment: ["PATH": "/nonexistent"],
+            home: "/tmp",
+            memorySampler: HealthFakeMemorySampler(snapshot: DoryProcessMemorySnapshot(
+                usages: [],
+                managedHelperTreePIDs: [],
+                complete: false,
+                errors: ["sampling unavailable"]
+            ))
+        )
+
+        let memory = try XCTUnwrap(reporter.doctorReport().results.first { $0.id == "memory.footprint" })
+        XCTAssertEqual(memory.status, .warn)
+        XCTAssertEqual(memory.code, "memory.footprint_unavailable")
+        XCTAssertTrue(memory.detail.contains("daemon-only peak RSS fallback"))
+        XCTAssertEqual(memory.data["physical_footprint_available"], "false")
+        XCTAssertEqual(memory.data["rss_kind"], "peak_resident_size")
+        XCTAssertEqual(memory.data["rss_scope"], "daemon_self")
+        XCTAssertEqual(memory.data["rss_source"], "getrusage.RUSAGE_SELF.ru_maxrss")
+    }
+
+    func testDarwinMemorySamplerIncludesManagedHelperDescendants() throws {
+        let helper = Process()
+        helper.executableURL = URL(fileURLWithPath: "/bin/sh")
+        helper.arguments = [
+            "-c",
+            "trap 'kill \"$child\" 2>/dev/null; wait \"$child\" 2>/dev/null' TERM EXIT; sleep 30 & child=$!; wait $child",
+        ]
+        try helper.run()
+        defer {
+            if helper.isRunning {
+                helper.terminate()
+                helper.waitUntilExit()
+            }
+        }
+
+        let sampler = DarwinDoryProcessMemorySampler()
+        var snapshot = sampler.snapshot(
+            daemonPID: getpid(),
+            managedHelperPID: helper.processIdentifier
+        )
+        let deadline = Date().addingTimeInterval(2)
+        while snapshot.managedHelperTreePIDs.count < 2, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+            snapshot = sampler.snapshot(
+                daemonPID: getpid(),
+                managedHelperPID: helper.processIdentifier
+            )
+        }
+
+        XCTAssertTrue(snapshot.complete, snapshot.errors.joined(separator: "; "))
+        XCTAssertTrue(snapshot.managedHelperTreePIDs.contains(helper.processIdentifier))
+        XCTAssertGreaterThanOrEqual(snapshot.managedHelperTreePIDs.count, 2)
+        let helperTreeUsages = snapshot.usages.filter {
+            snapshot.managedHelperTreePIDs.contains($0.pid)
+        }
+        XCTAssertGreaterThanOrEqual(helperTreeUsages.count, 2)
+        XCTAssertTrue(helperTreeUsages.allSatisfy { $0.residentSizeBytes > 0 })
+        XCTAssertTrue(helperTreeUsages.allSatisfy { $0.physicalFootprintBytes > 0 })
+    }
 }
 
 private final class HealthFakeSSHKeyStore: SSHKeyStore, @unchecked Sendable {
@@ -274,6 +475,14 @@ private struct HealthFakeDockerAPIProbe: DockerAPIProbing {
 
     func ping(socketPath: String) -> DockerAPIPingResult {
         result
+    }
+}
+
+private struct HealthFakeMemorySampler: DoryProcessMemorySampling {
+    var snapshot: DoryProcessMemorySnapshot
+
+    func snapshot(daemonPID: Int32, managedHelperPID: Int32?) -> DoryProcessMemorySnapshot {
+        snapshot
     }
 }
 

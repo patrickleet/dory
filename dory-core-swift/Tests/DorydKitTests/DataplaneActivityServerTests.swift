@@ -31,6 +31,25 @@ final class DataplaneActivityServerTests: XCTestCase {
         }
         XCTAssertEqual(idle.snapshot.activeRequests, 0)
     }
+
+    func testStoppingOldServerDoesNotUnlinkReplacementSocket() throws {
+        let base = "/tmp/dory-activity-replace-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+        let path = base + "/activity.sock"
+        let idle = IdleController()
+        let old = DataplaneActivityServer(path: path, idle: idle) {}
+        let replacement = DataplaneActivityServer(path: path, idle: idle) {}
+
+        try old.start()
+        try replacement.start()
+        defer { replacement.stop() }
+        old.stop()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+        try writeActivity("begin\tGET\t/_ping\n", to: path)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+    }
 }
 
 private func writeActivity(_ line: String, to path: String) throws {

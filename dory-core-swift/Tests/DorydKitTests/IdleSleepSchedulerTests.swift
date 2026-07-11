@@ -74,7 +74,7 @@ final class IdleSleepSchedulerTests: XCTestCase {
             ),
             idleController: idle,
             containerActivityProbe: { _ in activity },
-            dockerReadyWaiter: { _, _ in true }
+            dockerReadyWaiter: { _, _, _ in true }
         )
     }
 

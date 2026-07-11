@@ -85,6 +85,132 @@ private func iso8601String(_ date: Date) -> String {
     return formatter.string(from: date)
 }
 
+struct DoryProcessMemoryUsage: Sendable, Equatable {
+    var pid: Int32
+    var residentSizeBytes: Int64
+    var physicalFootprintBytes: Int64
+}
+
+struct DoryProcessMemorySnapshot: Sendable, Equatable {
+    var usages: [DoryProcessMemoryUsage]
+    var managedHelperTreePIDs: Set<Int32>
+    var complete: Bool
+    var errors: [String]
+}
+
+protocol DoryProcessMemorySampling: Sendable {
+    func snapshot(daemonPID: Int32, managedHelperPID: Int32?) -> DoryProcessMemorySnapshot
+}
+
+/// Reads live memory charges from the kernel rather than a process lifetime high-water mark.
+///
+/// A Dory engine is a process tree: doryd owns dory-hv (or dory-vmm), which in turn owns helpers
+/// such as gvproxy. Summing only doryd's `ru_maxrss` misses the VM's physical memory charge. Keep
+/// the enumeration and every sample in one snapshot so callers can label a raced/partial result
+/// honestly instead of presenting it as the whole engine.
+struct DarwinDoryProcessMemorySampler: DoryProcessMemorySampling {
+    private static let initialChildCapacity = 16
+    private static let maximumChildCapacity = 4_096
+
+    func snapshot(daemonPID: Int32, managedHelperPID: Int32?) -> DoryProcessMemorySnapshot {
+        var processPIDs: Set<Int32> = [daemonPID]
+        var helperTreePIDs: Set<Int32> = []
+        var pending: [Int32] = [daemonPID]
+        if let managedHelperPID, managedHelperPID > 0 {
+            processPIDs.insert(managedHelperPID)
+            helperTreePIDs.insert(managedHelperPID)
+            pending.append(managedHelperPID)
+        }
+
+        var processed: Set<Int32> = []
+        var errors: [String] = []
+        var complete = true
+        while let parentPID = pending.popLast() {
+            guard processed.insert(parentPID).inserted else { continue }
+            let children = directChildren(of: parentPID)
+            if let error = children.error {
+                complete = false
+                errors.append("children of pid \(parentPID): \(error)")
+            }
+            if children.truncated {
+                complete = false
+                errors.append("children of pid \(parentPID): process list exceeded safety limit")
+            }
+            let parentIsInHelperTree = helperTreePIDs.contains(parentPID)
+            for childPID in children.pids where childPID > 0 {
+                if parentIsInHelperTree {
+                    helperTreePIDs.insert(childPID)
+                }
+                if processPIDs.insert(childPID).inserted {
+                    pending.append(childPID)
+                }
+            }
+        }
+
+        var usages: [DoryProcessMemoryUsage] = []
+        for pid in processPIDs.sorted() {
+            switch usage(of: pid) {
+            case .success(let usage):
+                usages.append(usage)
+            case .failure(let error):
+                complete = false
+                errors.append("pid \(pid): \(error)")
+            }
+        }
+        return DoryProcessMemorySnapshot(
+            usages: usages,
+            managedHelperTreePIDs: helperTreePIDs,
+            complete: complete,
+            errors: errors
+        )
+    }
+
+    private func directChildren(of pid: Int32) -> (pids: [Int32], truncated: Bool, error: String?) {
+        var capacity = Self.initialChildCapacity
+        while true {
+            var pids = [pid_t](repeating: 0, count: capacity)
+            let count = pids.withUnsafeMutableBytes { buffer -> Int32 in
+                proc_listchildpids(pid, buffer.baseAddress, Int32(buffer.count))
+            }
+            guard count >= 0 else {
+                return ([], false, String(cString: strerror(errno)))
+            }
+            if count < capacity {
+                return (Array(pids[0..<Int(count)]), false, nil)
+            }
+            guard capacity < Self.maximumChildCapacity else {
+                return (Array(pids[0..<capacity]), true, nil)
+            }
+            capacity = min(capacity * 2, Self.maximumChildCapacity)
+        }
+    }
+
+    private func usage(of pid: Int32) -> Result<DoryProcessMemoryUsage, ProcessMemorySampleError> {
+        var info = rusage_info_v4()
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { rebound in
+                proc_pid_rusage(pid, RUSAGE_INFO_V4, rebound)
+            }
+        }
+        guard result == 0 else {
+            return .failure(ProcessMemorySampleError(message: String(cString: strerror(errno))))
+        }
+        return .success(DoryProcessMemoryUsage(
+            pid: pid,
+            residentSizeBytes: Int64(clamping: info.ri_resident_size),
+            physicalFootprintBytes: Int64(clamping: info.ri_phys_footprint)
+        ))
+    }
+}
+
+private struct ProcessMemorySampleError: Error {
+    var message: String
+}
+
+extension ProcessMemorySampleError: CustomStringConvertible {
+    var description: String { message }
+}
+
 public final class HealthReporter: @unchecked Sendable {
     private let dockerTier: DockerTier?
     private let machineManager: MachineManager?
@@ -96,8 +222,9 @@ public final class HealthReporter: @unchecked Sendable {
     private let dockerAPIProbe: any DockerAPIProbing
     private let commandRunner: any HealthCommandRunning
     private let registryProbe: any HealthRegistryProbing
+    private let memorySampler: any DoryProcessMemorySampling
 
-    public init(
+    public convenience init(
         socketPath: String,
         dockerTier: DockerTier?,
         machineManager: MachineManager? = nil,
@@ -109,6 +236,34 @@ public final class HealthReporter: @unchecked Sendable {
         home: String = NSHomeDirectory(),
         fileManager: FileManager = .default
     ) {
+        self.init(
+            socketPath: socketPath,
+            dockerTier: dockerTier,
+            machineManager: machineManager,
+            remoteManager: remoteManager,
+            dockerAPIProbe: dockerAPIProbe,
+            commandRunner: commandRunner,
+            registryProbe: registryProbe,
+            environment: environment,
+            home: home,
+            fileManager: fileManager,
+            memorySampler: DarwinDoryProcessMemorySampler()
+        )
+    }
+
+    init(
+        socketPath: String,
+        dockerTier: DockerTier?,
+        machineManager: MachineManager? = nil,
+        remoteManager: RemoteMachineManager?,
+        dockerAPIProbe: any DockerAPIProbing = UnixDockerAPIProbe(),
+        commandRunner: any HealthCommandRunning = ProcessHealthCommandRunner(),
+        registryProbe: any HealthRegistryProbing = URLSessionHealthRegistryProbe(),
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        home: String = NSHomeDirectory(),
+        fileManager: FileManager = .default,
+        memorySampler: any DoryProcessMemorySampling
+    ) {
         self.socketPath = socketPath
         self.dockerTier = dockerTier
         self.machineManager = machineManager
@@ -119,6 +274,7 @@ public final class HealthReporter: @unchecked Sendable {
         self.commandRunner = commandRunner
         self.registryProbe = registryProbe
         self.fileManager = fileManager
+        self.memorySampler = memorySampler
     }
 
     public func report(now: Date = Date()) -> DoctorReport {
@@ -655,28 +811,96 @@ public final class HealthReporter: @unchecked Sendable {
     }
 
     private func memoryCheck() -> HealthCheck {
+        let daemonPID = getpid()
+        let managedHelperPID = dockerTier?.status().hvPID
         var data: [String: String] = [
             "physical_memory_bytes": String(ProcessInfo.processInfo.physicalMemory),
+            "daemon_pid": String(daemonPID),
         ]
-        if let pid = dockerTier?.status().hvPID {
+        if let pid = managedHelperPID {
             data["engine_pid"] = String(pid)
         }
+
+        let snapshot = memorySampler.snapshot(
+            daemonPID: daemonPID,
+            managedHelperPID: managedHelperPID
+        )
+        data["phys_footprint_source"] = "proc_pid_rusage.RUSAGE_INFO_V4"
+        data["phys_footprint_aggregation"] = "sum_of_per_process_charges_may_double_count_shared_pages"
+        data["process_set_complete"] = snapshot.complete ? "true" : "false"
+        data["process_count"] = String(snapshot.usages.count)
+        data["process_pids"] = snapshot.usages.map(\.pid).sorted().map(String.init).joined(separator: ",")
+        if !snapshot.errors.isEmpty {
+            data["sampling_errors"] = snapshot.errors.joined(separator: "; ")
+        }
+
+        if !snapshot.usages.isEmpty {
+            let footprint = saturatingSum(snapshot.usages.map(\.physicalFootprintBytes))
+            let resident = saturatingSum(snapshot.usages.map(\.residentSizeBytes))
+            let daemonFootprint = snapshot.usages
+                .first { $0.pid == daemonPID }?.physicalFootprintBytes ?? 0
+            let helperTreeFootprint = saturatingSum(snapshot.usages.compactMap { usage in
+                snapshot.managedHelperTreePIDs.contains(usage.pid) ? usage.physicalFootprintBytes : nil
+            })
+            let otherDescendantFootprint = saturatingSum(snapshot.usages.compactMap { usage in
+                usage.pid != daemonPID && !snapshot.managedHelperTreePIDs.contains(usage.pid)
+                    ? usage.physicalFootprintBytes
+                    : nil
+            })
+
+            data["physical_footprint_available"] = "true"
+            data["phys_footprint_bytes"] = String(footprint)
+            data["phys_footprint_scope"] = snapshot.complete
+                ? "dory_process_set"
+                : "partial_dory_process_set"
+            data["daemon_phys_footprint_bytes"] = String(daemonFootprint)
+            data["managed_helper_tree_phys_footprint_bytes"] = String(helperTreeFootprint)
+            data["other_descendant_phys_footprint_bytes"] = String(otherDescendantFootprint)
+            // Retain the legacy key, but make its live aggregate scope and meaning explicit.
+            data["rss_bytes"] = String(resident)
+            data["rss_kind"] = "current_resident_size"
+            data["rss_scope"] = snapshot.complete
+                ? "dory_process_set"
+                : "partial_dory_process_set"
+
+            if snapshot.complete {
+                return HealthCheck(
+                    id: "memory.footprint",
+                    status: .pass,
+                    code: "memory.footprint_ok",
+                    title: "Dory memory footprint",
+                    detail: "summed physical footprint \(formatBytes(footprint)) across \(snapshot.usages.count) Dory process(es) (shared pages may be counted more than once); current resident set \(formatBytes(resident))",
+                    data: data
+                )
+            }
+
+            return HealthCheck(
+                id: "memory.footprint",
+                status: .warn,
+                code: "memory.footprint_partial",
+                title: "Dory memory footprint",
+                detail: "at least \(formatBytes(footprint)) summed physical footprint across \(snapshot.usages.count) sampled Dory process(es) (shared pages may be counted more than once); process-set sampling was incomplete",
+                action: "Run the health check again; if sampling remains partial, inspect whether an engine helper is repeatedly exiting.",
+                data: data
+            )
+        }
+
+        data["physical_footprint_available"] = "false"
         var usage = rusage()
         if getrusage(RUSAGE_SELF, &usage) == 0 {
-            // Darwin reports ru_maxrss in bytes; Linux reports kilobytes.
-            #if canImport(Darwin)
             data["rss_bytes"] = String(Int64(usage.ru_maxrss))
-            #else
-            data["rss_bytes"] = String(Int64(usage.ru_maxrss) * 1024)
-            #endif
+            data["rss_kind"] = "peak_resident_size"
+            data["rss_scope"] = "daemon_self"
+            data["rss_source"] = "getrusage.RUSAGE_SELF.ru_maxrss"
         }
         let rss = data["rss_bytes"].flatMap(Int64.init).map(formatBytes) ?? "unknown"
         return HealthCheck(
             id: "memory.footprint",
-            status: .pass,
-            code: "memory.footprint_ok",
+            status: .warn,
+            code: "memory.footprint_unavailable",
             title: "Dory memory footprint",
-            detail: "host RSS \(rss)",
+            detail: "physical footprint unavailable; daemon-only peak RSS fallback \(rss)",
+            action: "Run the health check again; this fallback does not include the VM or its helper processes.",
             data: data
         )
     }
@@ -1125,6 +1349,13 @@ private func compact(_ value: String, limit: Int = 300) -> String {
         return normalized
     }
     return String(normalized.prefix(limit))
+}
+
+private func saturatingSum(_ values: [Int64]) -> Int64 {
+    values.reduce(0) { total, value in
+        let (sum, overflow) = total.addingReportingOverflow(value)
+        return overflow ? Int64.max : sum
+    }
 }
 
 private func formatBytes(_ bytes: Int64) -> String {

@@ -170,7 +170,7 @@ final class DockerTierTests: XCTestCase {
                 )
             ),
             idleController: idle,
-            dockerReadyWaiter: { _, _ in true }
+            dockerReadyWaiter: { _, _, _ in true }
         )
 
         try tier.armSleeping()
@@ -205,7 +205,7 @@ final class DockerTierTests: XCTestCase {
                 )
             ),
             idleController: idle,
-            dockerReadyWaiter: { _, _ in false }
+            dockerReadyWaiter: { _, _, _ in false }
         )
 
         try tier.armSleeping()
@@ -241,7 +241,7 @@ final class DockerTierTests: XCTestCase {
                 )
             ),
             idleController: idle,
-            dockerReadyWaiter: { _, _ in
+            dockerReadyWaiter: { _, _, _ in
                 readyWaitEntered.signal()
                 return finishReadyWait.wait(timeout: .now() + 2) == .success
             }
@@ -286,7 +286,7 @@ final class DockerTierTests: XCTestCase {
                 )
             ),
             idleController: idle,
-            dockerReadyWaiter: { _, _ in false }
+            dockerReadyWaiter: { _, _, _ in false }
         )
         defer { tier.stop() }
 
@@ -295,6 +295,286 @@ final class DockerTierTests: XCTestCase {
         }
         XCTAssertEqual(tier.status().state, .failed)
         XCTAssertEqual(tier.status().lastError, "docker tier did not become ready after wake")
+        XCTAssertNil(tier.status().hvPID)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tier.socketPath))
+    }
+
+    func testStopCancelsBlockedFreshStartAndReapsInFlightHelper() throws {
+        let base = "/tmp/dory-tier-start-cancel-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+
+        let readyWaitEntered = DispatchSemaphore(value: 0)
+        let startFinished = DispatchSemaphore(value: 0)
+        let startError = LockedErrorBox()
+        let tier = DockerTier(
+            configuration: DockerTierConfiguration(
+                home: base + "/home",
+                forwardSocketPath: base + "/forward.sock",
+                activitySocketPath: base + "/activity.sock",
+                hvProcess: HvProcessConfiguration(
+                    executablePath: "/bin/sleep",
+                    arguments: ["30"]
+                )
+            ),
+            idleController: IdleController(),
+            dockerReadyWaiter: { _, timeout, shouldContinue in
+                readyWaitEntered.signal()
+                let deadline = Date().addingTimeInterval(min(timeout, 2))
+                while Date() < deadline, shouldContinue() {
+                    Thread.sleep(forTimeInterval: 0.005)
+                }
+                return false
+            }
+        )
+
+        DispatchQueue.global().async {
+            do {
+                try tier.start()
+            } catch {
+                startError.set(error)
+            }
+            startFinished.signal()
+        }
+
+        XCTAssertEqual(readyWaitEntered.wait(timeout: .now() + 2), .success)
+        let helperPID = try XCTUnwrap(tier.status().hvPID)
+
+        let stoppedAt = Date()
+        tier.stop()
+
+        XCTAssertEqual(startFinished.wait(timeout: .now() + 1), .success)
+        XCTAssertLessThan(Date().timeIntervalSince(stoppedAt), 1)
+        XCTAssertTrue(startError.value.map { "\($0)".contains("start was cancelled") } ?? false)
+        XCTAssertEqual(tier.status().state, .stopped)
+        XCTAssertNil(tier.status().hvPID)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tier.socketPath))
+        XCTAssertEqual(kill(helperPID, 0), -1)
+        XCTAssertEqual(errno, ESRCH)
+    }
+
+    func testOrdinaryStopAllowsRestartButDaemonShutdownPermanentlyRejectsStart() throws {
+        let base = "/tmp/dory-tier-terminal-latch-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+
+        let tier = DockerTier(
+            configuration: DockerTierConfiguration(
+                home: base + "/home",
+                forwardSocketPath: base + "/forward.sock",
+                activitySocketPath: base + "/activity.sock",
+                hvProcess: HvProcessConfiguration(
+                    executablePath: "/bin/sleep",
+                    arguments: ["30"]
+                )
+            ),
+            idleController: IdleController(),
+            dockerReadyWaiter: { _, _, _ in true }
+        )
+
+        try tier.start()
+        let firstPID = try XCTUnwrap(tier.status().hvPID)
+        tier.stop()
+        XCTAssertEqual(kill(firstPID, 0), -1)
+        XCTAssertEqual(errno, ESRCH)
+
+        try tier.start()
+        let secondPID = try XCTUnwrap(tier.status().hvPID)
+        tier.shutdown()
+        XCTAssertEqual(kill(secondPID, 0), -1)
+        XCTAssertEqual(errno, ESRCH)
+        XCTAssertEqual(tier.status().state, .stopped)
+
+        XCTAssertThrowsError(try tier.start()) { error in
+            XCTAssertTrue("\(error)".contains("doryd is shutting down"), "\(error)")
+        }
+        XCTAssertThrowsError(try tier.armSleeping()) { error in
+            XCTAssertTrue("\(error)".contains("doryd is shutting down"), "\(error)")
+        }
+        XCTAssertNil(tier.status().hvPID)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tier.socketPath))
+    }
+
+    func testDaemonShutdownCancelsAcceptedStartAndLatchesAgainstRetry() throws {
+        let base = "/tmp/dory-tier-terminal-start-race-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+
+        let readyWaitEntered = DispatchSemaphore(value: 0)
+        let startFinished = DispatchSemaphore(value: 0)
+        let startError = LockedErrorBox()
+        let tier = DockerTier(
+            configuration: DockerTierConfiguration(
+                home: base + "/home",
+                forwardSocketPath: base + "/forward.sock",
+                activitySocketPath: base + "/activity.sock",
+                hvProcess: HvProcessConfiguration(
+                    executablePath: "/bin/sleep",
+                    arguments: ["30"]
+                )
+            ),
+            idleController: IdleController(),
+            dockerReadyWaiter: { _, timeout, shouldContinue in
+                readyWaitEntered.signal()
+                let deadline = Date().addingTimeInterval(min(timeout, 2))
+                while Date() < deadline, shouldContinue() {
+                    Thread.sleep(forTimeInterval: 0.005)
+                }
+                return false
+            }
+        )
+
+        DispatchQueue.global().async {
+            do {
+                try tier.start()
+            } catch {
+                startError.set(error)
+            }
+            startFinished.signal()
+        }
+
+        XCTAssertEqual(readyWaitEntered.wait(timeout: .now() + 2), .success)
+        let helperPID = try XCTUnwrap(tier.status().hvPID)
+        tier.shutdown()
+
+        XCTAssertEqual(startFinished.wait(timeout: .now() + 1), .success)
+        XCTAssertTrue(startError.value.map { "\($0)".contains("start was cancelled") } ?? false)
+        XCTAssertEqual(kill(helperPID, 0), -1)
+        XCTAssertEqual(errno, ESRCH)
+        XCTAssertThrowsError(try tier.start()) { error in
+            XCTAssertTrue("\(error)".contains("doryd is shutting down"), "\(error)")
+        }
+        XCTAssertEqual(tier.status().state, .stopped)
+        XCTAssertNil(tier.status().hvPID)
+    }
+
+    func testTerminalShutdownRemovesDataplaneBoundAfterTearDown() throws {
+        let base = "/tmp/dory-tier-terminal-dataplane-race-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+
+        let dataplaneStartEntered = DispatchSemaphore(value: 0)
+        let releaseDataplaneStart = DispatchSemaphore(value: 0)
+        let startFinished = DispatchSemaphore(value: 0)
+        let startError = LockedErrorBox()
+        let tier = DockerTier(
+            configuration: DockerTierConfiguration(
+                home: base + "/home",
+                forwardSocketPath: base + "/forward.sock"
+            ),
+            beforeDataplaneStart: {
+                dataplaneStartEntered.signal()
+                _ = releaseDataplaneStart.wait(timeout: .now() + 2)
+            }
+        )
+
+        DispatchQueue.global().async {
+            do {
+                try tier.start()
+            } catch {
+                startError.set(error)
+            }
+            startFinished.signal()
+        }
+
+        XCTAssertEqual(dataplaneStartEntered.wait(timeout: .now() + 2), .success)
+        tier.shutdown()
+        releaseDataplaneStart.signal()
+
+        XCTAssertEqual(startFinished.wait(timeout: .now() + 2), .success)
+        XCTAssertTrue(startError.value.map { "\($0)".contains("start was cancelled") } ?? false)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tier.socketPath))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: base + "/forward.sock"))
+        XCTAssertEqual(tier.status().state, .stopped)
+    }
+
+    func testTerminalShutdownRemovesSleepingDataplaneBoundAfterTearDown() throws {
+        let base = "/tmp/dory-tier-terminal-arm-race-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+
+        let activityPath = base + "/activity.sock"
+        let dataplaneStartEntered = DispatchSemaphore(value: 0)
+        let releaseDataplaneStart = DispatchSemaphore(value: 0)
+        let armFinished = DispatchSemaphore(value: 0)
+        let armError = LockedErrorBox()
+        let tier = DockerTier(
+            configuration: DockerTierConfiguration(
+                home: base + "/home",
+                forwardSocketPath: base + "/forward.sock",
+                activitySocketPath: activityPath,
+                hvProcess: HvProcessConfiguration(
+                    executablePath: "/bin/sleep",
+                    arguments: ["30"]
+                )
+            ),
+            idleController: IdleController(),
+            beforeDataplaneStart: {
+                dataplaneStartEntered.signal()
+                _ = releaseDataplaneStart.wait(timeout: .now() + 2)
+            }
+        )
+
+        DispatchQueue.global().async {
+            do {
+                try tier.armSleeping()
+            } catch {
+                armError.set(error)
+            }
+            armFinished.signal()
+        }
+
+        XCTAssertEqual(dataplaneStartEntered.wait(timeout: .now() + 2), .success)
+        tier.shutdown()
+        releaseDataplaneStart.signal()
+
+        XCTAssertEqual(armFinished.wait(timeout: .now() + 2), .success)
+        XCTAssertTrue(armError.value.map { "\($0)".contains("start was cancelled") } ?? false)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tier.socketPath))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: activityPath))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: base + "/forward.sock"))
+        XCTAssertEqual(tier.status().state, .stopped)
+    }
+
+    func testDaemonShutdownCancelsAcceptedWakeAndPreventsFutureWake() async throws {
+        let base = "/tmp/dory-tier-terminal-wake-race-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+
+        let readyWaitEntered = DispatchSemaphore(value: 0)
+        let tier = DockerTier(
+            configuration: DockerTierConfiguration(
+                home: base + "/home",
+                forwardSocketPath: base + "/forward.sock",
+                activitySocketPath: base + "/activity.sock",
+                hvProcess: HvProcessConfiguration(
+                    executablePath: "/bin/sleep",
+                    arguments: ["30"]
+                )
+            ),
+            idleController: IdleController(),
+            dockerReadyWaiter: { _, timeout, shouldContinue in
+                readyWaitEntered.signal()
+                let deadline = Date().addingTimeInterval(min(timeout, 2))
+                while Date() < deadline, shouldContinue() {
+                    Thread.sleep(forTimeInterval: 0.005)
+                }
+                return false
+            }
+        )
+
+        try tier.armSleeping()
+        let wake = Task { await tier.ensureAwake() }
+        XCTAssertEqual(readyWaitEntered.wait(timeout: .now() + 2), .success)
+        let helperPID = try XCTUnwrap(tier.status().hvPID)
+
+        tier.shutdown()
+        await wake.value
+        await tier.ensureAwake()
+
+        XCTAssertEqual(kill(helperPID, 0), -1)
+        XCTAssertEqual(errno, ESRCH)
+        XCTAssertEqual(tier.status().state, .stopped)
         XCTAssertNil(tier.status().hvPID)
         XCTAssertFalse(FileManager.default.fileExists(atPath: tier.socketPath))
     }
@@ -317,7 +597,7 @@ final class DockerTierTests: XCTestCase {
             ),
             idleController: idle,
             containerActivityProbe: { _ in .active(1) },
-            dockerReadyWaiter: { _, _ in true }
+            dockerReadyWaiter: { _, _, _ in true }
         )
 
         try tier.start()
@@ -355,7 +635,7 @@ final class DockerTierTests: XCTestCase {
             ),
             idleController: idle,
             containerActivityProbe: { _ in .empty },
-            dockerReadyWaiter: { _, _ in true }
+            dockerReadyWaiter: { _, _, _ in true }
         )
 
         try tier.start()
@@ -392,7 +672,7 @@ final class DockerTierTests: XCTestCase {
             ),
             idleController: idle,
             containerActivityProbe: { _ in .empty },
-            dockerReadyWaiter: { _, _ in true }
+            dockerReadyWaiter: { _, _, _ in true }
         )
 
         try tier.start()
@@ -423,7 +703,7 @@ final class DockerTierTests: XCTestCase {
             ),
             idleController: idle,
             containerActivityProbe: { _ in .empty },
-            dockerReadyWaiter: { _, _ in true }
+            dockerReadyWaiter: { _, _, _ in true }
         )
 
         try tier.start()
@@ -456,7 +736,7 @@ final class DockerTierTests: XCTestCase {
             ),
             idleController: idle,
             containerActivityProbe: { _ in .active(2) },
-            dockerReadyWaiter: { _, _ in true }
+            dockerReadyWaiter: { _, _, _ in true }
         )
 
         try tier.start()
@@ -470,6 +750,257 @@ final class DockerTierTests: XCTestCase {
         XCTAssertEqual(tier.status().state, .running)
         XCTAssertEqual(tier.status().hvPID, originalPID)
         XCTAssertFalse(idle.snapshot.sleeping)
+    }
+
+    func testUnexpectedHelperExitClearsStaleEndpointsAndRestartsAfterBackoff() throws {
+        let base = "/tmp/dory-tier-supervisor-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+
+        let forwardPath = base + "/forward.sock"
+        let activityPath = base + "/activity.sock"
+        let tier = DockerTier(
+            configuration: DockerTierConfiguration(
+                home: base + "/home",
+                forwardSocketPath: forwardPath,
+                activitySocketPath: activityPath,
+                hvProcess: HvProcessConfiguration(
+                    executablePath: "/bin/sleep",
+                    arguments: ["30"],
+                    restartPolicy: HvRestartPolicy(
+                        maxRestarts: 2,
+                        delaySeconds: 0.25,
+                        maximumDelaySeconds: 0.25,
+                        stableRunSeconds: 60
+                    )
+                )
+            ),
+            idleController: IdleController(),
+            dockerReadyWaiter: { _, _, _ in true }
+        )
+        try tier.start()
+        defer { tier.stop() }
+
+        let originalPID = try XCTUnwrap(tier.status().hvPID)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tier.socketPath))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: activityPath))
+        XCTAssertTrue(FileManager.default.createFile(atPath: forwardPath, contents: Data("stale".utf8)))
+
+        let killedAt = Date()
+        XCTAssertEqual(kill(originalPID, SIGKILL), 0)
+        XCTAssertTrue(waitUntil(timeout: 1) {
+            let status = tier.status()
+            return status.state == .starting && status.hvPID == nil
+        })
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tier.socketPath))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: activityPath))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: forwardPath))
+
+        XCTAssertTrue(waitUntil(timeout: 2) {
+            let status = tier.status()
+            return status.state == .running && status.hvPID != nil && status.hvPID != originalPID
+        })
+        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(killedAt), 0.20)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tier.socketPath))
+    }
+
+    func testExplicitStopNeverTriggersSupervisorRestart() throws {
+        let base = "/tmp/dory-tier-explicit-stop-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+
+        let tier = DockerTier(
+            configuration: DockerTierConfiguration(
+                home: base + "/home",
+                forwardSocketPath: base + "/forward.sock",
+                activitySocketPath: base + "/activity.sock",
+                hvProcess: HvProcessConfiguration(
+                    executablePath: "/bin/sleep",
+                    arguments: ["30"],
+                    restartPolicy: HvRestartPolicy(maxRestarts: 3, delaySeconds: 0.02)
+                )
+            ),
+            idleController: IdleController(),
+            dockerReadyWaiter: { _, _, _ in true }
+        )
+        try tier.start()
+        let originalPID = try XCTUnwrap(tier.status().hvPID)
+
+        tier.stop()
+        Thread.sleep(forTimeInterval: 0.15)
+
+        XCTAssertEqual(tier.status().state, .stopped)
+        XCTAssertNil(tier.status().hvPID)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tier.socketPath))
+        XCTAssertEqual(kill(originalPID, 0), -1)
+        XCTAssertEqual(errno, ESRCH)
+    }
+
+    func testExplicitSleepCancelsQueuedSupervisorRestart() throws {
+        let base = "/tmp/dory-tier-explicit-sleep-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+
+        let idle = IdleController()
+        let tier = DockerTier(
+            configuration: DockerTierConfiguration(
+                home: base + "/home",
+                forwardSocketPath: base + "/forward.sock",
+                activitySocketPath: base + "/activity.sock",
+                hvProcess: HvProcessConfiguration(
+                    executablePath: "/bin/sleep",
+                    arguments: ["30"],
+                    restartPolicy: HvRestartPolicy(
+                        maxRestarts: 3,
+                        delaySeconds: 0.30,
+                        maximumDelaySeconds: 0.30
+                    )
+                )
+            ),
+            idleController: idle,
+            containerActivityProbe: { _ in .empty },
+            dockerReadyWaiter: { _, _, _ in true }
+        )
+        try tier.start()
+        defer { tier.stop() }
+        let originalPID = try XCTUnwrap(tier.status().hvPID)
+
+        XCTAssertEqual(kill(originalPID, SIGKILL), 0)
+        XCTAssertTrue(waitUntil(timeout: 1) {
+            let status = tier.status()
+            return status.state == .starting && status.hvPID == nil
+        })
+        XCTAssertTrue(tier.sleepForIdle(idleAfter: 0))
+        XCTAssertEqual(tier.status().state, .sleeping)
+        XCTAssertNil(tier.status().hvPID)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tier.socketPath))
+
+        Thread.sleep(forTimeInterval: 0.40)
+        XCTAssertEqual(tier.status().state, .sleeping)
+        XCTAssertNil(tier.status().hvPID, "cancelled restart must not resurrect a sleeping tier")
+    }
+
+    func testSupervisorStopsAtLimitAndManualStartResetsBudget() throws {
+        let base = "/tmp/dory-tier-restart-limit-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+
+        let tier = DockerTier(
+            configuration: DockerTierConfiguration(
+                home: base + "/home",
+                forwardSocketPath: base + "/forward.sock",
+                activitySocketPath: base + "/activity.sock",
+                hvProcess: HvProcessConfiguration(
+                    executablePath: "/bin/sleep",
+                    arguments: ["30"],
+                    restartPolicy: HvRestartPolicy(
+                        maxRestarts: 1,
+                        delaySeconds: 0.02,
+                        maximumDelaySeconds: 0.02,
+                        stableRunSeconds: 60
+                    )
+                )
+            ),
+            idleController: IdleController(),
+            dockerReadyWaiter: { _, _, _ in true }
+        )
+        defer { tier.stop() }
+        try tier.start()
+        let firstPID = try XCTUnwrap(tier.status().hvPID)
+
+        XCTAssertEqual(kill(firstPID, SIGKILL), 0)
+        XCTAssertTrue(waitUntil(timeout: 1) {
+            let status = tier.status()
+            return status.state == .running && status.hvPID != nil && status.hvPID != firstPID
+        })
+        let secondPID = try XCTUnwrap(tier.status().hvPID)
+        XCTAssertEqual(kill(secondPID, SIGKILL), 0)
+
+        XCTAssertTrue(waitUntil(timeout: 1) { tier.status().state == .failed })
+        XCTAssertNil(tier.status().hvPID)
+        XCTAssertTrue(tier.status().lastError?.contains("restart limit") == true)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tier.socketPath))
+        Thread.sleep(forTimeInterval: 0.10)
+        XCTAssertEqual(tier.status().state, .failed, "no queued restart may resurrect the tier")
+
+        try tier.start()
+        XCTAssertEqual(tier.status().state, .running)
+        XCTAssertNotNil(tier.status().hvPID)
+    }
+
+    func testHelperExitDuringRecoveryReadinessCancelsPromptlyAndConsumesBudget() throws {
+        let base = "/tmp/dory-tier-startup-exit-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+
+        let marker = base + "/runs"
+        let helper = base + "/helper.sh"
+        try """
+        #!/bin/sh
+        runs=0
+        if [ -f "$1" ]; then runs=$(wc -l < "$1"); fi
+        echo run >> "$1"
+        if [ "$runs" -eq 0 ]; then exec /bin/sleep 30; fi
+        exit 17
+        """.write(toFile: helper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: helper)
+
+        let readyCalls = LockedInt()
+        let tier = DockerTier(
+            configuration: DockerTierConfiguration(
+                home: base + "/home",
+                forwardSocketPath: base + "/forward.sock",
+                activitySocketPath: base + "/activity.sock",
+                hvProcess: HvProcessConfiguration(
+                    executablePath: helper,
+                    arguments: [marker],
+                    restartPolicy: HvRestartPolicy(
+                        maxRestarts: 2,
+                        delaySeconds: 0.01,
+                        maximumDelaySeconds: 0.02,
+                        stableRunSeconds: 60
+                    )
+                )
+            ),
+            idleController: IdleController(),
+            dockerReadyWaiter: { _, timeout, shouldContinue in
+                if readyCalls.increment() == 1 { return true }
+                let deadline = Date().addingTimeInterval(min(timeout, 2))
+                while Date() < deadline, shouldContinue() {
+                    Thread.sleep(forTimeInterval: 0.005)
+                }
+                return false
+            }
+        )
+        defer { tier.stop() }
+        try tier.start()
+        let firstPID = try XCTUnwrap(tier.status().hvPID)
+        // Process.run() reports the child before a heavily loaded host necessarily schedules the
+        // script body. Give that scheduling boundary room; the latency assertion below starts only
+        // after this marker and still proves recovery does not consume the 180-second ready wait.
+        let firstRunRecorded = waitUntil(timeout: 5) {
+            ((try? String(contentsOfFile: marker, encoding: .utf8)) ?? "")
+                .split(separator: "\n").count == 1
+        }
+        XCTAssertTrue(
+            firstRunRecorded,
+            "marker=\((try? String(contentsOfFile: marker, encoding: .utf8)) ?? "<missing>") status=\(tier.status())"
+        )
+        guard firstRunRecorded else { return }
+
+        let killedAt = Date()
+        XCTAssertEqual(kill(firstPID, SIGKILL), 0)
+        XCTAssertTrue(waitUntil(timeout: 2) { tier.status().state == .failed })
+
+        XCTAssertLessThan(Date().timeIntervalSince(killedAt), 1.5, "startup exit must not wait the 180-second readiness window")
+        XCTAssertEqual(readyCalls.value, 3)
+        XCTAssertEqual(
+            (try String(contentsOfFile: marker, encoding: .utf8)).split(separator: "\n").count,
+            3
+        )
+        XCTAssertTrue(tier.status().lastError?.contains("restart limit") == true)
+        XCTAssertNil(tier.status().hvPID)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tier.socketPath))
     }
 }
 
@@ -680,4 +1211,37 @@ private final class LockedErrorBox: @unchecked Sendable {
         stored = error
         lock.unlock()
     }
+}
+
+private final class LockedInt: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored = 0
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
+
+    @discardableResult
+    func increment() -> Int {
+        lock.lock()
+        stored += 1
+        let value = stored
+        lock.unlock()
+        return value
+    }
+}
+
+private func waitUntil(
+    timeout: TimeInterval,
+    pollInterval: TimeInterval = 0.005,
+    _ condition: () -> Bool
+) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if condition() { return true }
+        Thread.sleep(forTimeInterval: pollInterval)
+    }
+    return condition()
 }

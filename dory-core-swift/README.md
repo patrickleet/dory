@@ -58,7 +58,7 @@ swift run dorydctl balloon reconcile
 swift run dorydctl health
 ```
 
-The CLI intentionally mirrors the plist-safe XPC surface. Use `docker agent-info|ports|telemetry`
+The CLI intentionally mirrors the plist-safe XPC surface. Use `docker agent-info|ports|telemetry|clock-sync`
 for agent control smoke tests, `network replace-routes --json routes.json` for local domain routing,
 `remote connect|push|status` for SSH-backed agents, and `doctor-json`/`incidents` for health gates.
 

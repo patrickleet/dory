@@ -228,7 +228,7 @@ final class DorydServiceTests: XCTestCase {
             ),
             idleController: idle,
             containerActivityProbe: { _ in .empty },
-            dockerReadyWaiter: { _, _ in true }
+            dockerReadyWaiter: { _, _, _ in true }
         )
         try tier.start()
         defer { tier.stop() }
@@ -330,6 +330,27 @@ final class DorydServiceTests: XCTestCase {
             telemetryReply.fulfill()
         }
         wait(for: [telemetryReply], timeout: 5)
+
+        let clockReply = expectation(description: "dockerAgentClockSync reply")
+        proxy.dockerAgentClockSync { body, message in
+            XCTAssertEqual(message, "")
+            XCTAssertEqual(body["name"] as? String, "docker")
+            XCTAssertEqual(body["attempted"] as? Bool, true)
+            XCTAssertEqual(body["synced"] as? Bool, true)
+            XCTAssertEqual(body["error"] as? String, "")
+            clockReply.fulfill()
+        }
+        wait(for: [clockReply], timeout: 5)
+
+        tier.stop()
+        let stoppedClockReply = expectation(description: "stopped dockerAgentClockSync reply")
+        proxy.dockerAgentClockSync { body, message in
+            XCTAssertEqual(body["attempted"] as? Bool, false)
+            XCTAssertEqual(body["synced"] as? Bool, false)
+            XCTAssertTrue(message.contains("not available"), message)
+            stoppedClockReply.fulfill()
+        }
+        wait(for: [stoppedClockReply], timeout: 5)
     }
 
     func testRemoteConnectPushAndStatusOverXPC() throws {

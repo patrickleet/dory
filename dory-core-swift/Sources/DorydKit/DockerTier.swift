@@ -59,7 +59,11 @@ public struct DockerTierConfiguration: Sendable {
 }
 
 public typealias DockerContainerActivityProbe = @Sendable (DockerTierConfiguration) -> DockerContainerActivity
-public typealias DockerReadyWaiter = @Sendable (DockerTierConfiguration, TimeInterval) -> Bool
+public typealias DockerReadyWaiter = @Sendable (
+    DockerTierConfiguration,
+    TimeInterval,
+    @escaping @Sendable () -> Bool
+) -> Bool
 
 private protocol DockerManagedProcess: AnyObject, Sendable {
     var pid: Int32? { get }
@@ -89,6 +93,9 @@ public final class DockerTier: @unchecked Sendable {
         case suspendFailed(pid: Int32?)
         case resumeFailed(pid: Int32?)
         case readyTimeout
+        case helperExited(String)
+        case startCancelled
+        case daemonShuttingDown
         case wakeFailed(String)
 
         public var description: String {
@@ -103,6 +110,12 @@ public final class DockerTier: @unchecked Sendable {
                 return "failed to resume dory-hv\(pid.map { " pid \($0)" } ?? "")"
             case .readyTimeout:
                 return "docker tier did not become ready after wake"
+            case .helperExited(let detail):
+                return "docker tier helper \(detail)"
+            case .startCancelled:
+                return "docker tier start was cancelled"
+            case .daemonShuttingDown:
+                return "docker tier cannot start while doryd is shutting down"
             case .wakeFailed(let message):
                 return message.isEmpty ? "docker tier did not wake" : message
             }
@@ -120,10 +133,12 @@ public final class DockerTier: @unchecked Sendable {
     private let configuration: DockerTierConfiguration
     private let containerActivityProbe: DockerContainerActivityProbe
     private let dockerReadyWaiter: DockerReadyWaiter
+    private let beforeDataplaneStart: @Sendable () -> Void
     private let socket: DorySocket
     private let idleController: IdleController?
     private let agentControl: AgentControl?
     private let portPublisher: PortPublisher?
+    private let supervisorQueue = DispatchQueue(label: "dev.dory.doryd.docker-tier-supervisor")
     private let lock = NSLock()
     private var dataplane: DoryDataplaneHandle?
     private var activityServer: DataplaneActivityServer?
@@ -131,6 +146,12 @@ public final class DockerTier: @unchecked Sendable {
     private var state: DockerTierState = .stopped
     private var lastError: String?
     private var wakeTask: Task<Void, Never>?
+    private var activeHelperGeneration: UUID?
+    private var helperStartedAt: Date?
+    private var unexpectedRestartCount = 0
+    private var lifecycleEpoch: UInt64 = 0
+    private var restartWorkItem: DispatchWorkItem?
+    private var terminalShutdown = false
 
     public init(
         configuration: DockerTierConfiguration,
@@ -147,21 +168,28 @@ public final class DockerTier: @unchecked Sendable {
                     dockerPort: configuration.dockerPort
                 )
         },
-        dockerReadyWaiter: @escaping DockerReadyWaiter = { configuration, timeout in
+        dockerReadyWaiter: @escaping DockerReadyWaiter = { configuration, timeout, shouldContinue in
             if let dockerdSocketPath = configuration.dockerdSocketPath {
-                return DockerEngineProbe.waitUntilReady(socketPath: dockerdSocketPath, timeout: timeout)
+                return DockerEngineProbe.waitUntilReady(
+                    socketPath: dockerdSocketPath,
+                    timeout: timeout,
+                    shouldContinue: shouldContinue
+                )
             }
             return DockerEngineProbe.waitUntilReady(
                 forwardSocketPath: configuration.forwardSocketPath,
                 cid: configuration.cid,
                 dockerPort: configuration.dockerPort,
-                timeout: timeout
+                timeout: timeout,
+                shouldContinue: shouldContinue
             )
-        }
+        },
+        beforeDataplaneStart: @escaping @Sendable () -> Void = {}
     ) {
         self.configuration = configuration
         self.containerActivityProbe = containerActivityProbe
         self.dockerReadyWaiter = dockerReadyWaiter
+        self.beforeDataplaneStart = beforeDataplaneStart
         self.idleController = idleController
         self.socket = DorySocket(home: configuration.home)
         if let injectedAgentControl {
@@ -182,13 +210,26 @@ public final class DockerTier: @unchecked Sendable {
     }
 
     public func status() -> DockerTierStatus {
+        reconcileManagedHelperLiveness()
         lock.lock()
         defer { lock.unlock() }
+        let helperPID = helperProcess?.pid
+        let reportedState: DockerTierState
+        let reportedError: String?
+        if state == .running, configuration.hasManagedHelper, helperPID == nil {
+            // A child can cross the exit boundary between the liveness reconciliation above and
+            // this snapshot. Never publish a logically impossible `running` + no-child status.
+            reportedState = .failed
+            reportedError = lastError ?? "managed helper is no longer running"
+        } else {
+            reportedState = state
+            reportedError = lastError
+        }
         return DockerTierStatus(
-            state: state,
+            state: reportedState,
             socketPath: socket.path,
-            hvPID: helperProcess?.pid,
-            lastError: lastError
+            hvPID: helperPID,
+            lastError: reportedError
         )
     }
 
@@ -201,6 +242,10 @@ public final class DockerTier: @unchecked Sendable {
         defer { idleController?.endControlOperation() }
 
         lock.lock()
+        guard !terminalShutdown else {
+            lock.unlock()
+            throw TierError.daemonShuttingDown
+        }
         if dataplane != nil {
             if state == .stopped {
                 state = .sleeping
@@ -215,6 +260,13 @@ public final class DockerTier: @unchecked Sendable {
             lock.unlock()
             throw TierError.sleepingDataplaneRequiresWakeSupport
         }
+        restartWorkItem?.cancel()
+        restartWorkItem = nil
+        lifecycleEpoch &+= 1
+        let armEpoch = lifecycleEpoch
+        unexpectedRestartCount = 0
+        activeHelperGeneration = nil
+        helperStartedAt = nil
         state = .starting
         lastError = nil
         lock.unlock()
@@ -222,21 +274,44 @@ public final class DockerTier: @unchecked Sendable {
         do {
             let resources = try startDataplane()
             lock.lock()
+            guard !terminalShutdown,
+                  lifecycleEpoch == armEpoch,
+                  state == .starting else {
+                lock.unlock()
+                resources.handle.shutdown()
+                resources.activityServer?.stop()
+                // Terminal shutdown forbids any newer lifecycle, so it is safe and necessary to
+                // remove paths that this late dataplane bind may have recreated after tearDown.
+                removeRuntimeSockets()
+                throw TierError.startCancelled
+            }
             dataplane = resources.handle
             activityServer = resources.activityServer
             helperProcess = nil
             state = .sleeping
             wakeTask = nil
+            activeHelperGeneration = nil
+            helperStartedAt = nil
             lastError = nil
             idleController?.setSleeping(true)
             lock.unlock()
         } catch {
-            tearDown(markStopped: false)
             lock.lock()
-            state = .failed
-            lastError = "\(error)"
+            let terminallyCancelled = terminalShutdown
+            let ownsLifecycle = !terminallyCancelled
+                && lifecycleEpoch == armEpoch
+                && state == .starting
+            if ownsLifecycle {
+                state = .failed
+                lastError = "\(error)"
+            }
             lock.unlock()
-            idleController?.setSleeping(false)
+            if ownsLifecycle || terminallyCancelled {
+                removeRuntimeSockets()
+            }
+            if ownsLifecycle {
+                idleController?.setSleeping(false)
+            }
             throw error
         }
     }
@@ -246,12 +321,23 @@ public final class DockerTier: @unchecked Sendable {
         defer { idleController?.endControlOperation() }
 
         lock.lock()
-        if state == .starting {
+        guard !terminalShutdown else {
             lock.unlock()
-            throw TierError.alreadyRunning
+            throw TierError.daemonShuttingDown
+        }
+        if state == .starting {
+            // A manual start during supervised backoff promotes the queued recovery to an
+            // immediate foreground start. A helper that is already launching remains exclusive.
+            guard helperProcess == nil, let queuedRestart = restartWorkItem else {
+                lock.unlock()
+                throw TierError.alreadyRunning
+            }
+            queuedRestart.cancel()
+            restartWorkItem = nil
         }
         if dataplane != nil {
             if state == .sleeping {
+                unexpectedRestartCount = 0
                 lock.unlock()
                 wakeSynchronously()
                 try requireRunningAfterWake()
@@ -260,47 +346,143 @@ public final class DockerTier: @unchecked Sendable {
             lock.unlock()
             throw TierError.alreadyRunning
         }
+        restartWorkItem?.cancel()
+        restartWorkItem = nil
+        lifecycleEpoch &+= 1
+        let startEpoch = lifecycleEpoch
+        unexpectedRestartCount = 0
+        activeHelperGeneration = nil
+        helperStartedAt = nil
         state = .starting
         lastError = nil
         lock.unlock()
 
+        try launchFreshTier(epoch: startEpoch)
+    }
+
+    private func launchFreshTier(epoch: UInt64) throws {
         var startedHelper: (any DockerManagedProcess)?
+        var startedResources: DataplaneResources?
         do {
-            let helper = makeManagedProcess()
-            try helper?.start()
+            let helperGeneration = UUID()
+            let helper = makeManagedProcess(generation: helperGeneration)
             startedHelper = helper
 
-            if configuration.hasManagedHelper,
-               !dockerReadyWaiter(configuration, Self.freshStartReadyTimeout) {
-                throw TierError.readyTimeout
+            // Publish the in-flight helper before start(), because VMM startup can block waiting
+            // for its handoff and raw-HV startup immediately enters the Docker readiness wait.
+            // A concurrent daemon shutdown must be able to find and stop either shape instead of
+            // leaving a child behind until the startup call eventually returns.
+            lock.lock()
+            guard !terminalShutdown, lifecycleEpoch == epoch, state == .starting else {
+                lock.unlock()
+                throw TierError.startCancelled
+            }
+            helperProcess = helper
+            activeHelperGeneration = helper == nil ? nil : helperGeneration
+            lock.unlock()
+
+            try helper?.start()
+
+            guard freshLaunchIsActive(epoch: epoch, helper: helper) else {
+                throw TierError.startCancelled
+            }
+
+            if configuration.hasManagedHelper {
+                let ready = dockerReadyWaiter(configuration, Self.freshStartReadyTimeout) {
+                    self.freshLaunchIsActive(epoch: epoch, helper: helper)
+                        && helper?.isRunning == true
+                }
+                guard freshLaunchIsActive(epoch: epoch, helper: helper) else {
+                    throw TierError.startCancelled
+                }
+                guard helper?.isRunning == true else {
+                    throw TierError.helperExited("exited during startup")
+                }
+                guard ready else {
+                    throw TierError.readyTimeout
+                }
             }
 
             let resources = try startDataplane()
+            startedResources = resources
 
             lock.lock()
-            helperProcess = helper
+            let ownsHelper = helper.map { helperProcess === $0 } ?? (helperProcess == nil)
+            guard !terminalShutdown,
+                  lifecycleEpoch == epoch,
+                  state == .starting,
+                  ownsHelper else {
+                lock.unlock()
+                throw TierError.startCancelled
+            }
+            if configuration.hasManagedHelper, helper?.isRunning != true {
+                lock.unlock()
+                throw TierError.helperExited("exited while publishing the Docker socket")
+            }
             activityServer = resources.activityServer
             dataplane = resources.handle
+            helperStartedAt = helper == nil ? nil : Date()
             state = .running
+            lastError = nil
             idleController?.setSleeping(false)
             lock.unlock()
+            startedResources = nil
         } catch {
-            tearDown(markStopped: false, extraHelper: startedHelper)
+            startedResources?.handle.shutdown()
+            startedResources?.activityServer?.stop()
+            startedHelper?.stop()
+
+            let ownsLifecycle: Bool
+            let terminallyCancelled: Bool
             lock.lock()
-            state = .failed
-            lastError = "\(error)"
+            terminallyCancelled = terminalShutdown
+            if lifecycleEpoch == epoch {
+                ownsLifecycle = true
+                if let startedHelper, helperProcess === startedHelper {
+                    helperProcess = nil
+                }
+                activeHelperGeneration = nil
+                helperStartedAt = nil
+                state = .failed
+                lastError = "\(error)"
+            } else {
+                ownsLifecycle = false
+            }
             lock.unlock()
+            if ownsLifecycle || terminallyCancelled {
+                // A terminally-cancelled launch may have bound its dataplane after shutdown's
+                // tearDown already unlinked the old paths. No newer lifecycle can exist once the
+                // latch is set, so removing those late paths cannot unlink a replacement server.
+                removeRuntimeSockets()
+            }
             throw error
         }
+    }
+
+    private func freshLaunchIsActive(
+        epoch: UInt64,
+        helper: (any DockerManagedProcess)?
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let ownsHelper = helper.map { helperProcess === $0 } ?? (helperProcess == nil)
+        return !terminalShutdown
+            && lifecycleEpoch == epoch
+            && state == .starting
+            && ownsHelper
     }
 
     private func requireRunningAfterWake() throws {
         lock.lock()
         let currentState = state
         let currentError = lastError
+        let isTerminalShutdown = terminalShutdown
         lock.unlock()
 
         guard currentState == .running else {
+            if isTerminalShutdown {
+                throw TierError.daemonShuttingDown
+            }
             if currentError == TierError.readyTimeout.description {
                 throw TierError.readyTimeout
             }
@@ -311,6 +493,21 @@ public final class DockerTier: @unchecked Sendable {
     public func stop() {
         idleController?.beginControlOperation()
         defer { idleController?.endControlOperation() }
+        tearDown(markStopped: true)
+    }
+
+    /// Permanently close this tier for daemon process shutdown.
+    ///
+    /// Unlike ordinary engineStop/stop(), this is a one-way latch. Any XPC request that was
+    /// accepted before listener invalidation, or races cleanup afterward, is prevented from
+    /// spawning/resuming a helper once terminal shutdown begins.
+    public func shutdown() {
+        idleController?.beginControlOperation()
+        defer { idleController?.endControlOperation() }
+
+        lock.lock()
+        terminalShutdown = true
+        lock.unlock()
         tearDown(markStopped: true)
     }
 
@@ -336,7 +533,51 @@ public final class DockerTier: @unchecked Sendable {
     }
 
     public func sleepForIdle(idleAfter seconds: TimeInterval, now: Date = Date()) -> Bool {
-        sleepForIdle(idleAfter: seconds, now: now, activity: containerActivityProbe(configuration))
+        lock.lock()
+        let isTerminalShutdown = terminalShutdown
+        lock.unlock()
+        guard !isTerminalShutdown else { return false }
+
+        if let sleptQueuedRecovery = sleepQueuedRecoveryIfPresent() {
+            return sleptQueuedRecovery
+        }
+        return sleepForIdle(idleAfter: seconds, now: now, activity: containerActivityProbe(configuration))
+    }
+
+    /// An explicit sleep can race an unexpected-exit backoff. Convert the queued recovery into the
+    /// ordinary lightweight sleeping dataplane; otherwise the delayed work item would violate the
+    /// user's sleep decision by relaunching the VM moments later.
+    private func sleepQueuedRecoveryIfPresent() -> Bool? {
+        let queuedRestart: DispatchWorkItem
+        lock.lock()
+        guard state == .starting,
+              helperProcess == nil,
+              dataplane == nil,
+              let queued = restartWorkItem else {
+            lock.unlock()
+            return nil
+        }
+        queuedRestart = queued
+        restartWorkItem = nil
+        lifecycleEpoch &+= 1
+        activeHelperGeneration = nil
+        helperStartedAt = nil
+        state = .stopped
+        lastError = nil
+        lock.unlock()
+
+        queuedRestart.cancel()
+        removeRuntimeSockets()
+        do {
+            try armSleeping()
+            return true
+        } catch {
+            lock.lock()
+            state = .failed
+            lastError = "could not arm sleeping tier after cancelling recovery: \(error)"
+            lock.unlock()
+            return false
+        }
     }
 
     private func sleepForIdle(
@@ -379,6 +620,8 @@ public final class DockerTier: @unchecked Sendable {
         switch activity {
         case .empty:
             helperProcess = nil
+            activeHelperGeneration = nil
+            helperStartedAt = nil
             lastError = nil
             agentControl?.disconnect()
             currentHelper.stop()
@@ -602,7 +845,7 @@ public final class DockerTier: @unchecked Sendable {
 
     private func wakeTaskForEnsureAwake() -> Task<Void, Never>? {
         lock.lock()
-        if state != .sleeping {
+        if terminalShutdown || state != .sleeping {
             lock.unlock()
             return nil
         }
@@ -626,6 +869,11 @@ public final class DockerTier: @unchecked Sendable {
 
         var shouldSyncClock = false
         lock.lock()
+        guard !terminalShutdown else {
+            wakeTask = nil
+            lock.unlock()
+            return
+        }
         if state == .sleeping, let currentHelper = helperProcess, currentHelper.isRunning {
             guard currentHelper.resume() else {
                 lastError = TierError.resumeFailed(pid: currentHelper.pid).description
@@ -634,20 +882,30 @@ public final class DockerTier: @unchecked Sendable {
                 idleController?.setSleeping(true)
                 return
             }
+            lifecycleEpoch &+= 1
+            let resumeEpoch = lifecycleEpoch
             state = .starting
             lastError = nil
             lock.unlock()
 
-            let ready = dockerReadyWaiter(configuration, Self.resumeReadyTimeout)
+            let ready = dockerReadyWaiter(configuration, Self.resumeReadyTimeout) {
+                self.freshLaunchIsActive(epoch: resumeEpoch, helper: currentHelper)
+                    && currentHelper.isRunning
+            }
 
             lock.lock()
-            guard state == .starting else {
+            let ownsCurrentHelper = helperProcess === currentHelper
+            guard !terminalShutdown,
+                  lifecycleEpoch == resumeEpoch,
+                  state == .starting,
+                  ownsCurrentHelper else {
                 wakeTask = nil
                 lock.unlock()
                 return
             }
-            if ready {
+            if ready, currentHelper.isRunning {
                 state = .running
+                helperStartedAt = Date()
                 lastError = nil
                 wakeTask = nil
                 lock.unlock()
@@ -659,7 +917,15 @@ public final class DockerTier: @unchecked Sendable {
                 }
                 return
             }
-            lastError = TierError.readyTimeout.description
+            lastError = ready
+                ? TierError.helperExited("exited while resuming").description
+                : TierError.readyTimeout.description
+            state = .sleeping
+            if !currentHelper.isRunning {
+                helperProcess = nil
+                activeHelperGeneration = nil
+                helperStartedAt = nil
+            }
             wakeTask = nil
             lock.unlock()
             idleController?.setSleeping(true)
@@ -670,36 +936,55 @@ public final class DockerTier: @unchecked Sendable {
             lock.unlock()
             return
         }
+        lifecycleEpoch &+= 1
+        let wakeEpoch = lifecycleEpoch
         state = .starting
         lastError = nil
         lock.unlock()
 
+        let (helper, helperGeneration) = makeFreshManagedProcess()
         do {
-            let helper = try startFreshManagedProcess()
             lock.lock()
-            guard state == .starting else {
-                // Torn down while the fresh helper was starting; discard it rather than
-                // adopt it into a stopped tier.
+            guard !terminalShutdown,
+                  lifecycleEpoch == wakeEpoch,
+                  state == .starting else {
                 wakeTask = nil
                 lock.unlock()
                 helper?.stop()
                 return
             }
+            // Publish before start(): daemon shutdown must be able to cancel the exact window
+            // between an accepted engineWake and the helper's blocking handoff/readiness wait.
             helperProcess = helper
+            activeHelperGeneration = helper == nil ? nil : helperGeneration
             lock.unlock()
 
-            let ready = dockerReadyWaiter(configuration, Self.freshStartReadyTimeout)
+            try helper?.start()
+            guard freshLaunchIsActive(epoch: wakeEpoch, helper: helper) else {
+                helper?.stop()
+                return
+            }
+
+            let ready = dockerReadyWaiter(configuration, Self.freshStartReadyTimeout) {
+                self.freshLaunchIsActive(epoch: wakeEpoch, helper: helper)
+                    && helper?.isRunning == true
+            }
 
             lock.lock()
-            guard state == .starting else {
+            let ownsHelper = helper.map { helperProcess === $0 } ?? (helperProcess == nil)
+            guard !terminalShutdown,
+                  lifecycleEpoch == wakeEpoch,
+                  state == .starting,
+                  ownsHelper else {
                 wakeTask = nil
                 lock.unlock()
                 helper?.stop()
                 return
             }
-            if ready {
+            if ready, helper?.isRunning == true {
                 helperProcess = helper
                 state = .running
+                helperStartedAt = Date()
                 lastError = nil
                 wakeTask = nil
                 lock.unlock()
@@ -711,20 +996,37 @@ public final class DockerTier: @unchecked Sendable {
                 }
             } else {
                 helperProcess = nil
+                activeHelperGeneration = nil
+                helperStartedAt = nil
                 state = .sleeping
-                lastError = TierError.readyTimeout.description
+                lastError = ready
+                    ? TierError.helperExited("exited while waking").description
+                    : TierError.readyTimeout.description
                 wakeTask = nil
                 lock.unlock()
                 helper?.stop()
                 idleController?.setSleeping(true)
             }
         } catch {
+            helper?.stop()
             lock.lock()
-            state = .sleeping
-            lastError = "\(error)"
-            wakeTask = nil
+            let ownsHelper = helper.map { helperProcess === $0 } ?? (helperProcess == nil)
+            let ownsLifecycle = !terminalShutdown
+                && lifecycleEpoch == wakeEpoch
+                && state == .starting
+                && ownsHelper
+            if ownsLifecycle {
+                helperProcess = nil
+                activeHelperGeneration = nil
+                helperStartedAt = nil
+                state = .sleeping
+                lastError = "\(error)"
+                wakeTask = nil
+            }
             lock.unlock()
-            idleController?.setSleeping(true)
+            if ownsLifecycle {
+                idleController?.setSleeping(true)
+            }
         }
     }
 
@@ -738,20 +1040,219 @@ public final class DockerTier: @unchecked Sendable {
         return result
     }
 
-    private func startFreshManagedProcess() throws -> (any DockerManagedProcess)? {
-        let helper = makeManagedProcess()
-        try helper?.start()
-        return helper
+    private func makeFreshManagedProcess() -> ((any DockerManagedProcess)?, UUID) {
+        let generation = UUID()
+        let helper = makeManagedProcess(generation: generation)
+        return (helper, generation)
     }
 
-    private func makeManagedProcess() -> (any DockerManagedProcess)? {
-        if let vmmConfiguration = configuration.vmmProcess {
-            return VmmDockerProcess(configuration: vmmConfiguration)
+    private func makeManagedProcess(generation: UUID) -> (any DockerManagedProcess)? {
+        let onUnexpectedTermination: HvProcessUnexpectedTerminationHandler = { [weak self] termination in
+            self?.managedHelperExited(generation: generation, termination: termination)
         }
-        if let hvConfiguration = configuration.hvProcess {
-            return HvProcess(configuration: hvConfiguration)
+        if let vmmConfiguration = configuration.vmmProcess {
+            return VmmDockerProcess(
+                configuration: vmmConfiguration,
+                unexpectedTerminationHandler: onUnexpectedTermination
+            )
+        }
+        if var hvConfiguration = configuration.hvProcess {
+            // The tier must rebuild the full helper + dataplane graph after a VM exit. Disable
+            // HvProcess's local child-only retry so it cannot resurrect behind stale proxies.
+            hvConfiguration.restartPolicy = .none
+            return HvProcess(
+                configuration: hvConfiguration,
+                unexpectedTerminationHandler: onUnexpectedTermination
+            )
         }
         return nil
+    }
+
+    private var managedRestartPolicy: HvRestartPolicy {
+        configuration.hvProcess?.restartPolicy
+            ?? configuration.vmmProcess?.restartPolicy
+            ?? .none
+    }
+
+    private func reconcileManagedHelperLiveness() {
+        guard configuration.hasManagedHelper else { return }
+        let generation: UUID?
+        let helper: (any DockerManagedProcess)?
+        lock.lock()
+        if state == .running {
+            generation = activeHelperGeneration
+            helper = helperProcess
+        } else {
+            generation = nil
+            helper = nil
+        }
+        lock.unlock()
+
+        guard let generation, helper?.isRunning != true else { return }
+        handleManagedHelperLoss(
+            generation: generation,
+            detail: "is no longer running"
+        )
+    }
+
+    private func managedHelperExited(generation: UUID, termination: HvProcessTermination) {
+        handleManagedHelperLoss(
+            generation: generation,
+            detail: termination.description
+        )
+    }
+
+    private func handleManagedHelperLoss(generation: UUID, detail: String) {
+        let currentDataplane: DoryDataplaneHandle?
+        let currentHelper: (any DockerManagedProcess)?
+        let currentActivityServer: DataplaneActivityServer?
+        let inFlightWake: Task<Void, Never>?
+        let restart: DispatchWorkItem?
+        let restartDelay: TimeInterval
+
+        lock.lock()
+        guard !terminalShutdown,
+              state == .running,
+              activeHelperGeneration == generation else {
+            lock.unlock()
+            return
+        }
+
+        let policy = managedRestartPolicy
+        if policy.stableRunSeconds > 0,
+           let helperStartedAt,
+           Date().timeIntervalSince(helperStartedAt) >= policy.stableRunSeconds {
+            unexpectedRestartCount = 0
+        }
+        unexpectedRestartCount += 1
+        let attempt = unexpectedRestartCount
+        let canRestart = attempt <= policy.maxRestarts
+
+        lifecycleEpoch &+= 1
+        let restartEpoch = lifecycleEpoch
+        restartWorkItem?.cancel()
+        currentDataplane = dataplane
+        currentHelper = helperProcess
+        currentActivityServer = activityServer
+        inFlightWake = wakeTask
+        dataplane = nil
+        helperProcess = nil
+        activityServer = nil
+        wakeTask = nil
+        activeHelperGeneration = nil
+        helperStartedAt = nil
+        idleController?.setSleeping(false)
+
+        if canRestart {
+            let item = DispatchWorkItem { [weak self] in
+                self?.performScheduledRestart(epoch: restartEpoch)
+            }
+            restart = item
+            restartWorkItem = item
+            restartDelay = policy.delay(forAttempt: attempt)
+            state = .starting
+            lastError = "managed helper \(detail); restart attempt \(attempt)/\(policy.maxRestarts) queued"
+        } else {
+            restart = nil
+            restartWorkItem = nil
+            restartDelay = 0
+            state = .failed
+            lastError = "managed helper \(detail); automatic restart limit (\(policy.maxRestarts)) exhausted"
+        }
+
+        // Tear down every endpoint that could still accept a client before publishing a retry.
+        // Keep the lifecycle lock through endpoint teardown so an explicit start cannot bind a new
+        // socket that an old server's cleanup subsequently removes.
+        inFlightWake?.cancel()
+        removeRuntimeSockets()
+        currentDataplane?.shutdown()
+        currentActivityServer?.stop()
+        agentControl?.disconnect()
+        currentHelper?.stop()
+        lock.unlock()
+
+        if let restart {
+            supervisorQueue.asyncAfter(deadline: .now() + restartDelay, execute: restart)
+        }
+    }
+
+    private func performScheduledRestart(epoch: UInt64) {
+        idleController?.beginControlOperation()
+        defer { idleController?.endControlOperation() }
+
+        lock.lock()
+        guard lifecycleEpoch == epoch,
+              !terminalShutdown,
+              state == .starting,
+              helperProcess == nil,
+              restartWorkItem != nil else {
+            lock.unlock()
+            return
+        }
+        restartWorkItem = nil
+        lock.unlock()
+
+        do {
+            cleanupStaleHelpers()
+            try launchFreshTier(epoch: epoch)
+        } catch TierError.startCancelled {
+            return
+        } catch {
+            scheduleRecoveryAfterLaunchFailure(epoch: epoch, error: error)
+        }
+    }
+
+    private func scheduleRecoveryAfterLaunchFailure(epoch: UInt64, error: Error) {
+        let restart: DispatchWorkItem?
+        let delay: TimeInterval
+
+        lock.lock()
+        guard !terminalShutdown,
+              lifecycleEpoch == epoch,
+              state == .failed else {
+            lock.unlock()
+            return
+        }
+        let policy = managedRestartPolicy
+        if unexpectedRestartCount < policy.maxRestarts {
+            unexpectedRestartCount += 1
+            lifecycleEpoch &+= 1
+            let nextEpoch = lifecycleEpoch
+            let attempt = unexpectedRestartCount
+            let item = DispatchWorkItem { [weak self] in
+                self?.performScheduledRestart(epoch: nextEpoch)
+            }
+            restart = item
+            restartWorkItem = item
+            delay = policy.delay(forAttempt: attempt)
+            state = .starting
+            lastError = "restart attempt \(attempt - 1) failed: \(error); attempt \(attempt)/\(policy.maxRestarts) queued"
+        } else {
+            restart = nil
+            restartWorkItem = nil
+            delay = 0
+            lastError = "automatic restart limit (\(policy.maxRestarts)) exhausted after launch failure: \(error)"
+        }
+        lock.unlock()
+
+        if let restart {
+            supervisorQueue.asyncAfter(deadline: .now() + delay, execute: restart)
+        }
+    }
+
+    private func removeRuntimeSockets() {
+        unlink(socket.path)
+        guard configuration.hasManagedHelper else { return }
+        unlink(configuration.forwardSocketPath)
+        if let dockerdSocketPath = configuration.dockerdSocketPath {
+            unlink(dockerdSocketPath)
+        }
+        if let activitySocketPath = configuration.activitySocketPath {
+            unlink(activitySocketPath)
+        }
+        if let handoffSocketPath = configuration.vmmProcess?.handoffSocketPath {
+            unlink(handoffSocketPath)
+        }
     }
 
     private func startActivityServerIfNeeded() throws -> DataplaneActivityServer? {
@@ -769,6 +1270,7 @@ public final class DockerTier: @unchecked Sendable {
     }
 
     private func startDataplane() throws -> DataplaneResources {
+        beforeDataplaneStart()
         let server = try startActivityServerIfNeeded()
         do {
             let fd = try socket.bind()
@@ -820,17 +1322,25 @@ public final class DockerTier: @unchecked Sendable {
         let currentHelper: (any DockerManagedProcess)?
         let currentActivityServer: DataplaneActivityServer?
         let inFlightWake: Task<Void, Never>?
+        let queuedRestart: DispatchWorkItem?
         lock.lock()
+        lifecycleEpoch &+= 1
         currentDataplane = dataplane
         currentHelper = helperProcess ?? extraHelper
         currentActivityServer = activityServer
         inFlightWake = wakeTask
+        queuedRestart = restartWorkItem
         dataplane = nil
         helperProcess = nil
         activityServer = nil
         wakeTask = nil
+        restartWorkItem = nil
+        activeHelperGeneration = nil
+        helperStartedAt = nil
         if markStopped {
             state = .stopped
+            unexpectedRestartCount = 0
+            lastError = nil
             idleController?.setSleeping(false)
         }
         lock.unlock()
@@ -838,12 +1348,13 @@ public final class DockerTier: @unchecked Sendable {
         // Cancel any in-flight wake so it stops resuming; it also re-checks state under
         // the lock and discards a freshly started helper now that state != .sleeping.
         inFlightWake?.cancel()
+        queuedRestart?.cancel()
 
         currentDataplane?.shutdown()
         currentActivityServer?.stop()
         agentControl?.disconnect()
         currentHelper?.stop()
-        unlink(socket.path)
+        removeRuntimeSockets()
     }
 
     deinit {

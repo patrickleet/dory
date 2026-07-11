@@ -3,17 +3,17 @@ import Testing
 @testable import Dory
 
 struct RuntimeSupportTests {
-    // Dory's native dory-hv tier runs on Apple silicon and is preferred on Intel when raw PVH assets
-    // are present. Intel falls back to the VZ shared tier when only amd64 VZ assets are available.
-    @Test func engineSupportsMacOS14AppleSilicon() {
+    // Dory.app remains a macOS 14 app, but the shipped dory-hv helper starts at macOS 15. Sonoma
+    // therefore uses the dory-vmm shared tier on both supported host architectures.
+    @Test func appleSiliconSonomaUsesVZSharedTierEvenWhenRawHVAssetsExist() {
         let sonoma = MacHostPlatform(major: 14, minor: 0, patch: 0, architecture: "arm64")
         let evaluation = SharedVMProvisioner.engineSupport(
             platform: sonoma,
             hvNativeAvailable: true,
-            vzSharedAvailable: false,
+            vzSharedAvailable: true,
             hypervisorSupported: true
         )
-        #expect(evaluation.tier == .hvNative)
+        #expect(evaluation.tier == .vzShared)
         #expect(evaluation.support.isSupported)
         #expect(evaluation.support.issue == RuntimeSupport.Issue.none)
     }
@@ -40,8 +40,20 @@ struct RuntimeSupportTests {
         #expect(evaluation.support.isSupported)
     }
 
-    @Test func intelPrefersNativeHVTierWhenRawEngineAssetsExist() {
+    @Test func intelSonomaNeverSelectsNativeHVEvenWhenRawEngineAssetsExist() {
         let intel = MacHostPlatform(major: 14, minor: 7, patch: 0, architecture: "x86_64")
+        let evaluation = SharedVMProvisioner.engineSupport(
+            platform: intel,
+            hvNativeAvailable: true,
+            vzSharedAvailable: true,
+            hypervisorSupported: true
+        )
+        #expect(evaluation.tier == .vzShared)
+        #expect(evaluation.support.isSupported)
+    }
+
+    @Test func intelMacOS15PrefersNativeHVTierWhenRawEngineAssetsExist() {
+        let intel = MacHostPlatform(major: 15, minor: 0, patch: 0, architecture: "x86_64")
         let evaluation = SharedVMProvisioner.engineSupport(
             platform: intel,
             hvNativeAvailable: true,
@@ -77,15 +89,24 @@ struct RuntimeSupportTests {
         #expect(support.issue == .osVersion)
     }
 
-    @Test func capableHardwareIsUnsupportedWhenEngineUnavailable() {
-        // Right Mac, but the engine's binaries/kernel are missing or the user opted out
-        // (DORY_HV_ENGINE=0): report unavailable so the app falls back to a Docker-compatible
-        // engine rather than showing a misleading boot failure.
+    @Test func appleSiliconMacOS15FallsBackToVZWhenRawHVIsUnavailable() {
+        let sequoia = MacHostPlatform(major: 15, minor: 4, patch: 0, architecture: "arm64")
+        let evaluation = SharedVMProvisioner.engineSupport(
+            platform: sequoia,
+            hvNativeAvailable: false,
+            vzSharedAvailable: true,
+            hypervisorSupported: true
+        )
+        #expect(evaluation.tier == .vzShared)
+        #expect(evaluation.support.isSupported)
+    }
+
+    @Test func capableHardwareIsUnsupportedWhenAllEngineAssetsAreUnavailable() {
         let sequoia = MacHostPlatform(major: 15, minor: 4, patch: 0, architecture: "arm64")
         let support = SharedVMProvisioner.hostSupport(
             platform: sequoia,
             engineAvailable: false,
-            vzEngineAvailable: true,
+            vzEngineAvailable: false,
             hypervisorSupported: true
         )
         #expect(!support.isSupported)
@@ -116,14 +137,80 @@ struct RuntimeSupportTests {
         #expect(evaluation.support.issue == .hypervisor)
     }
 
-    @Test func nativeHVPlatformSupportIncludesIntelMacsAtTheMacOS14Floor() {
+    @Test func nativeHVPlatformSupportStartsAtMacOS15OnBothArchitectures() {
+        let intelSonoma = MacHostPlatform(major: 14, minor: 7, patch: 0, architecture: "x86_64")
+        let armSonoma = MacHostPlatform(major: 14, minor: 7, patch: 0, architecture: "arm64")
+        let intelMacOS15 = MacHostPlatform(major: 15, minor: 0, patch: 0, architecture: "x86_64")
+        let armMacOS15 = MacHostPlatform(major: 15, minor: 0, patch: 0, architecture: "arm64")
+        #expect(!DoryHVSupport.evaluate(platform: intelSonoma).isSupported)
+        #expect(!DoryHVSupport.evaluate(platform: armSonoma).isSupported)
+        #expect(DoryHVSupport.evaluate(platform: intelMacOS15).isSupported)
+        #expect(DoryHVSupport.evaluate(platform: armMacOS15).isSupported)
+    }
+
+    @Test func hvEngineAvailabilityRejectsSonomaBeforeConsideringAssets() {
         let intel = MacHostPlatform(major: 14, minor: 7, patch: 0, architecture: "x86_64")
-        #expect(DoryHVSupport.evaluate(platform: intel).isSupported)
+        let arm = MacHostPlatform(major: 14, minor: 7, patch: 0, architecture: "arm64")
+        #expect(!SharedVMProvisioner.hvEngineAvailable(platform: intel, environment: [:]))
+        #expect(!SharedVMProvisioner.hvEngineAvailable(platform: arm, environment: [:]))
     }
 
     @Test func hvEngineDisabledByOptOutFlag() {
         // DORY_HV_ENGINE=0 force-disables the engine even when binaries are present.
         #expect(!SharedVMProvisioner.hvEngineAvailable(environment: ["DORY_HV_ENGINE": "0"]))
+    }
+
+    @Test func vmEngineAvailabilityRequiresArchitectureMatchedBundledAssets() {
+        var assets: Set<String> = [
+            "dory-vm-kernel-amd64.lzfse",
+            "dory-engine-rootfs-amd64.ext4.lzfse",
+        ]
+        let available = {
+            SharedVMProvisioner.vmEngineAssetsAvailable(
+                arch: "amd64",
+                helperAvailable: true,
+                resourceAvailable: { assets.contains("\($0).\($1)") }
+            )
+        }
+
+        #expect(available())
+        assets.remove("dory-vm-kernel-amd64.lzfse")
+        assets.insert("dory-vm-kernel-arm64.lzfse")
+        #expect(!available())
+        assets.remove("dory-engine-rootfs-amd64.ext4.lzfse")
+        assets.insert("dory-machine-rootfs-amd64.ext4")
+        #expect(!available())
+        assets.insert("dory-vm-kernel-amd64.lzfse")
+        #expect(available())
+        #expect(!SharedVMProvisioner.vmEngineAssetsAvailable(
+            arch: "amd64",
+            helperAvailable: false,
+            resourceAvailable: { assets.contains("\($0).\($1)") }
+        ))
+    }
+
+    @Test func vmEngineAvailabilityAcceptsCompleteExplicitFallbackFixture() throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("dory-vmm-assets-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let helper = directory.appendingPathComponent("dory-vmm")
+        let kernel = directory.appendingPathComponent("kernel")
+        let rootfs = directory.appendingPathComponent("rootfs.ext4")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: helper)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: helper.path)
+        try Data("kernel".utf8).write(to: kernel)
+        try Data("rootfs".utf8).write(to: rootfs)
+
+        var environment = [
+            "DORYD_VMM_HELPER": helper.path,
+            "DORYD_VMM_KERNEL": kernel.path,
+            "DORYD_VMM_ROOTFS": rootfs.path,
+        ]
+        #expect(SharedVMProvisioner.vmEngineAvailable(environment: environment, arch: "amd64"))
+        environment["DORYD_VMM_ROOTFS"] = directory.appendingPathComponent("missing-rootfs").path
+        #expect(!SharedVMProvisioner.vmEngineAvailable(environment: environment, arch: "amd64"))
     }
 
     @Test func sharedVMDefaultMemoryPolicyIsBelowLegacyFourGiB() {
@@ -139,9 +226,9 @@ struct RuntimeSupportTests {
         #expect(SharedVMProvisioner.memoryStringToMB("1073741824") == 1024)
     }
 
-    @Test func sharedVMEngineArgumentsStartDirectIPBridge() {
-        let arguments = SharedVMProvisioner.engineArguments(
-            config: SharedVMProvisioner.Config(cpus: 6, memory: "3G"),
+    @Test func sharedVMEngineArgumentsStartDirectIPBridge() throws {
+        let arguments = try SharedVMProvisioner.engineArguments(
+            config: SharedVMProvisioner.Config(cpus: 6, memory: "3G", daxDataShares: []),
             kernel: "/tmp/kernel",
             gvproxy: "/tmp/gvproxy",
             rootfs: "/tmp/rootfs.ext4",
@@ -157,9 +244,9 @@ struct RuntimeSupportTests {
         #expect(argumentValue(after: "--cpus", in: arguments) == "6")
     }
 
-    @Test func sharedVMEngineArgumentsShareHomeAtItsRealPath() {
-        let arguments = SharedVMProvisioner.engineArguments(
-            config: SharedVMProvisioner.Config(cpus: 4, memory: "2G"),
+    @Test func sharedVMEngineArgumentsShareHomeAtItsRealPath() throws {
+        let arguments = try SharedVMProvisioner.engineArguments(
+            config: SharedVMProvisioner.Config(cpus: 4, memory: "2G", daxDataShares: []),
             kernel: "/tmp/kernel",
             gvproxy: "/tmp/gvproxy",
             rootfs: nil
@@ -169,25 +256,68 @@ struct RuntimeSupportTests {
         #expect(argumentValue(after: "--share", in: arguments) == "home=\(home):rw:at=\(home):safe")
     }
 
-    @Test func sharedVMEngineArgumentsAppendValidDaxDataSharesOnly() throws {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("dory-dax-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let path = dir.standardizedFileURL.path
+    @Test func sharedVMEngineArgumentsRejectLegacyDaxPreferenceExplicitly() {
+        do {
+            _ = try SharedVMProvisioner.engineArguments(
+                config: SharedVMProvisioner.Config(cpus: 4, memory: "2G", daxDataShares: ["/tmp/data"]),
+                kernel: "/tmp/kernel",
+                gvproxy: "/tmp/gvproxy",
+                rootfs: nil
+            )
+            Issue.record("legacy DAX preference unexpectedly entered production arguments")
+        } catch SharedVMProvisioner.ProvisionError.unsafeConfiguration(let reason) {
+            #expect(reason.contains("DAX host shares are disabled"))
+            #expect(reason.contains("fail-stop boundary"))
+            #expect(reason.contains("remove the dory.daxDataShares preference"))
+        } catch {
+            Issue.record("unexpected DAX rejection error: \(error)")
+        }
+    }
 
-        let arguments = SharedVMProvisioner.engineArguments(
-            config: SharedVMProvisioner.Config(cpus: 4, memory: "2G", daxDataShares: [path, "/no/such/dax/dir", path]),
-            kernel: "/tmp/kernel",
-            gvproxy: "/tmp/gvproxy",
-            rootfs: nil
-        )
+    @Test func sharedVMRejectsLegacyDaxPreferenceBeforeLiveEngineReuseProbes() async {
+        do {
+            _ = try await SharedVMProvisioner.shouldReuseHVEngine(
+                config: SharedVMProvisioner.Config(
+                    cpus: 4,
+                    memory: "2G",
+                    daxDataShares: ["/tmp/data"]
+                ),
+                reachability: {
+                    Issue.record("reachability probe ran before rejecting the legacy DAX preference")
+                    return true
+                },
+                liveness: {
+                    Issue.record("liveness probe ran before rejecting the legacy DAX preference")
+                    return true
+                }
+            )
+            Issue.record("live engine reuse unexpectedly bypassed the legacy DAX rejection")
+        } catch SharedVMProvisioner.ProvisionError.unsafeConfiguration(let reason) {
+            #expect(reason.contains("DAX host shares are disabled"))
+            #expect(reason.contains("remove the dory.daxDataShares preference"))
+        } catch {
+            Issue.record("unexpected DAX reuse rejection error: \(error)")
+        }
+    }
 
-        let home = NSHomeDirectory()
-        #expect(arguments.contains("home=\(home):rw:at=\(home):safe"))       // home stays non-DAX
-        #expect(arguments.contains("daxdata0=\(path):rw:dax:at=\(path):safe")) // existing dir -> DAX share
-        #expect(!arguments.contains { $0.contains("/no/such/dax/dir") })      // missing path dropped
-        #expect(arguments.filter { $0.hasPrefix("daxdata") }.count == 1)      // de-duplicated
+    @Test func sharedVMStopsLegacyDaxEngineBeforeSurfacingMigrationError() {
+        var stopped = false
+        do {
+            try SharedVMProvisioner.stopUnsafeLegacyDaxEngineIfNeeded(
+                config: SharedVMProvisioner.Config(
+                    cpus: 4,
+                    memory: "2G",
+                    daxDataShares: ["/tmp/data"]
+                ),
+                stopEngine: { stopped = true }
+            )
+            Issue.record("legacy DAX engine migration unexpectedly succeeded")
+        } catch SharedVMProvisioner.ProvisionError.unsafeConfiguration(let reason) {
+            #expect(stopped)
+            #expect(reason.contains("DAX host shares are disabled"))
+        } catch {
+            Issue.record("unexpected DAX migration error: \(error)")
+        }
     }
 
     @Test func sharedVMResourceNamesAreArchSuffixed() {

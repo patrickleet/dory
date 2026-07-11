@@ -2,6 +2,49 @@
 import XCTest
 
 final class DorydConfigurationTests: XCTestCase {
+    func testRawHVPlatformContractMatchesShippedHelperMinimumOS() {
+        XCTAssertEqual(DorydHostPlatform.Architecture(machineHardwareName: "arm64e"), .arm64)
+        XCTAssertFalse(DorydHostPlatform(architecture: .x86_64, macOSMajorVersion: 14).supportsRawHV)
+        XCTAssertFalse(DorydHostPlatform(architecture: .arm64, macOSMajorVersion: 14).supportsRawHV)
+        XCTAssertTrue(DorydHostPlatform(architecture: .x86_64, macOSMajorVersion: 15).supportsRawHV)
+        XCTAssertTrue(DorydHostPlatform(architecture: .arm64, macOSMajorVersion: 15).supportsRawHV)
+        XCTAssertFalse(
+            DorydHostPlatform(
+                architecture: .unsupported("powerpc"),
+                macOSMajorVersion: 27
+            ).supportsRawHV
+        )
+    }
+
+    func testIntelSonomaForcesVmmFallbackEvenWhenRawHVIsExplicitlyEnabled() throws {
+        try assertEngineSelection(
+            platform: DorydHostPlatform(architecture: .x86_64, macOSMajorVersion: 14),
+            expectedRawHV: false
+        )
+    }
+
+    func testArm64SonomaForcesVmmFallbackEvenWhenRawHVIsExplicitlyEnabled() throws {
+        try assertEngineSelection(
+            platform: DorydHostPlatform(architecture: .arm64, macOSMajorVersion: 14),
+            expectedRawHV: false
+        )
+    }
+
+    func testArm64MacOS15SelectsRawHV() throws {
+        try assertEngineSelection(
+            platform: DorydHostPlatform(architecture: .arm64, macOSMajorVersion: 15),
+            expectedRawHV: true
+        )
+    }
+
+    func testHostScaledDockerDefaultsLeaveRoomForMacOS() {
+        XCTAssertEqual(DorydEnvironment.hostScaledCPUCount(activeProcessorCount: 12), 10)
+        XCTAssertEqual(DorydEnvironment.hostScaledCPUCount(activeProcessorCount: 4), 4)
+        XCTAssertEqual(DorydEnvironment.hostScaledCPUCount(activeProcessorCount: 2), 2)
+        XCTAssertEqual(DorydEnvironment.hostScaledMemoryMB(physicalMemory: 16 * 1024 * 1024 * 1024), 8192)
+        XCTAssertEqual(DorydEnvironment.hostScaledMemoryMB(physicalMemory: 8 * 1024 * 1024 * 1024), 4096)
+    }
+
     func testBuildsDockerTierWithDoryHvForwardArguments() throws {
         let directory = "/tmp/doryd-config-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
         try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
@@ -29,7 +72,7 @@ final class DorydConfigurationTests: XCTestCase {
             "DORYD_SHARES": "src=/tmp/src:rw;cache=/tmp/cache:ro",
             "DORYD_HV_RESTART_LIMIT": "5",
             "DORYD_HV_RESTART_DELAY": "0.1",
-        ], cwd: directory)
+        ], cwd: directory, hostPlatform: supportedRawHVPlatform())
 
         let config = try XCTUnwrap(env.dockerTierConfiguration())
         XCTAssertEqual(config.home, directory + "/home")
@@ -85,7 +128,7 @@ final class DorydConfigurationTests: XCTestCase {
             "DORYD_HV_HELPER": helper,
             "DORYD_HV_KERNEL": directory + "/missing-kernel",
             "DORYD_GVPROXY": gvproxy,
-        ], cwd: directory)
+        ], cwd: directory, hostPlatform: supportedRawHVPlatform())
 
         XCTAssertNil(env.dockerTierConfiguration())
     }
@@ -119,7 +162,7 @@ final class DorydConfigurationTests: XCTestCase {
 
         let env = DorydEnvironment(values: [
             "DORYD_HOME": directory + "/home",
-        ], cwd: directory, executablePath: doryd)
+        ], cwd: directory, executablePath: doryd, hostPlatform: supportedRawHVPlatform())
 
         let hv = try XCTUnwrap(env.dockerTierConfiguration()?.hvProcess)
         XCTAssertArgumentPair(hv.arguments, "--kernel", kernel)
@@ -156,7 +199,7 @@ final class DorydConfigurationTests: XCTestCase {
         let env = DorydEnvironment(values: [
             "DORYD_HOME": directory + "/home",
             "DORYD_STATE_DIR": state,
-        ], cwd: directory, executablePath: doryd)
+        ], cwd: directory, executablePath: doryd, hostPlatform: supportedRawHVPlatform())
 
         let hv = try XCTUnwrap(env.dockerTierConfiguration()?.hvProcess)
         let preparedRootfs = state + "/assets/dory-engine-rootfs-\(guestArch).ext4"
@@ -198,7 +241,7 @@ final class DorydConfigurationTests: XCTestCase {
             "DORYD_RESOURCES_DIR": resources,
             "DORYD_STATE_DIR": state,
             "DORYD_RAW_HV_SUPPORTED": "1",
-        ], cwd: directory, executablePath: "doryd")
+        ], cwd: directory, executablePath: "doryd", hostPlatform: supportedRawHVPlatform())
 
         let hv = try XCTUnwrap(env.dockerTierConfiguration()?.hvProcess)
         let preparedRootfs = state + "/assets/dory-engine-rootfs-\(guestArch).ext4"
@@ -375,6 +418,54 @@ final class DorydConfigurationTests: XCTestCase {
         try "#!/bin/sh\nexit 0\n".write(toFile: path, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
         return path
+    }
+
+    private func supportedRawHVPlatform() -> DorydHostPlatform {
+        #if arch(x86_64)
+        DorydHostPlatform(architecture: .x86_64, macOSMajorVersion: 15)
+        #else
+        DorydHostPlatform(architecture: .arm64, macOSMajorVersion: 15)
+        #endif
+    }
+
+    private func assertEngineSelection(
+        platform: DorydHostPlatform,
+        expectedRawHV: Bool
+    ) throws {
+        let directory = "/tmp/doryd-platform-config-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+
+        let hvHelper = try executableFixture(at: directory + "/dory-hv")
+        let vmmHelper = try executableFixture(at: directory + "/dory-vmm")
+        let gvproxy = try executableFixture(at: directory + "/gvproxy")
+        let kernel = directory + "/kernel"
+        let rootfs = directory + "/rootfs.ext4"
+        FileManager.default.createFile(atPath: kernel, contents: Data())
+        FileManager.default.createFile(atPath: rootfs, contents: Data())
+
+        let environment = DorydEnvironment(values: [
+            "DORYD_HOME": directory + "/home",
+            "DORYD_STATE_DIR": directory + "/state",
+            "DORYD_HV_HELPER": hvHelper,
+            "DORYD_HV_KERNEL": kernel,
+            "DORYD_GVPROXY": gvproxy,
+            "DORYD_ENGINE_ROOTFS": rootfs,
+            "DORYD_VMM_HELPER": vmmHelper,
+            "DORYD_VMM_KERNEL": kernel,
+            "DORYD_VMM_ROOTFS": rootfs,
+            // This remains a debug enable/disable switch, not a way to bypass binary compatibility.
+            "DORYD_RAW_HV_SUPPORTED": "1",
+        ], cwd: directory, hostPlatform: platform)
+
+        let configuration = try XCTUnwrap(environment.dockerTierConfiguration())
+        if expectedRawHV {
+            XCTAssertEqual(configuration.hvProcess?.executablePath, hvHelper)
+            XCTAssertNil(configuration.vmmProcess)
+        } else {
+            XCTAssertNil(configuration.hvProcess)
+            XCTAssertEqual(configuration.vmmProcess?.executablePath, vmmHelper)
+        }
     }
 }
 
