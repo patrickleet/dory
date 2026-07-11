@@ -484,9 +484,14 @@ public struct DorydEnvironment: Sendable {
 
     /// Keep standalone doryd launches on the same elastic host-scaled defaults as Dory.app's
     /// LaunchAgent. Explicit DORYD_CPUS / DORYD_MEMORY_MB values always win.
+    ///
+    /// The vCPU count is capped at 6: measured bind-mount npm medians on an M2 Pro were 2.52 s at
+    /// 2 vCPUs, 2.38 s at 4, 2.38 s at 6, and 3.34 s at 10 (with the completion-polling guest
+    /// kernel; worse before it). Guest I/O parallelism saturates at the workload's own
+    /// concurrency, while extra vCPUs add IPI/timer load and spill onto efficiency cores.
     public static func hostScaledCPUCount(activeProcessorCount: Int = ProcessInfo.processInfo.activeProcessorCount) -> Int {
         let available = max(1, activeProcessorCount)
-        return min(available, max(4, available - 2))
+        return min(6, min(available, max(4, available - 2)))
     }
 
     public static func hostScaledMemoryMB(physicalMemory: UInt64 = ProcessInfo.processInfo.physicalMemory) -> Int {

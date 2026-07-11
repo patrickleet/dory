@@ -38,7 +38,8 @@ final class DorydConfigurationTests: XCTestCase {
     }
 
     func testHostScaledDockerDefaultsLeaveRoomForMacOS() {
-        XCTAssertEqual(DorydEnvironment.hostScaledCPUCount(activeProcessorCount: 12), 10)
+        XCTAssertEqual(DorydEnvironment.hostScaledCPUCount(activeProcessorCount: 12), 6)
+        XCTAssertEqual(DorydEnvironment.hostScaledCPUCount(activeProcessorCount: 8), 6)
         XCTAssertEqual(DorydEnvironment.hostScaledCPUCount(activeProcessorCount: 4), 4)
         XCTAssertEqual(DorydEnvironment.hostScaledCPUCount(activeProcessorCount: 2), 2)
         XCTAssertEqual(DorydEnvironment.hostScaledMemoryMB(physicalMemory: 16 * 1024 * 1024 * 1024), 8192)
