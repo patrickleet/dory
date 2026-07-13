@@ -21,10 +21,14 @@ identities, binds target collision decisions and accepted final states, and eval
 as exact verified/post-publication mappings plus unchanged unselected-source and unowned-target
 inventories. Image-only evidence cannot complete a plan containing volumes, networks, writable
 layers, or containers. The 29 focused journal/planner tests and complete 307-test Swift package
-pass, and the Apple Silicon app builds against this same package with Xcode 26.6. Migration,
-backup/restore, relocation, and upgrade must now create, persist, execute, and reconcile these
-plans; the shared foundation alone is not release completion. The owned Alpine fixture also does
-not prove the user's full 79-volume, 14-container OrbStack inventory. The accepted
+pass, and the Apple Silicon app builds against this same package with Xcode 26.6. Volume inventory
+preflight now uses a researched, strict compatibility decoder for Engine API 1.40–1.55: it accepts
+legacy `Volumes`, transitional dual-shape, and current `VolumeUsage.Items` responses, rejects
+conflicting or malformed successful responses, and never hides a malformed success through a
+legacy fallback. The combined parser and migration suites pass 74 tests. Migration,
+backup/restore, relocation, and upgrade must now create, persist, execute, and reconcile shared
+plans; the foundation and compatibility gate alone are not release completion. The owned Alpine
+fixture also does not prove the user's full 79-volume, 14-container OrbStack inventory. The accepted
 [transactional data-operations contract](docs/architecture/transactional-data-operations.md)
 replaces further one-off migration patching with one plan → quiesce → stage → verify → publish →
 validate protocol, exact dependency closure, crash recovery at every transition, read-back volume
@@ -74,7 +78,7 @@ re-sign that artifact, then repeat the exact-candidate gates before replacing th
 
 ## Verified locally
 
-- The full non-UI app gate passes **711 tests in 95 suites** after the final migration, Compose,
+- The full non-UI app gate passes **723 tests in 96 suites** after the final migration, Compose,
   and ephemeral-port preservation changes.
 - The owned live OrbStack-to-Dory migration passed against both real engine sockets. It preserved:
   image availability, named-volume bytes, custom networking, environment, command/entrypoint,
@@ -95,7 +99,7 @@ re-sign that artifact, then repeat the exact-candidate gates before replacing th
   Running machines now sample guest `/proc` through the bounded guest-agent exec path every two
   seconds, while `dorydctl machine stats` exposes a strict versioned CPU, used/total memory,
   network, block-I/O, process, and uptime schema. Four focused parser/contract tests, 24 XPC/app
-  lifecycle tests, the full Dory Core suite, the full 711-test app suite, and the offline
+  lifecycle tests, the full Dory Core suite, the full 723-test app suite, and the offline
   competitor release-policy suite pass. The exact-candidate resource gate now validates live stats
   after every resource-changing restart.
 - SSH-agent qualification now covers the separate BuildKit session path required by

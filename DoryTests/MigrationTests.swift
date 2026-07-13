@@ -114,6 +114,9 @@ final class MigrationPreflightRuntime: ContainerRuntime {
     var reportedVolumeName = "db-data"
     var reportedVolumeSize: Int64 = 3_000_000_000
     var invalidTargetUsage = false
+    var useCurrentVolumeUsageShape = false
+    var malformedCurrentVolumeUsageShape = false
+    var volumeUsageRequestPaths: [String] = []
     var filteredVolumeMountRW: Bool?
     var reportedWritableSizes: [String: Int64]?
 
@@ -213,7 +216,30 @@ final class MigrationPreflightRuntime: ContainerRuntime {
                 : Data(#"{"ImageUsage":{"TotalSize":100},"VolumeUsage":{"TotalSize":200},"ContainerUsage":{"TotalSize":300},"BuildCacheUsage":{"TotalSize":400}}"#.utf8)
             return HTTPResponse(statusCode: 200, reason: "OK", headers: [:], body: data)
         }
-        guard method == "GET", path == "/system/df?type=volume" else { return nil }
+        return volumeUsageResponse(method: method, path: path)
+    }
+
+    private func volumeUsageResponse(method: String, path: String) -> HTTPResponse? {
+        guard method == "GET", path.hasPrefix("/system/df?type=volume") else { return nil }
+        volumeUsageRequestPaths.append(path)
+        if malformedCurrentVolumeUsageShape {
+            guard path == "/system/df?type=volume&verbose=1" else { return nil }
+            return HTTPResponse(
+                statusCode: 200,
+                reason: "OK",
+                headers: [:],
+                body: Data(#"{"VolumeUsage":{"Items":[{"Name":"db-data"}]}}"#.utf8)
+            )
+        }
+        if useCurrentVolumeUsageShape {
+            guard path == "/system/df?type=volume&verbose=1" else { return nil }
+            return HTTPResponse(statusCode: 200, reason: "OK", headers: [:], body: Data(#"""
+            {"VolumeUsage":{"TotalSize":\#(reportedVolumeSize),"Items":[
+              {"Name":"\#(reportedVolumeName)","UsageData":{"Size":\#(reportedVolumeSize),"RefCount":1}}
+            ]}}
+            """#.utf8))
+        }
+        guard path == "/system/df?type=volume" else { return nil }
         return HTTPResponse(statusCode: 200, reason: "OK", headers: [:], body: Data(#"""
         {"Volumes":[
           {"Name":"\#(reportedVolumeName)","UsageData":{"Size":\#(reportedVolumeSize),"RefCount":1}}
@@ -1387,6 +1413,30 @@ struct MigrationTests {
         #expect(inventory.unknownVolumeSizes == 1)
         #expect(inventory.isVolumeSizeUnknown)
         #expect(inventory.isImportBlocked)
+    }
+
+    @Test func preflightUsesVerboseCurrentVolumeUsageWithoutLegacyArray() async throws {
+        let source = MigrationPreflightRuntime()
+        source.useCurrentVolumeUsageShape = true
+
+        let inventory = try #require(await MigrationAssistant.preflight(from: source))
+
+        #expect(inventory.estimatedVolumeBytes == source.reportedVolumeSize)
+        #expect(inventory.unknownVolumeSizes == 0)
+        #expect(inventory.volumeSizePreflightAvailable)
+        #expect(source.volumeUsageRequestPaths == ["/system/df?type=volume&verbose=1"])
+    }
+
+    @Test func successfulMalformedCurrentVolumeUsageFailsClosedWithoutLegacyFallback() async throws {
+        let source = MigrationPreflightRuntime()
+        source.malformedCurrentVolumeUsageShape = true
+
+        let inventory = try #require(await MigrationAssistant.preflight(from: source))
+
+        #expect(inventory.estimatedVolumeBytes == 0)
+        #expect(!inventory.volumeSizePreflightAvailable)
+        #expect(inventory.isImportBlocked)
+        #expect(source.volumeUsageRequestPaths == ["/system/df?type=volume&verbose=1"])
     }
 
     @Test func targetUsagePrefersExactAggregateTotalsAndFailsClosedOnInvalidLegacySizes() async throws {

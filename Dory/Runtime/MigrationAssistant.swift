@@ -615,25 +615,22 @@ enum MigrationAssistant {
     }
 
     private static func namedVolumeSizes(on runtime: any ContainerRuntime) async -> [String: Int64]? {
-        guard runtime.supportsRawProxy,
-              let response = await runtime.proxyRequest(
-                  method: "GET",
-                  path: "/system/df?type=volume",
-                  headers: [(name: "Accept", value: "application/json")],
-                  body: Data()
-              ), response.isSuccess,
-              let root = try? JSONSerialization.jsonObject(with: response.body) as? [String: Any],
-              let volumes = root["Volumes"] as? [[String: Any]] else { return nil }
-        var sizes: [String: Int64] = [:]
-        for volume in volumes {
-            guard let name = volume["Name"] as? String, !name.isEmpty,
-                  sizes[name] == nil,
-                  let usage = volume["UsageData"] as? [String: Any],
-                  let number = usage["Size"] as? NSNumber,
-                  number.int64Value >= 0 else { return nil }
-            sizes[name] = number.int64Value
+        guard runtime.supportsRawProxy else { return nil }
+        let paths = [
+            "/system/df?type=volume&verbose=1",
+            "/system/df?type=volume",
+            "/system/df"
+        ]
+        for path in paths {
+            guard let response = await runtime.proxyRequest(
+                method: "GET",
+                path: path,
+                headers: [(name: "Accept", value: "application/json")],
+                body: Data()
+            ), response.isSuccess else { continue }
+            return try? DockerDiskUsageParser.namedVolumeSizes(from: response.body)
         }
-        return sizes
+        return nil
     }
 
     private static func dockerUsage(on runtime: (any ContainerRuntime)?) async -> Int64? {
