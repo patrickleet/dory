@@ -5,7 +5,7 @@ set -euo pipefail
 
 strip_test_products=0
 root="$HOME/Library/Developer/Xcode/DerivedData"
-lsregister="/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister"
+lsregister="${DORY_LSREGISTER_BIN:-/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -100,6 +100,13 @@ while IFS= read -r -d '' app; do
   clear_xattrs "$app"
   case "$(basename "$app")" in
     DoryUITests-Runner.app) unregister_launchservices "$app" ;;
-    Dory.app) strip_test_payloads "$app" ;;
+    Dory.app)
+      # Xcode registers the test host before this scrub. macOS can retain the original provenance
+      # assessment in LaunchServices even after the xattrs are gone, yielding the misleading
+      # “damaged” dialog / IDELaunchErrorDomain Code 20. Dropping that cached registration is
+      # sufficient; xcodebuild launches the cleaned test host directly and may register it afresh.
+      unregister_launchservices "$app"
+      strip_test_payloads "$app"
+      ;;
   esac
 done < <(find "$root" -path '*/Build/Products/*' \( -name 'Dory.app' -o -name 'DoryUITests-Runner.app' \) -type d -prune -print0)

@@ -34,12 +34,11 @@ jobs:
     runs-on: [self-hosted, macOS, intel, dory]
     timeout-minutes: 120
     env:
-      READINESS_WORKDIR: ${{ runner.temp }}/dory-readiness
       READINESS_SETTLE: '8'
       ENGINES: ${{ github.event.inputs.readiness_engines || 'dory' }}
       READINESS_EXTRA_ARGS: ${{ github.event.inputs.readiness_extra_args || '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@c915c33a16f01166c17c4e35fe1d4085a2d71adb # v4
 
       - name: Select newest installed Xcode
         run: |
@@ -47,6 +46,7 @@ jobs:
           [ -n "$newest" ] || { echo "No Xcode installation found"; exit 1; }
           echo "selected: $newest"
           echo "DEVELOPER_DIR=$newest/Contents/Developer" >> "$GITHUB_ENV"
+          echo "READINESS_WORKDIR=$RUNNER_TEMP/dory-readiness" >> "$GITHUB_ENV"
 
       - name: Record Intel host facts
         run: |
@@ -79,7 +79,7 @@ jobs:
 
       - name: Upload readiness artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: intel-readiness
           path: ${{ env.READINESS_WORKDIR }}

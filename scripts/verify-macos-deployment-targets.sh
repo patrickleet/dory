@@ -79,4 +79,5 @@ verify_binary "Helpers/doryd" 14.0
 verify_binary "Helpers/dorydctl" 14.0
 verify_binary "Helpers/dory-vmm" 14.0
 verify_binary "Helpers/dory-network-helper" 14.0
+verify_binary "Helpers/dory-dataplane-proxy" 14.0
 verify_binary "Helpers/dory-hv" 15.0

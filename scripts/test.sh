@@ -5,6 +5,29 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+usage() {
+  cat <<'EOF'
+Usage: scripts/test.sh [--ui] [xcodebuild test arguments]
+
+Runs the Dory unit-test scheme by default. Use --ui (or -only-testing:DoryUITests) to select the
+dedicated shared Dory UI Tests scheme. Extra arguments are forwarded to test-without-building.
+EOF
+}
+
+scheme="Dory"
+test_args=()
+for argument in "$@"; do
+  case "$argument" in
+    -h|--help) usage; exit 0 ;;
+    --ui) scheme="Dory UI Tests" ;;
+    -only-testing:DoryUITests|-only-testing:DoryUITests/*)
+      scheme="Dory UI Tests"
+      test_args+=("$argument")
+      ;;
+    *) test_args+=("$argument") ;;
+  esac
+done
+
 find_xcode() {
   local dev app found
   for app in /Applications/Xcode.app /Applications/Xcode-*.app \
@@ -34,7 +57,17 @@ if [ -z "${DEVELOPER_DIR:-}" ]; then
   fi
 fi
 
-xcode_args=(-project Dory.xcodeproj -scheme Dory -destination 'platform=macOS')
+cleanup_test_products() {
+  scripts/clean-xcode-products.sh
+}
+trap cleanup_test_products EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+xcode_args=(-project Dory.xcodeproj -scheme "$scheme" -destination 'platform=macOS')
+if [ "$scheme" = "Dory UI Tests" ]; then
+  xcode_args+=(-parallel-testing-enabled NO)
+fi
 if [ -n "${CI:-}" ]; then
   xcode_args+=(CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO)
 fi
@@ -51,5 +84,11 @@ sed -i '' 's/objectVersion = 110;/objectVersion = 77;/' Dory.xcodeproj/project.p
 # launchable without changing source files.
 scripts/clean-xcode-products.sh
 
-xcodebuild "${xcode_args[@]}" test-without-building "$@"
+if [ "${#test_args[@]}" -gt 0 ]; then
+  xcodebuild "${xcode_args[@]}" test-without-building "${test_args[@]}"
+else
+  # Bash 3.2 (the system /bin/bash on supported macOS releases) raises "unbound variable"
+  # for an empty-array expansion under `set -u`. The unfiltered full suite is the common path.
+  xcodebuild "${xcode_args[@]}" test-without-building
+fi
 scripts/clean-xcode-products.sh

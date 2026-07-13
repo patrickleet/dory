@@ -5,7 +5,65 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 LOG="${DORY_CI_TEST_LOG:-/tmp/dory_ci_tests.log}"
 
-ALLOW='^$'
+# shellcheck source=ci-test-support.sh
+source scripts/ci-test-support.sh
+
+if ! bash scripts/test-ci-test-support.sh; then
+  echo "ci-test: log parser tests failed" >&2
+  exit 1
+fi
+
+# Release bundles must carry one exact, universal Dory dual-stack gvproxy payload. This gate is offline and tests
+# checksum, architecture, version, override, and source-selection regressions.
+if ! bash scripts/test-gvproxy-payload.sh; then
+  echo "ci-test: gvproxy payload policy tests failed" >&2
+  exit 1
+fi
+
+if ! bash scripts/test-host-cli-payload.sh; then
+  echo "ci-test: host CLI payload policy tests failed" >&2
+  exit 1
+fi
+
+if ! bash scripts/test-release-outputs.sh; then
+  echo "ci-test: public release output contract tests failed" >&2
+  exit 1
+fi
+
+if ! bash scripts/test-release-upgrade-rollback-smoke.sh; then
+  echo "ci-test: release upgrade/rollback safety tests failed" >&2
+  exit 1
+fi
+
+if ! bash scripts/test-verify-sparkle-update.sh; then
+  echo "ci-test: Sparkle signature/key compatibility tests failed" >&2
+  exit 1
+fi
+
+if ! bash scripts/test-clean-release-source.sh; then
+  echo "ci-test: clean public-release source tests failed" >&2
+  exit 1
+fi
+
+if ! bash scripts/test-clean-xcode-products.sh; then
+  echo "ci-test: Xcode test-host LaunchServices cleanup tests failed" >&2
+  exit 1
+fi
+
+if ! bash scripts/test-readiness-offline.sh; then
+  echo "ci-test: readiness fail-closed regression tests failed" >&2
+  exit 1
+fi
+
+if ! bash scripts/test-competitor-release-gates.sh; then
+  echo "ci-test: competitor-derived release gate tests failed" >&2
+  exit 1
+fi
+
+if ! bash scripts/test-sleep-wake-evidence.sh; then
+  echo "ci-test: physical sleep/wake evidence verifier tests failed" >&2
+  exit 1
+fi
 
 # Gate on the doctor helper's own tests: without `set -e` a failing exit here would be swallowed
 # by the pipefail-only shell, letting CI pass on a broken diagnostic surface.
@@ -22,6 +80,10 @@ if ! bash scripts/test-benchmark-external-network.sh; then
 fi
 if ! bash scripts/test-benchmark-user-workflows.sh; then
   echo "ci-test: user-workflow benchmark tests failed" >&2
+  exit 1
+fi
+if ! bash scripts/test-benchmark-campaign.sh; then
+  echo "ci-test: destructive benchmark campaign safety tests failed" >&2
   exit 1
 fi
 
@@ -55,23 +117,24 @@ fi
 last_reason=""
 for attempt in 1 2; do
   bash scripts/test.sh -skip-testing:DoryUITests 2>&1 | tee "$LOG"
+  test_rc=${PIPESTATUS[0]}
 
-  passed=$(grep -cE "Test case '.*' passed" "$LOG" || true)
-  failed=$(grep -oE "Test case '[^']+' failed" "$LOG" | sort -u || true)
-  unexpected=$(printf '%s\n' "$failed" | grep -vE "$ALLOW" | grep -vE '^$' || true)
+  passed="$(dory_ci_count_completed_tests "$LOG")"
+  failed="$(dory_ci_failure_lines "$LOG")"
 
-  echo "ci-gate: attempt=$attempt passed=$passed"
-  if [ -n "$failed" ]; then printf 'ci-gate known-flaky or failed:\n%s\n' "$failed"; fi
+  echo "ci-gate: attempt=$attempt exit=$test_rc completed=$passed"
+  if [ -n "$failed" ]; then printf 'ci-gate failure evidence:\n%s\n' "$failed"; fi
 
-  if [ -z "$unexpected" ] && [ "${passed:-0}" -ge 300 ]; then
-    echo "ci-gate: OK — suite ran to completion with no unexpected failures"
+  if [ "$test_rc" -eq 0 ] && [ "${passed:-0}" -ge 300 ]; then
+    echo "ci-gate: OK — suite ran to completion with a successful test exit"
     exit 0
   fi
 
-  if [ -n "$unexpected" ]; then
-    last_reason="unexpected failures:\n$unexpected"
+  if [ "$test_rc" -ne 0 ]; then
+    last_reason="test command exited $test_rc"
+    [ -n "$failed" ] && last_reason="$last_reason; failure evidence:\n$failed"
   else
-    last_reason="only $passed tests ran (shared-runner host death)"
+    last_reason="only $passed tests completed (shared-runner host death)"
   fi
   [ "$attempt" -lt 2 ] && echo "ci-gate: attempt $attempt not clean ($last_reason); retrying once"
 done

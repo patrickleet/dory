@@ -6,17 +6,17 @@ cask "dory" do
 
   url "https://github.com/Augani/dory/releases/download/v#{version}/Dory-#{version}.zip"
   name "Dory"
-  desc "Lightweight Docker and Linux container runtime"
+  desc "Native Docker and Linux container runtime"
   homepage "https://github.com/Augani/dory"
 
-  # The cask intentionally follows the unsuffixed universal artifact. GitHub releases also publish
-  # smaller arm64 and x86_64 downloads for users who want a platform-optimized app. Dory's built-in
-  # shared-VM engine needs macOS 15 (Sequoia) or later; on macOS 14 Dory runs against any
-  # Docker-compatible engine. The engine is bundled when release assets are available.
+  # Dory's first public production track is Apple Silicon. Intel support remains on the roadmap.
+  depends_on arch: :arm64
   depends_on macos: :sonoma
 
   app "Dory.app"
 
+  # Preserve ~/Library/Application Support/Dory/Dory.dorydrive: uninstall and --zap must never
+  # remove images, containers, volumes, networks, machines, or other user workload data.
   zap trash: [
     "~/.dory",
     "~/Library/Application Support/com.pythonxi.Dory",

@@ -1,11 +1,10 @@
 #!/bin/bash
 # Dory release pipeline: archive + Developer ID sign -> notarize -> staple -> zip/dmg.
 #
-# Default release shape:
-#   * Dory-<version>-arm64.zip      Apple silicon optimized app
-#   * Dory-<version>-x86_64.zip     Intel optimized app
-#   * Dory-<version>-universal.zip  Universal app
-#   * Dory-<version>.zip            Compatibility alias for the universal app
+# Default release shape (Apple Silicon first):
+#   * Dory-<version>-arm64.zip      Apple silicon app
+#   * Dory-<version>.zip            Compatibility alias for the arm64 app
+# Intel/universal variants remain available for development builds but are not public defaults.
 #
 # Requires (one-time, your Apple Developer account -- the external gate):
 #   * A "Developer ID Application" certificate in your keychain.
@@ -22,7 +21,7 @@ if [ -z "${DEVELOPER_DIR:-}" ]; then
     [ -x "$app/Contents/Developer/usr/bin/xcodebuild" ] && { export DEVELOPER_DIR="$app/Contents/Developer"; break; }
   done
 fi
-cd "$(dirname "$0")/.."
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 VERSION="${1:-0.1.0}"
 # Monotonic build number (CFBundleVersion). Sparkle compares this to detect updates. CI passes
@@ -32,8 +31,9 @@ BUILD_DIR="${DORY_RELEASE_BUILD_DIR:-release-build}"
 NOTARY_PROFILE="${DORY_NOTARY_PROFILE:-dory-notary}"
 TEAM="${NOTARY_TEAM_ID:-864H636QW4}"
 NOTARY_TEAM_ID="${NOTARY_TEAM_ID:-$TEAM}"
-RELEASE_VARIANTS="${DORY_RELEASE_VARIANTS:-arm64 x86_64 universal}"
+RELEASE_VARIANTS="${DORY_RELEASE_VARIANTS:-arm64}"
 SIGN_IDENTITY="${DORY_SIGN_ID:-Developer ID Application}"
+SOURCE_COMMIT="${DORY_RELEASE_SOURCE_COMMIT:-$(git rev-parse HEAD 2>/dev/null || true)}"
 
 notarize() {
   if [ -n "${NOTARY_APPLE_ID:-}" ]; then
@@ -134,6 +134,71 @@ preflight_macos_floor() {
   done
 }
 
+preflight_public_release() {
+  [ "${DORY_PUBLIC_RELEASE:-0}" = "1" ] || return 0
+
+  [ "$VERSION" = "${VERSION#v}" ] \
+    || release_error "public release version must not include a leading v: $VERSION"
+  printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$' \
+    || release_error "public release version must be SemVer-like (for example 0.3.0): $VERSION"
+  case "$BUILD" in
+    ''|*[!0-9]*) release_error "public release build must be a positive integer: $BUILD" ;;
+    0) release_error "public release build must be greater than zero" ;;
+  esac
+  printf '%s\n' "$SOURCE_COMMIT" | grep -Eq '^[0-9a-f]{40}$' \
+    || release_error "public release source commit must be a full lowercase Git SHA: ${SOURCE_COMMIT:-missing}"
+  [ "$SOURCE_COMMIT" = "$(git rev-parse HEAD)" ] \
+    || release_error "public release source commit $SOURCE_COMMIT does not match checkout $(git rev-parse HEAD)"
+
+  [ "${DORY_BUNDLE_ENGINE:-1}" = "1" ] \
+    || release_error "public releases must bundle the engine"
+  [ "$RELEASE_VARIANTS" = "arm64" ] \
+    || release_error "public releases must build exactly the Apple Silicon variant: arm64"
+  [ "${DORY_REQUIRE_BUNDLE_ASSETS:-1}" = "1" ] \
+    || release_error "public releases must require every bundle asset"
+  [ "${DORY_REQUIRE_DEVELOPER_ID_SIGNATURES:-1}" = "1" ] \
+    || release_error "public releases must require Developer ID signatures"
+  [ "${DORY_BUNDLE_VENUS:-1}" = "1" ] \
+    || release_error "public full releases advertise the Apple-silicon Venus GPU payload and must bundle it"
+  [ "${DORY_BUNDLE_VENUS_REQUIRED:-0}" = "1" ] \
+    || release_error "public full releases must fail when the advertised Venus renderer is unavailable"
+  [ "$SIGN_IDENTITY" != "-" ] \
+    || release_error "public releases cannot use ad-hoc signing"
+  [ "${DORY_SKIP_NOTARIZE:-0}" != "1" ] \
+    || release_error "public releases cannot skip notarization"
+  [ "${DORY_SKIP_SIGNING_PREFLIGHT:-0}" != "1" ] \
+    || release_error "public releases cannot skip signing preflight"
+  [ "${DORY_ALLOW_ADHOC_SIGN:-0}" != "1" ] \
+    || release_error "public releases cannot allow ad-hoc nested-code fallback"
+  [ "${DORY_ALLOW_UNVERIFIED_GUEST_ASSETS:-0}" != "1" ] \
+    || release_error "public releases cannot use unverified guest assets"
+  [ "${DORY_ALLOW_MISSING_HOST_CLI:-0}" != "1" ] \
+    || release_error "public releases cannot omit clean-Mac host CLIs"
+  [ "${DORY_BUILD_APPCAST:-1}" = "1" ] \
+    || release_error "public releases must generate an appcast"
+  [ "${DORY_BUILD_APP_UPDATE:-1}" = "1" ] \
+    || release_error "public releases must generate the app-update ZIP referenced by the appcast"
+  [ "${DORY_APPCAST_PREFER_APP_UPDATE:-1}" = "1" ] \
+    || release_error "public releases must point Sparkle at the self-contained app-update ZIP"
+  [ "${DORY_BUILD_LITE:-1}" = "1" ] \
+    || release_error "public releases must generate the documented lite ZIP"
+  [ "${DORY_BUILD_RUNTIME:-1}" = "1" ] \
+    || release_error "public releases must generate the documented headless runtime"
+  [ "${DORY_MAKE_DMG:-1}" = "1" ] \
+    || release_error "public releases must generate DMGs"
+  [ -z "${DORY_APPCAST_ZIP:-}" ] \
+    || release_error "public releases cannot redirect the appcast to an external ZIP override"
+  [ -z "${DORY_SPARKLE_ED_SIGNATURE:-}" ] \
+    || release_error "public releases must create the Sparkle signature from the configured private key"
+
+  local cli_version
+  cli_version="$(sed -nE 's/^DORY_CLI_VERSION="([^"]+)"$/\1/p' scripts/dory | head -1)"
+  [ "$cli_version" = "$VERSION" ] \
+    || release_error "scripts/dory version $cli_version does not match public release $VERSION"
+  scripts/verify-clean-release-source.sh . >/dev/null \
+    || release_error "public release source does not exactly match commit $SOURCE_COMMIT"
+}
+
 release_host_guest_arch() {
   [ "$(uname -m)" = x86_64 ] && printf '%s\n' amd64 || printf '%s\n' arm64
 }
@@ -173,7 +238,7 @@ guest_override_name() {
 preflight_guest_assets() {
   [ "${DORY_BUNDLE_ENGINE:-1}" = "1" ] || return 0
   local arch name value hv_kernel vm_kernel initfs agent engine_rootfs gpu_kernel
-  local missing="" override_names="" kernel_verify_arches="" initfs_verify_arches=""
+  local missing="" override_names="" kernel_verify_arches="" gpu_verify_arches="" initfs_verify_arches=""
 
   for arch in $(release_guest_arches); do
     hv_kernel="$(guest_override_name DORY_HV_KERNEL "$arch")"
@@ -182,8 +247,11 @@ preflight_guest_assets() {
     agent="$(guest_override_name DORY_GUEST_AGENT "$arch")"
     engine_rootfs="$(guest_override_name DORY_ENGINE_ROOTFS "$arch")"
     gpu_kernel=""
-    if [ "${DORY_BUNDLE_VENUS:-1}" = "1" ]; then
+    # Venus is currently advertised and verified only on Apple silicon. Never infer an untested
+    # Intel GPU guarantee merely because the public app also carries an x86_64 CPU slice.
+    if [ "${DORY_BUNDLE_VENUS:-1}" = "1" ] && [ "$arch" = arm64 ]; then
       gpu_kernel="$(guest_override_name DORY_HV_GPU_KERNEL "$arch")"
+      [ -n "$gpu_kernel" ] || gpu_verify_arches="$gpu_verify_arches $arch"
     fi
 
     for name in "$hv_kernel" "$vm_kernel" "$initfs" "$agent" "$engine_rootfs" "$gpu_kernel"; do
@@ -249,6 +317,16 @@ preflight_guest_assets() {
         fi
         ;;
     esac
+    case " $gpu_verify_arches " in
+      *" $arch "*)
+        if [ ! -f "guest/out/Image-gpu" ]; then
+          missing="$missing arm64-gpu-kernel(guest/out/Image-gpu)"
+        else
+          DORY_EXPERIMENTAL_GPU=1 guest/kernel/verify-build.sh arm64 >/dev/null \
+            || release_error "arm64 GPU kernel is stale or missing required Venus features"
+        fi
+        ;;
+    esac
   done
   [ -z "$missing" ] || release_error "engine-bundled release needs guest assets on this runner; missing:$missing. Build them with guest/kernel/build.sh and guest/initfs/build.sh (or use the matching DORY_HV_KERNEL_*, DORY_KERNEL_*, DORY_INITFS_*, DORY_GUEST_AGENT_*, and DORY_ENGINE_ROOTFS_* overrides with the explicit development escape), or set DORY_BUNDLE_ENGINE=0 for an app-only dry-run"
 }
@@ -259,6 +337,7 @@ preflight_release() {
   for tool in xcodebuild codesign xcrun ditto lipo shasum plutil security; do
     require_tool "$tool"
   done
+  preflight_public_release
   preflight_macos_floor
   preflight_guest_assets
   if [ "${DORY_MAKE_DMG:-1}" = "1" ]; then
@@ -319,10 +398,12 @@ verify_codesign() {
 }
 
 verify_developer_id_signature() {
-  local path="$1"
+  local path="$1" details
   [ "${DORY_REQUIRE_DEVELOPER_ID_SIGNATURES:-1}" = "1" ] || return 0
   [ "$SIGN_IDENTITY" != "-" ] || return 0
-  codesign -dv "$path" 2>&1 | grep -q 'Authority=Developer ID Application' \
+  details="$(codesign -dv --verbose=4 "$path" 2>&1)" \
+    || release_error "could not inspect code signature for $path"
+  printf '%s\n' "$details" | grep 'Authority=Developer ID Application' >/dev/null \
     || release_error "$path is not signed by a Developer ID Application certificate"
 }
 
@@ -347,17 +428,17 @@ verify_full_bundle() {
   launch_agent="$resources/dev.dory.doryd.plist"
 
   echo "==> Verifying full clean-Mac bundle payload..."
-  for helper in doryd dorydctl dory-vmm dory-network-helper dory-hv gvproxy docker docker-compose kubectl dory dory-doctor; do
+  for helper in doryd dorydctl dory-vmm dory-network-helper dory-dataplane-proxy dory-hv gvproxy docker docker-buildx docker-compose kubectl dory dory-doctor; do
     assert_executable_exists "$helpers/$helper" "bundled helper"
   done
-  for helper in doryd dorydctl dory-vmm dory-network-helper dory-hv; do
+  for helper in doryd dorydctl dory-vmm dory-network-helper dory-dataplane-proxy dory-hv; do
     assert_macho_arches "$helpers/$helper" "$HELPER_ARCHES"
   done
-  for helper in gvproxy docker docker-compose kubectl; do
+  for helper in gvproxy docker docker-buildx docker-compose kubectl; do
     assert_macho_arches "$helpers/$helper" "$HOST_CLI_ARCHES"
   done
   scripts/verify-macos-deployment-targets.sh "$app" "$HELPER_ARCHES"
-  for helper in doryd dorydctl dory-vmm dory-network-helper dory-hv gvproxy docker docker-compose kubectl dory dory-doctor; do
+  for helper in doryd dorydctl dory-vmm dory-network-helper dory-dataplane-proxy dory-hv gvproxy docker docker-buildx docker-compose kubectl dory dory-doctor; do
     verify_developer_id_signature "$helpers/$helper"
   done
 
@@ -369,10 +450,21 @@ verify_full_bundle() {
     assert_file_exists "$resources/dory-vm-kernel-$asset_arch.lzfse" "compressed VZ kernel"
     assert_file_exists "$resources/dory-vm-initfs-$asset_arch.ext4.lzfse" "compressed VZ initfs"
     assert_file_exists "$resources/dory-engine-rootfs-$asset_arch.ext4.lzfse" "engine rootfs"
+    assert_file_exists "$resources/dory-kernel-build-$asset_arch.stamp" "kernel provenance stamp"
+    assert_file_exists "$resources/dory-initfs-build-$asset_arch.stamp" "initfs provenance stamp"
+    if [ "$asset_arch" = arm64 ] && [ "${DORY_BUNDLE_VENUS:-1}" = "1" ]; then
+      assert_file_exists "$resources/dory-hv-kernel-gpu-arm64.lzfse" "Apple-silicon GPU kernel"
+      assert_file_exists "$resources/dory-kernel-build-arm64-gpu.stamp" "Apple-silicon GPU kernel provenance"
+    fi
   done
   assert_file_exists "$resources/dory-engine-rootfs.ext4.lzfse" "engine rootfs"
+  assert_file_exists "$resources/gvproxy-provenance.txt" "gvproxy provenance"
+  assert_file_exists "$resources/host-cli-provenance.txt" "host CLI provenance"
+  assert_file_exists "$resources/dory-payload-sha256.txt" "payload digest inventory"
   assert_file_exists "$launch_agent" "bundled launchd plist"
   plutil -lint "$launch_agent" >/dev/null
+  (cd "$app" && shasum -a 256 -c "Contents/Resources/dory-payload-sha256.txt" >/dev/null) \
+    || release_error "$app payload digest inventory does not match bundled helpers/resources"
 }
 
 sign_app() {
@@ -477,6 +569,7 @@ json_escape() {
 
 artifact_kind() {
   case "$1" in
+    *.cdx.json) printf '%s' "cyclonedx-json" ;;
     *.dmg) printf '%s' "dmg" ;;
     *.zip) printf '%s' "zip" ;;
     *.tar.gz) printf '%s' "tar.gz" ;;
@@ -489,9 +582,11 @@ write_release_manifest() {
   first=1
   {
     echo "{"
-    echo "  \"schemaVersion\": 1,"
+    echo "  \"schemaVersion\": 2,"
     echo "  \"version\": \"$(json_escape "$VERSION")\","
     echo "  \"build\": \"$(json_escape "$BUILD")\","
+    echo "  \"sourceCommit\": \"$(json_escape "$SOURCE_COMMIT")\","
+    echo "  \"publicRelease\": $([ "${DORY_PUBLIC_RELEASE:-0}" = "1" ] && echo true || echo false),"
     echo "  \"bundleEngine\": $([ "${DORY_BUNDLE_ENGINE:-1}" = "1" ] && echo true || echo false),"
     echo "  \"notarized\": $([ "${DORY_SKIP_NOTARIZE:-0}" = "1" ] && echo false || echo true),"
     echo "  \"variants\": \"$(json_escape "$RELEASE_VARIANTS")\","
@@ -505,7 +600,7 @@ write_release_manifest() {
       first=0
       printf '    {"name":"%s","path":"%s","kind":"%s","bytes":%s,"sha256":"%s"}' \
         "$(json_escape "$(basename "$artifact")")" \
-        "$(json_escape "$artifact")" \
+        "$(json_escape "$(basename "$artifact")")" \
         "$kind" \
         "$(file_size_bytes "$artifact")" \
         "$(sha256_file "$artifact")"
@@ -528,6 +623,10 @@ build_appcast_enabled() {
   esac
 }
 
+if [ "${DORY_RELEASE_SOURCE_ONLY:-0}" = "1" ]; then
+  if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; else exit 0; fi
+fi
+
 preflight_release
 if [ "${DORY_RELEASE_PREFLIGHT_ONLY:-0}" = "1" ]; then
   echo "==> Preflight-only mode passed."
@@ -545,6 +644,8 @@ UNIVERSAL_ZIP=""
 UNIVERSAL_DMG=""
 UNIVERSAL_APP=""
 ARM64_APP=""
+ARM64_ZIP=""
+ARM64_DMG=""
 
 for requested in $RELEASE_VARIANTS; do
   configure_variant "$requested"
@@ -593,7 +694,11 @@ for requested in $RELEASE_VARIANTS; do
   [ -f "$DMG" ] && DMGS+=("$DMG")
 
   case "$VARIANT" in
-    arm64) ARM64_APP="$APP" ;;
+    arm64)
+      ARM64_APP="$APP"
+      ARM64_ZIP="$ZIP"
+      [ -f "$DMG" ] && ARM64_DMG="$DMG"
+      ;;
     universal)
       UNIVERSAL_ZIP="$ZIP"
       [ -f "$DMG" ] && UNIVERSAL_DMG="$DMG"
@@ -602,22 +707,25 @@ for requested in $RELEASE_VARIANTS; do
   esac
 done
 
-# Keep the historic cask/download filenames pointed at the universal artifact.
+# Keep the historic cask/download filenames as aliases for the public primary artifact. During the
+# Apple-Silicon-first phase that is arm64; a future universal release can take precedence unchanged.
 COMPAT_ZIP=""
 COMPAT_DMG=""
-if [ -n "$UNIVERSAL_ZIP" ]; then
+PRIMARY_ZIP="${UNIVERSAL_ZIP:-$ARM64_ZIP}"
+PRIMARY_DMG="${UNIVERSAL_DMG:-$ARM64_DMG}"
+if [ -n "$PRIMARY_ZIP" ]; then
   COMPAT_ZIP="$BUILD_DIR/Dory-$VERSION.zip"
-  copy_alias "$UNIVERSAL_ZIP" "$COMPAT_ZIP"
+  copy_alias "$PRIMARY_ZIP" "$COMPAT_ZIP"
   ZIPS+=("$COMPAT_ZIP")
 fi
-if [ -n "$UNIVERSAL_DMG" ]; then
+if [ -n "$PRIMARY_DMG" ]; then
   COMPAT_DMG="$BUILD_DIR/Dory-$VERSION.dmg"
-  copy_alias "$UNIVERSAL_DMG" "$COMPAT_DMG"
+  copy_alias "$PRIMARY_DMG" "$COMPAT_DMG"
   DMGS+=("$COMPAT_DMG")
 fi
 
 # ---- Extra release flavors ---------------------------------------------------------------
-# lite: app only, universal when the universal variant is built.
+# lite: app only, from the public primary archive.
 LITE_ZIP=""
 if [ "${DORY_BUNDLE_ENGINE:-1}" = "1" ] && [ "${DORY_BUILD_LITE:-1}" = "1" ]; then
   LITE_ARCHIVE="${UNIVERSAL_ARCHIVE:-$FIRST_ARCHIVE}"
@@ -665,9 +773,7 @@ if [ "${DORY_BUNDLE_ENGINE:-1}" = "1" ] && [ "${DORY_BUILD_APP_UPDATE:-1}" = "1"
   fi
 fi
 
-# Headless runtime stays arm64 for now because scripts/runtime/dory-engine is currently the
-# Apple-silicon CLI runtime. The platform-optimized app artifacts above are the primary download
-# surface for Intel + universal distribution.
+# Headless runtime is arm64 during the Apple-Silicon-first release phase.
 RUNTIME_TAR=""
 if [ "${DORY_BUNDLE_ENGINE:-1}" = "1" ] && [ "${DORY_BUILD_RUNTIME:-1}" = "1" ] && [ -n "$ARM64_APP" ]; then
   echo "==> Packaging standalone engine runtime..."
@@ -677,6 +783,7 @@ if [ "${DORY_BUNDLE_ENGINE:-1}" = "1" ] && [ "${DORY_BUILD_RUNTIME:-1}" = "1" ] 
   mkdir -p "$RUNTIME_DIR/bin" "$RUNTIME_DIR/share/dory"
   cp "$ARM64_APP/Contents/Helpers/dory-hv" "$RUNTIME_DIR/bin/"
   cp "$ARM64_APP/Contents/Helpers/gvproxy" "$RUNTIME_DIR/bin/"
+  cp "$ARM64_APP/Contents/Helpers/dory-dataplane-proxy" "$RUNTIME_DIR/bin/"
   cp "$ARM64_APP/Contents/Resources/dory-hv-kernel-arm64.lzfse" "$RUNTIME_DIR/share/dory/"
   [ -f "$ARM64_APP/Contents/Resources/dory-agent-linux-arm64" ] && cp "$ARM64_APP/Contents/Resources/dory-agent-linux-arm64" "$RUNTIME_DIR/share/dory/"
   if [ -f "$ARM64_APP/Contents/Resources/dory-engine-rootfs-arm64.ext4.lzfse" ]; then
@@ -690,10 +797,11 @@ if [ "${DORY_BUNDLE_ENGINE:-1}" = "1" ] && [ "${DORY_BUILD_RUNTIME:-1}" = "1" ] 
 # dory-engine $VERSION (arm64)
 
 Dory's container engine as a standalone, Colima-style runtime: one shared Linux VM running
-dockerd, with memory returned to macOS as workloads idle.
+dockerd, with virtio free-page reporting. Host-pressure reclaim remains opt-in and experimental.
 
-    ./dory-engine start          # boots the engine, publishes ~/.dory/engine.sock
-    ./dory-engine start --amd64  # also enable x86/amd64 images via QEMU emulation
+    ./dory-engine start          # boots the engine; bundled FEX/amd64 is on by default
+    ./dory-engine start --no-amd64 # explicit native-only opt-out
+    ./dory-engine start --lan-visible # opt in to wildcard publication for wildcard Docker binds
     docker context use dory-engine
     docker run --rm alpine echo hello
 
@@ -701,6 +809,17 @@ dockerd, with memory returned to macOS as workloads idle.
 EOF
   tar -czf "$BUILD_DIR/$RUNTIME_NAME.tar.gz" -C "$BUILD_DIR/runtime" "$RUNTIME_NAME"
   RUNTIME_TAR="$BUILD_DIR/$RUNTIME_NAME.tar.gz"
+fi
+
+SBOM=""
+SBOM_APP="${UNIVERSAL_APP:-$ARM64_APP}"
+if [ -n "$SBOM_APP" ] && [ -d "$SBOM_APP" ]; then
+  SBOM="$BUILD_DIR/Dory-$VERSION.cdx.json"
+  echo "==> Generating exact app-tree CycloneDX SBOM..."
+  scripts/generate-release-sbom.py \
+    --app "$SBOM_APP" --version "$VERSION" --source-commit "$SOURCE_COMMIT" --output "$SBOM"
+  scripts/verify-release-sbom.py \
+    --sbom "$SBOM" --app "$SBOM_APP" --version "$VERSION" --source-commit "$SOURCE_COMMIT"
 fi
 
 DEFAULT_ZIP="${COMPAT_ZIP:-${UNIVERSAL_ZIP:-${ZIPS[0]:-}}}"
@@ -742,7 +861,7 @@ if [ "${#DMGS[@]}" -gt 0 ]; then
     echo "    $artifact  (sha256: $(sha256_file "$artifact"))"
   done
 fi
-for artifact in "$LITE_ZIP" "$APP_UPDATE_ZIP" "$RUNTIME_TAR"; do
+for artifact in "$LITE_ZIP" "$APP_UPDATE_ZIP" "$RUNTIME_TAR" "$SBOM"; do
   [ -n "$artifact" ] && [ -f "$artifact" ] || continue
   echo "    $artifact  (sha256: $(sha256_file "$artifact"))"
 done
@@ -758,7 +877,7 @@ if [ "${#DMGS[@]}" -gt 0 ]; then
     MANIFEST_ARTIFACTS+=("$artifact")
   done
 fi
-MANIFEST_ARTIFACTS+=("$LITE_ZIP" "$APP_UPDATE_ZIP" "$RUNTIME_TAR" "$APPCAST")
+MANIFEST_ARTIFACTS+=("$LITE_ZIP" "$APP_UPDATE_ZIP" "$RUNTIME_TAR" "$APPCAST" "$SBOM")
 MANIFEST="$(write_release_manifest "${MANIFEST_ARTIFACTS[@]}")"
 echo "    $MANIFEST  (release manifest)"
 [ -n "$APPCAST" ] && echo "    $APPCAST  (Sparkle appcast)"
@@ -774,6 +893,7 @@ if [ -n "${GITHUB_OUTPUT:-}" ]; then
     echo "lite=$LITE_ZIP"
     echo "app_update=$APP_UPDATE_ZIP"
     echo "runtime=$RUNTIME_TAR"
+    echo "sbom=$SBOM"
     echo "manifest=$MANIFEST"
     echo "appcast=$APPCAST"
     echo "appcast_zip=$APPCAST_ZIP"
