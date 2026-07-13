@@ -754,7 +754,7 @@ else
   GVPROXY_SOURCE_KIND="pinned-source-build"
   GVPROXY_TMP="$(mktemp "${TMPDIR:-/tmp}/dory-gvproxy-${GVPROXY_VERSION}.XXXXXX")"
   GVPROXY_BUILD_PROVENANCE="$GVPROXY_TMP.provenance"
-  echo "    building provenance-pinned dual-stack gvproxy $GVPROXY_VERSION…"
+  echo "    building provenance-pinned dual-stack gvproxy ${GVPROXY_VERSION}…"
   if scripts/build-gvproxy.sh --output "$GVPROXY_TMP" --provenance "$GVPROXY_BUILD_PROVENANCE"; then
     GVPROXY_SRC="$GVPROXY_TMP"
   else

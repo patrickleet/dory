@@ -288,6 +288,23 @@ if grep -Eq 'find_qemu_static|inject_qemu_into_initfs|DORY_QEMU_(X86_64|AARCH64)
     scripts/bundle-engine.sh; then
   fail "app bundling can still depend on or inject an unpinned host qemu-user runtime"
 fi
+python3 - <<'PY'
+from pathlib import Path
+import re
+
+unsafe_boundary = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]")
+failures = []
+for path in Path("scripts").rglob("*.sh"):
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        match = unsafe_boundary.search(line)
+        if match:
+            failures.append(f"{path}:{line_number}: {match.group()!r}")
+if failures:
+    raise SystemExit(
+        "unbraced shell variable touches non-ASCII text and may become a locale-dependent name:\n"
+        + "\n".join(failures)
+    )
+PY
 grep -F 'runtime_mount="$(awk "\$2 == \"/run/dory-fex\"' \
   scripts/nonnative-mmdebstrap-gate.sh >/dev/null \
   || fail "mmdebstrap post-build mount verification can escape its container shell quoting"
