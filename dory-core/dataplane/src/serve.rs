@@ -6,7 +6,7 @@
 //! The shape per connection: one backend connection (dialed lazily on the first request), a blind
 //! response pump backend→client (responses are never parsed), and a request loop client→backend
 //! that tracks request boundaries (content-length framed). A `create` body is rewritten in place;
-//! a hijack/upgrade request (attach/exec/build/pull) drops the rest of the connection into a raw
+//! a hijack/upgrade request (attach/exec/build/load) drops the rest of the connection into a raw
 //! splice; everything else streams through verbatim. Half-close is preserved in both directions:
 //! client EOF becomes backend `SHUT_WR`, backend EOF becomes client `SHUT_WR`.
 //!
@@ -16,7 +16,9 @@
 //! The backend is abstracted so the embedding VMM supplies the real transport (the captive vsock
 //! stream), while tests supply an in-memory `dockerd`.
 
+use std::collections::BTreeSet;
 use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -74,6 +76,260 @@ impl ActivityReporter {
 /// A docker create body is small JSON (a few KB). Anything past this is malformed or hostile and is
 /// rejected before it can overflow the request-length arithmetic.
 const MAX_CREATE_BODY: usize = 8 * 1024 * 1024;
+const MAX_INSPECT_BODY: usize = 2 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum HostPortProtocol {
+    Tcp,
+    Udp,
+}
+
+/// Fixed host ports requested by Docker create. Dory's dockerd runs in the guest, so it cannot see
+/// listeners already occupying the corresponding macOS port. Probe those ports before forwarding
+/// create; otherwise Docker reports success while the host forwarder retries invisibly forever.
+fn requested_fixed_host_ports(body: &[u8]) -> BTreeSet<(HostPortProtocol, SocketAddr)> {
+    let Ok(root) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return BTreeSet::new();
+    };
+    let Some(bindings) = root
+        .get("HostConfig")
+        .and_then(|value| value.get("PortBindings"))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return BTreeSet::new();
+    };
+    let mut requested = BTreeSet::new();
+    for (container_port, entries) in bindings {
+        let Some((_, protocol)) = container_port.rsplit_once('/') else {
+            continue;
+        };
+        let protocol = match protocol.to_ascii_lowercase().as_str() {
+            "tcp" | "tcp6" => HostPortProtocol::Tcp,
+            "udp" | "udp6" => HostPortProtocol::Udp,
+            _ => continue,
+        };
+        let Some(entries) = entries.as_array() else {
+            continue;
+        };
+        for entry in entries {
+            let Some(host_port) = entry
+                .get("HostPort")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| value.parse::<u16>().ok())
+                .filter(|port| *port != 0)
+            else {
+                continue;
+            };
+            // Dory maps privileged guest publications to an unprivileged host port by contract.
+            let local_port = if host_port < 1024 {
+                60_000 + host_port
+            } else {
+                host_port
+            };
+            let host_ip = entry
+                .get("HostIp")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim_matches(['[', ']']);
+            let addresses: Vec<IpAddr> = match host_ip {
+                "127.0.0.1" => vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+                "::1" => vec![IpAddr::V6(Ipv6Addr::LOCALHOST)],
+                "localhost" | "" | "0.0.0.0" | "::" => vec![
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    IpAddr::V6(Ipv6Addr::LOCALHOST),
+                ],
+                value => value.parse::<IpAddr>().map_or_else(
+                    |_| {
+                        vec![
+                            IpAddr::V4(Ipv4Addr::LOCALHOST),
+                            IpAddr::V6(Ipv6Addr::LOCALHOST),
+                        ]
+                    },
+                    |address| vec![address],
+                ),
+            };
+            for address in addresses {
+                requested.insert((protocol, SocketAddr::new(address, local_port)));
+            }
+        }
+    }
+    requested
+}
+
+fn preflight_fixed_host_ports(body: &[u8]) -> Result<(), String> {
+    enum Probe {
+        Tcp(TcpListener),
+        Udp(UdpSocket),
+    }
+    let mut probes = Vec::new();
+    for (protocol, address) in requested_fixed_host_ports(body) {
+        let probe = match protocol {
+            HostPortProtocol::Tcp => TcpListener::bind(address).map(Probe::Tcp),
+            HostPortProtocol::Udp => UdpSocket::bind(address).map(Probe::Udp),
+        }
+        .map_err(|error| {
+            let protocol = match protocol {
+                HostPortProtocol::Tcp => "tcp",
+                HostPortProtocol::Udp => "udp",
+            };
+            format!("host port {address}/{protocol} is unavailable: {error}")
+        })?;
+        probes.push(probe);
+    }
+    // Keep every probe open until the full set succeeds, so duplicate/wildcard requests cannot
+    // pass by observing ports released by an earlier iteration of the same create request.
+    for probe in &probes {
+        match probe {
+            Probe::Tcp(listener) => {
+                let _ = listener.local_addr();
+            }
+            Probe::Udp(socket) => {
+                let _ = socket.local_addr();
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn inspect_container_for_start<B: Backend>(
+    backend: &B,
+    start_path: &str,
+) -> std::io::Result<Vec<u8>> {
+    let container = start_path
+        .strip_prefix("/containers/")
+        .and_then(|path| path.strip_suffix("/start"))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid start path")
+        })?;
+    let mut stream = backend.connect().await?;
+    stream
+        .write_all(
+            format!(
+                "GET /containers/{container}/json HTTP/1.1\r\nHost: d\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 16 * 1024];
+    let head_len = loop {
+        if let Some(length) = head_end(&response) {
+            break length;
+        }
+        if response.len() > MAX_HEAD_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "container inspect response head is too large",
+            ));
+        }
+        let count = stream.read(&mut chunk).await?;
+        if count == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "container inspect ended before its response head",
+            ));
+        }
+        response.extend_from_slice(&chunk[..count]);
+    };
+    let head = std::str::from_utf8(&response[..head_len]).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "container inspect response head is not UTF-8",
+        )
+    })?;
+    if !head.starts_with("HTTP/1.1 200 ") && !head.starts_with("HTTP/1.0 200 ") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "container inspect did not return 200",
+        ));
+    }
+    if is_chunked(head) {
+        loop {
+            match decode_chunked_body(&response[head_len..], MAX_INSPECT_BODY) {
+                ChunkedBody::Complete { body, .. } => return Ok(body),
+                ChunkedBody::NeedMore => {
+                    if response.len().saturating_sub(head_len) > MAX_INSPECT_BODY + MAX_HEAD_BYTES {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "chunked container inspect response exceeded its bound",
+                        ));
+                    }
+                    let count = stream.read(&mut chunk).await?;
+                    if count == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "chunked container inspect response is incomplete",
+                        ));
+                    }
+                    response.extend_from_slice(&chunk[..count]);
+                }
+                ChunkedBody::TooLarge => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "chunked container inspect response body is too large",
+                    ));
+                }
+                ChunkedBody::Malformed => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "chunked container inspect response is malformed",
+                    ));
+                }
+            }
+        }
+    }
+    let body_length = content_length(head).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "container inspect response has no content length",
+        )
+    })?;
+    if body_length > MAX_INSPECT_BODY {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "container inspect response body is too large",
+        ));
+    }
+    while response.len() < head_len + body_length {
+        let count = stream.read(&mut chunk).await?;
+        if count == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "container inspect response body is incomplete",
+            ));
+        }
+        response.extend_from_slice(&chunk[..count]);
+        if response.len() > head_len + MAX_INSPECT_BODY {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "container inspect response exceeded its bound",
+            ));
+        }
+    }
+    Ok(response[head_len..head_len + body_length].to_vec())
+}
+
+async fn preflight_container_start<B: Backend>(backend: &B, start_path: &str) -> Option<String> {
+    let inspect = timeout(
+        Duration::from_secs(3),
+        inspect_container_for_start(backend, start_path),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let mut last_error = None;
+    // A prior Dory container may have just stopped. Give the two-second host-forwarder reconcile
+    // interval time to release its listener before treating it as an external collision.
+    for _ in 0..30 {
+        match preflight_fixed_host_ports(&inspect) {
+            Ok(()) => return None,
+            Err(error) => last_error = Some(error),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    last_error
+}
 
 /// Supplies a fresh connection to the guest `dockerd` per client. In production `Stream` is the
 /// captive vsock stream owned by the VMM; in tests it is an in-memory `UnixStream`.
@@ -310,33 +566,100 @@ impl<B: Backend> Proxy<B> {
                     return Ok(());
                 }
                 Disposition::CreateRewrite => {
-                    let want = content_length(&head_text).unwrap_or(0);
-                    // A create body is small JSON. An absurd/overflowing Content-Length is malformed
-                    // or hostile: reject it rather than overflow head_len+want — with panic=abort a
-                    // reverse-range slice panic would crash the WHOLE dataplane, not just this conn.
-                    if want > MAX_CREATE_BODY {
-                        let mut w = self.client_write.lock().await;
-                        let _ = w
-                            .write_all(&http_error(
-                                413,
-                                "Payload Too Large",
-                                "create body too large",
-                            ))
-                            .await;
-                        let _ = w.shutdown().await;
-                        return Ok(());
-                    }
-                    let request_end = head_len + want; // no overflow: want <= MAX_CREATE_BODY
-                    while buf.len() < request_end {
-                        let n = client_read.read(&mut tmp).await?;
-                        if n == 0 {
-                            break;
+                    let (create_body, body_end) = if is_chunked(&head_text) {
+                        loop {
+                            match decode_chunked_body(&buf[head_len..], MAX_CREATE_BODY) {
+                                ChunkedBody::Complete { body, consumed } => {
+                                    break (body, head_len + consumed)
+                                }
+                                ChunkedBody::NeedMore => {
+                                    // Bound framing and trailers as well as decoded JSON. This also
+                                    // prevents a peer from sending an endless unterminated size line.
+                                    if buf.len().saturating_sub(head_len)
+                                        > MAX_CREATE_BODY + MAX_HEAD_BYTES
+                                    {
+                                        let mut w = self.client_write.lock().await;
+                                        let _ = w
+                                            .write_all(&http_error(
+                                                413,
+                                                "Payload Too Large",
+                                                "chunked create body too large",
+                                            ))
+                                            .await;
+                                        let _ = w.shutdown().await;
+                                        return Ok(());
+                                    }
+                                    let n = client_read.read(&mut tmp).await?;
+                                    if n == 0 {
+                                        let mut w = self.client_write.lock().await;
+                                        let _ = w
+                                            .write_all(&http_error(
+                                                400,
+                                                "Bad Request",
+                                                "incomplete chunked create body",
+                                            ))
+                                            .await;
+                                        let _ = w.shutdown().await;
+                                        return Ok(());
+                                    }
+                                    buf.extend_from_slice(&tmp[..n]);
+                                }
+                                ChunkedBody::TooLarge => {
+                                    let mut w = self.client_write.lock().await;
+                                    let _ = w
+                                        .write_all(&http_error(
+                                            413,
+                                            "Payload Too Large",
+                                            "create body too large",
+                                        ))
+                                        .await;
+                                    let _ = w.shutdown().await;
+                                    return Ok(());
+                                }
+                                ChunkedBody::Malformed => {
+                                    let mut w = self.client_write.lock().await;
+                                    let _ = w
+                                        .write_all(&http_error(
+                                            400,
+                                            "Bad Request",
+                                            "malformed chunked create body",
+                                        ))
+                                        .await;
+                                    let _ = w.shutdown().await;
+                                    return Ok(());
+                                }
+                            }
                         }
-                        buf.extend_from_slice(&tmp[..n]);
-                    }
-                    let body_end = request_end.min(buf.len());
+                    } else {
+                        let want = content_length(&head_text).unwrap_or(0);
+                        // A create body is small JSON. An absurd/overflowing Content-Length is
+                        // malformed or hostile: reject it rather than overflow head_len+want —
+                        // with panic=abort a reverse-range slice panic would crash the dataplane.
+                        if want > MAX_CREATE_BODY {
+                            let mut w = self.client_write.lock().await;
+                            let _ = w
+                                .write_all(&http_error(
+                                    413,
+                                    "Payload Too Large",
+                                    "create body too large",
+                                ))
+                                .await;
+                            let _ = w.shutdown().await;
+                            return Ok(());
+                        }
+                        let request_end = head_len + want; // no overflow: want <= MAX_CREATE_BODY
+                        while buf.len() < request_end {
+                            let n = client_read.read(&mut tmp).await?;
+                            if n == 0 {
+                                break;
+                            }
+                            buf.extend_from_slice(&tmp[..n]);
+                        }
+                        let body_end = request_end.min(buf.len());
+                        (buf[head_len..body_end].to_vec(), body_end)
+                    };
                     let rewrite = rewrite_create_body(
-                        &buf[head_len..body_end],
+                        &create_body,
                         &RewriteOpts {
                             gpu_supported: opts.gpu_supported,
                         },
@@ -361,7 +684,17 @@ impl<B: Backend> Proxy<B> {
                     }
                     buf.drain(..body_end);
                 }
-                Disposition::Passthrough => {
+                disposition @ (Disposition::ContainerStartPreflight | Disposition::Passthrough) => {
+                    if disposition == Disposition::ContainerStartPreflight {
+                        if let Some(error) =
+                            preflight_container_start(self.backend.as_ref(), &head.path).await
+                        {
+                            let mut w = self.client_write.lock().await;
+                            let _ = w.write_all(&http_error(409, "Conflict", &error)).await;
+                            let _ = w.shutdown().await;
+                            return Ok(());
+                        }
+                    }
                     if is_chunked(&head_text) {
                         // No docker CLI flow sends a chunked passthrough body (the big streams
                         // are hijack-classified), so rather than parse chunk framing, degrade to
@@ -431,16 +764,94 @@ fn is_chunked(head_text: &str) -> bool {
     false
 }
 
+enum ChunkedBody {
+    NeedMore,
+    Complete { body: Vec<u8>, consumed: usize },
+    TooLarge,
+    Malformed,
+}
+
+/// Decode one RFC 9112 chunked request body. `consumed` stops exactly after the terminating empty
+/// trailer line so a keep-alive request already buffered behind it remains available to the loop.
+fn decode_chunked_body(input: &[u8], max_decoded: usize) -> ChunkedBody {
+    fn crlf(input: &[u8]) -> Option<usize> {
+        input.windows(2).position(|window| window == b"\r\n")
+    }
+
+    let mut decoded = Vec::new();
+    let mut position = 0usize;
+    loop {
+        let Some(line_len) = crlf(&input[position..]) else {
+            return ChunkedBody::NeedMore;
+        };
+        if line_len > MAX_HEAD_BYTES {
+            return ChunkedBody::Malformed;
+        }
+        let size_line = &input[position..position + line_len];
+        let size_token = size_line
+            .split(|byte| *byte == b';')
+            .next()
+            .unwrap_or_default();
+        let Ok(size_text) = std::str::from_utf8(size_token) else {
+            return ChunkedBody::Malformed;
+        };
+        let Ok(size) = usize::from_str_radix(size_text.trim(), 16) else {
+            return ChunkedBody::Malformed;
+        };
+        position += line_len + 2;
+        if size == 0 {
+            // Consume optional trailer fields through their terminating empty line.
+            loop {
+                let Some(trailer_len) = crlf(&input[position..]) else {
+                    return ChunkedBody::NeedMore;
+                };
+                if trailer_len > MAX_HEAD_BYTES {
+                    return ChunkedBody::Malformed;
+                }
+                position += trailer_len + 2;
+                if trailer_len == 0 {
+                    return ChunkedBody::Complete {
+                        body: decoded,
+                        consumed: position,
+                    };
+                }
+            }
+        }
+        if size > max_decoded.saturating_sub(decoded.len()) {
+            return ChunkedBody::TooLarge;
+        }
+        let Some(chunk_end) = position.checked_add(size) else {
+            return ChunkedBody::TooLarge;
+        };
+        let Some(framed_end) = chunk_end.checked_add(2) else {
+            return ChunkedBody::TooLarge;
+        };
+        if input.len() < framed_end {
+            return ChunkedBody::NeedMore;
+        }
+        if &input[chunk_end..framed_end] != b"\r\n" {
+            return ChunkedBody::Malformed;
+        }
+        decoded.extend_from_slice(&input[position..chunk_end]);
+        position = framed_end;
+    }
+}
+
 /// Rebuild the request head with a corrected `Content-Length` (the rewrite changes the body length).
+/// A decoded chunked create is forwarded as ordinary fixed-length JSON, so its framing headers must
+/// not survive alongside Content-Length.
 fn rebuild_head(head_text: &str, content_length: usize) -> Vec<u8> {
     let block = head_text.trim_end_matches("\r\n\r\n");
     let mut lines: Vec<String> = Vec::new();
     for (i, line) in block.split("\r\n").enumerate() {
-        // Keep the request line (i == 0); drop any existing content-length header.
+        // Keep the request line (i == 0); drop framing headers replaced by Content-Length.
         if i > 0
-            && line
-                .split_once(':')
-                .is_some_and(|(n, _)| n.trim().eq_ignore_ascii_case("content-length"))
+            && line.split_once(':').is_some_and(|(n, _)| {
+                let name = n.trim();
+                name.eq_ignore_ascii_case("content-length")
+                    || name.eq_ignore_ascii_case("transfer-encoding")
+                    || name.eq_ignore_ascii_case("trailer")
+            })
         {
             continue;
         }
@@ -598,6 +1009,54 @@ mod tests {
         }
     }
 
+    struct StaticInspectBackend {
+        body: String,
+        chunked: bool,
+    }
+
+    impl Backend for StaticInspectBackend {
+        type Stream = UnixStream;
+
+        fn connect(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<UnixStream>> + Send + '_>> {
+            let body = self.body.clone();
+            let chunked = self.chunked;
+            Box::pin(async move {
+                let (ours, mut theirs) = UnixStream::pair()?;
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while head_end(&request).is_none() {
+                        match theirs.read(&mut chunk).await {
+                            Ok(count) if count > 0 => request.extend_from_slice(&chunk[..count]),
+                            _ => return,
+                        }
+                    }
+                    assert!(
+                        String::from_utf8_lossy(&request).starts_with("GET /containers/demo/json "),
+                        "unexpected inspect request: {}",
+                        String::from_utf8_lossy(&request)
+                    );
+                    let response = if chunked {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                            body.len(), body
+                        )
+                    } else {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(), body
+                        )
+                    };
+                    let _ = theirs.write_all(response.as_bytes()).await;
+                    let _ = theirs.shutdown().await;
+                });
+                Ok(ours)
+            })
+        }
+    }
+
     async fn bind_temp_listener() -> (UnixListener, std::path::PathBuf) {
         let dir = std::env::temp_dir();
         let id = NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
@@ -659,6 +1118,54 @@ mod tests {
     const LOOPBACK_BODY: &str =
         r#"{"HostConfig":{"PortBindings":{"80/tcp":[{"HostIp":"127.0.0.1","HostPort":"8080"}]}}}"#;
 
+    #[test]
+    fn fixed_host_port_preflight_rejects_an_existing_macos_listener() {
+        let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let body = format!(
+            r#"{{"HostConfig":{{"PortBindings":{{"80/tcp":[{{"HostIp":"127.0.0.1","HostPort":"{port}"}}]}}}}}}"#
+        );
+
+        let error = preflight_fixed_host_ports(body.as_bytes()).unwrap_err();
+
+        assert!(error.contains(&port.to_string()), "got: {error}");
+        assert!(error.contains("tcp"), "got: {error}");
+    }
+
+    #[test]
+    fn host_port_preflight_skips_dynamic_ports_and_maps_privileged_ports() {
+        let dynamic = br#"{"HostConfig":{"PortBindings":{"80/tcp":[{"HostPort":""}],"53/udp":[{"HostPort":"0"}]}}}"#;
+        assert!(requested_fixed_host_ports(dynamic).is_empty());
+
+        let fixed = br#"{"HostConfig":{"PortBindings":{"80/tcp":[{"HostIp":"127.0.0.1","HostPort":"80"}]}}}"#;
+        assert_eq!(
+            requested_fixed_host_ports(fixed),
+            BTreeSet::from([(
+                HostPortProtocol::Tcp,
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 60_080),
+            )])
+        );
+    }
+
+    #[tokio::test]
+    async fn container_start_preflight_inspects_then_rejects_occupied_host_port() {
+        let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let backend = StaticInspectBackend {
+            body: format!(
+                r#"{{"HostConfig":{{"PortBindings":{{"8080/tcp":[{{"HostIp":"127.0.0.1","HostPort":"{port}"}}]}}}}}}"#
+            ),
+            chunked: true,
+        };
+
+        let error = preflight_container_start(&backend, "/containers/demo/start")
+            .await
+            .expect("occupied port must be rejected");
+
+        assert!(error.contains(&port.to_string()), "got: {error}");
+        assert!(error.contains("tcp"), "got: {error}");
+    }
+
     #[tokio::test]
     async fn create_body_is_rewritten_before_forwarding() {
         let (captured, path) = spawn_fake(false).await;
@@ -691,6 +1198,51 @@ mod tests {
             String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 201"),
             "201 relayed back"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn chunked_create_body_is_decoded_rewritten_and_forwarded_as_fixed_length() {
+        let (captured, path) = spawn_fake(false).await;
+        let body =
+            r#"{"HostConfig":{"Binds":["/tmp/test/.dory/engine.sock:/var/run/docker.sock:ro"]}}"#;
+        let split = body.len() / 2;
+        let request = format!(
+            "POST /v1.54/containers/create HTTP/1.1\r\nHost: d\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nTrailer: X-Proof\r\n\r\n{:X};fixture=yes\r\n{}\r\n{:X}\r\n{}\r\n0\r\nX-Proof: complete\r\n\r\n",
+            split,
+            &body[..split],
+            body.len() - split,
+            &body[split..]
+        );
+
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        // Fragment the framing too: the proxy must keep reading until the zero chunk and trailers.
+        let midpoint = request.len() / 2;
+        client
+            .write_all(&request.as_bytes()[..midpoint])
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        client
+            .write_all(&request.as_bytes()[midpoint..])
+            .await
+            .unwrap();
+        let response = read_response(&mut client).await;
+        assert!(response.starts_with("HTTP/1.1 201"), "got: {response}");
+        client.shutdown().await.unwrap();
+
+        let got = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
+        assert!(
+            got.contains("/containers/create"),
+            "backend got create: {got}"
+        );
+        assert!(
+            got.contains("/var/run/docker.sock:/var/run/docker.sock:ro"),
+            "Dory socket bind rewritten: {got}"
+        );
+        assert!(!got.to_ascii_lowercase().contains("transfer-encoding"));
+        assert!(!got.to_ascii_lowercase().contains("trailer:"));
+        assert!(got.to_ascii_lowercase().contains("content-length:"));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -755,6 +1307,43 @@ mod tests {
         assert!(
             got_text.contains("host-gateway"),
             "ExtraHosts injected on the reused connection"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Supabase's Go Docker client pulls all stack images, consumes each streamed response, then
+    /// reuses a pooled connection for Vector's create. A pull is not an HTTP upgrade and must not
+    /// permanently turn that connection into an unclassified raw splice.
+    #[tokio::test]
+    async fn keepalive_create_after_streamed_image_pull_is_still_rewritten() {
+        let (captured, path) = spawn_fake(false).await;
+        let mut client = UnixStream::connect(&path).await.unwrap();
+
+        client
+            .write_all(
+                b"POST /v1.54/images/create?fromImage=alpine&tag=3.20 HTTP/1.1\r\nHost: d\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        assert!(read_response(&mut client).await.starts_with("HTTP/1.1 200"));
+
+        let body =
+            r#"{"HostConfig":{"Binds":["/tmp/test/.dory/engine.sock:/var/run/docker.sock:ro"]}}"#;
+        client
+            .write_all(create_request(body).as_bytes())
+            .await
+            .unwrap();
+        assert!(read_response(&mut client).await.starts_with("HTTP/1.1 201"));
+        client.shutdown().await.unwrap();
+
+        let got = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
+        assert!(
+            got.contains("/images/create"),
+            "pull reached backend: {got}"
+        );
+        assert!(
+            got.contains("/var/run/docker.sock:/var/run/docker.sock:ro"),
+            "post-pull create was rewritten: {got}"
         );
         let _ = std::fs::remove_file(&path);
     }

@@ -12,6 +12,7 @@ let package = Package(
         .executable(name: "dorydctl", targets: ["dorydctl"]),
         .executable(name: "dory-vmm", targets: ["dory-vmm"]),
         .executable(name: "dory-network-helper", targets: ["dory-network-helper"]),
+        .executable(name: "dory-dataplane-proxy", targets: ["dory-dataplane-proxy"]),
     ],
     targets: [
         .binaryTarget(name: "DoryFFI", path: "artifacts/DoryFFI.xcframework"),
@@ -41,7 +42,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "dorydctl",
-            dependencies: ["DorydKit"]
+            dependencies: ["DorydKit", "DoryCore"]
         ),
         .executableTarget(
             name: "dory-vmm",
@@ -50,6 +51,10 @@ let package = Package(
         .executableTarget(
             name: "dory-network-helper",
             dependencies: ["DorydKit"]
+        ),
+        .executableTarget(
+            name: "dory-dataplane-proxy",
+            dependencies: ["DorydKit", "DoryCore"]
         ),
         .testTarget(
             name: "DoryCoreTests",

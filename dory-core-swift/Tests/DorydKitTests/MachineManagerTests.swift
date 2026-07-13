@@ -356,6 +356,45 @@ final class MachineManagerTests: XCTestCase {
         }
     }
 
+    func testMachineResourcesStayWithinAdvertisedContractWithoutMutation() throws {
+        let base = "/tmp/dory-machine-resources-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        defer { try? FileManager.default.removeItem(atPath: base) }
+        let manager = MachineManager(configuration: MachineManagerConfiguration(
+            vmmExecutablePath: "/bin/sleep",
+            stateDirectory: base,
+            baseArguments: ["30"],
+            passMachineArguments: false,
+            requiresReadyHandoff: false
+        ))
+
+        for (memory, cpus) in [(UInt64(1023), 2), (UInt64(16 * 1024 + 1), 2), (UInt64(2048), 9)] {
+            XCTAssertThrowsError(try manager.create(DoryMachineConfiguration(
+                id: "invalid-\(memory)-\(cpus)",
+                kernelPath: "/tmp/kernel",
+                rootfsPath: "/tmp/rootfs",
+                memoryMB: memory,
+                cpuCount: cpus
+            )))
+        }
+
+        _ = try manager.create(DoryMachineConfiguration(
+            id: "dev",
+            kernelPath: "/tmp/kernel",
+            rootfsPath: "/tmp/rootfs",
+            memoryMB: 2048,
+            cpuCount: 2
+        ))
+        let before = try Data(contentsOf: URL(fileURLWithPath: "\(base)/dev/machine.json"))
+
+        XCTAssertThrowsError(try manager.update(id: "dev", memoryMB: 512))
+        XCTAssertThrowsError(try manager.update(id: "dev", cpuCount: 9))
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: "\(base)/dev/machine.json")), before)
+
+        let maximum = try manager.update(id: "dev", memoryMB: 16 * 1024, cpuCount: 8)
+        XCTAssertEqual(maximum.memoryMB, 16 * 1024)
+        XCTAssertEqual(maximum.cpuCount, 8)
+    }
+
     func testCreateClonesRootfsIntoPerMachineStateDirectory() throws {
         let base = "/tmp/dory-machine-rootfs-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
         try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)

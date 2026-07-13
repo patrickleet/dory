@@ -1,4 +1,5 @@
 import Darwin
+import DoryCore
 import Foundation
 
 struct DorydHostPlatform: Sendable, Equatable {
@@ -108,10 +109,31 @@ public struct DorydEnvironment: Sendable {
 
         let explicitForward = string("DORYD_AGENT_VSOCK_FORWARD") != nil
             || string("DORY_AGENT_VSOCK_FORWARD") != nil
+        let gpuRequested = venusRequested
+        if gpuRequested, explicitForward {
+            reportEngineConfigurationError(
+                "DORYD_GPU=venus requires doryd's local dory-hv engine; external forwards must prove capability with DORYD_GPU_SUPPORTED"
+            )
+            return nil
+        }
+        if gpuRequested {
+            guard rawHVSupported, hostGuestArch == "arm64" else {
+                reportEngineConfigurationError(
+                    "Venus GPU mode is release-verified only with the arm64 dory-hv engine"
+                )
+                return nil
+            }
+        }
         let hvProcess = rawHVSupported ? hvProcessConfiguration(
             stateDirectory: stateDirectory,
             forwardSocket: forwardSocket
         ) : nil
+
+        // A requested Venus device must never degrade to the headless dory-vmm fallback. Missing or
+        // unusable GPU assets make the engine unavailable so the app can restore the prior setting.
+        if gpuRequested, hvProcess == nil {
+            return nil
+        }
 
         if hvProcess == nil, !explicitForward,
            let vmmProcess = vmmDockerProcessConfiguration(stateDirectory: stateDirectory) {
@@ -143,8 +165,7 @@ public struct DorydEnvironment: Sendable {
             cid: cid,
             dockerPort: clampedDockerPort(),
             gpuSupported: bool("DORYD_GPU_SUPPORTED", default: false)
-                || string("DORYD_GPU") == "venus"
-                || string("DORY_EXPERIMENTAL_GPU") == "venus",
+                || gpuRequested,
             activitySocketPath: string("DORYD_ACTIVITY_SOCK")
                 ?? "\(stateDirectory)/dataplane-activity.sock",
             hvProcess: hvProcess,
@@ -221,7 +242,13 @@ public struct DorydEnvironment: Sendable {
         guard let helper = executablePath(firstOf: ["DORYD_VMM_HELPER", "DORY_VMM_HELPER"], fallbackCandidates: helperCandidates(named: "dory-vmm")) else {
             return nil
         }
-        let stateDirectory = string("DORYD_MACHINE_STATE_DIR") ?? "\(home)/.dory/machines"
+        let stateDirectory: String
+        if let explicit = string("DORYD_MACHINE_STATE_DIR") {
+            stateDirectory = explicit
+        } else {
+            guard let drive = dataDrive() else { return nil }
+            stateDirectory = drive.machinesDirectory
+        }
         return MachineManagerConfiguration(
             vmmExecutablePath: helper,
             stateDirectory: stateDirectory,
@@ -232,13 +259,19 @@ public struct DorydEnvironment: Sendable {
         )
     }
 
+    public func dataDriveConfiguration() throws -> DoryDataDrive {
+        try DoryDataDrive(
+            home: home,
+            overrideRoot: string("DORYD_DATA_DRIVE") ?? string("DORY_DATA_DRIVE")
+        )
+    }
+
     private func hvProcessConfiguration(
         stateDirectory: String,
         forwardSocket: String
     ) -> HvProcessConfiguration? {
         guard let helper = executablePath(firstOf: ["DORYD_HV_HELPER", "DORY_HV_HELPER"], fallbackCandidates: helperCandidates(named: "dory-hv")),
-              let kernel = existingPath(firstOf: ["DORYD_HV_KERNEL", "DORY_HV_KERNEL"])
-                ?? bundledResource(named: ["dory-hv-kernel-\(hostGuestArch)", "dory-hv-kernel"]),
+              let kernel = hvKernelPath(stateDirectory: stateDirectory),
               let gvproxy = executablePath(firstOf: ["DORYD_GVPROXY", "DORY_GVPROXY"], fallbackCandidates: gvproxyCandidates()) else {
             return nil
         }
@@ -254,9 +287,17 @@ public struct DorydEnvironment: Sendable {
             "--mem-mb", String(clampedMemoryMB()),
             "--cpus", String(clampedCPUs()),
         ]
+        guard let drive = dataDrive() else { return nil }
+        arguments.append(contentsOf: ["--data-drive", drive.root])
+        if let sshAuthSock = string("DORYD_SSH_AUTH_SOCK"), sshAuthSock.hasPrefix("/") {
+            arguments.append(contentsOf: ["--ssh-agent-socket", sshAuthSock])
+        }
 
-        if bool("DORYD_DIRECT_IP", default: true) {
+        if bool("DORYD_DIRECT_IP", default: string("DORYD_PUBLISH_HOST") == "0.0.0.0") {
             arguments.append("--direct-ip")
+        }
+        if bool("DORYD_NATIVE_IPV6", default: true) {
+            arguments.append("--direct-ipv6")
         }
         let engineRootfsNames = ["dory-engine-rootfs-\(hostGuestArch).ext4", "dory-engine-rootfs.ext4"]
         let engineRootfs = existingPath(firstOf: ["DORYD_ENGINE_ROOTFS", "DORY_ENGINE_ROOTFS"])
@@ -281,10 +322,10 @@ public struct DorydEnvironment: Sendable {
         if let guestAgent = guestAgentPath() {
             arguments.append(contentsOf: ["--guest-agent", guestAgent])
         }
-        if string("DORYD_GPU") == "venus" || string("DORY_EXPERIMENTAL_GPU") == "venus" {
+        if venusRequested {
             arguments.append(contentsOf: ["--gpu", "venus"])
         }
-        if bool("DORYD_AMD64", default: hostGuestArch == "arm64") {
+        if hostGuestArch == "arm64", bool("DORYD_AMD64", default: false) {
             arguments.append("--amd64")
         }
         if string("DORYD_PUBLISH_HOST") == "0.0.0.0" {
@@ -309,6 +350,7 @@ public struct DorydEnvironment: Sendable {
 
     private func vmmDockerProcessConfiguration(stateDirectory: String) -> VmmDockerProcessConfiguration? {
         guard let helper = executablePath(firstOf: ["DORYD_VMM_HELPER", "DORY_VMM_HELPER"], fallbackCandidates: helperCandidates(named: "dory-vmm")),
+              let gvproxy = executablePath(firstOf: ["DORYD_GVPROXY", "DORY_GVPROXY"], fallbackCandidates: gvproxyCandidates()),
               let kernel = existingPath(firstOf: ["DORYD_VMM_KERNEL", "DORY_VMM_KERNEL"])
                 ?? preparedBundledCompressedResource(
                     named: ["dory-vm-kernel-\(hostGuestArch)", "dory-vm-kernel"],
@@ -336,13 +378,22 @@ public struct DorydEnvironment: Sendable {
             "--state-dir", stateDirectory,
             "--kernel", kernel,
             "--rootfs", rootfs,
+            "--gvproxy", gvproxy,
             "--handoff-sock", handoffSocket,
             "--memory-mb", String(clampedMemoryMB()),
             "--cpus", String(clampedCPUs()),
             "--cmdline", cmdline,
         ]
+        guard let drive = dataDrive() else { return nil }
+        arguments.append(contentsOf: ["--data-drive", drive.root])
+        if let sshAuthSock = string("DORYD_SSH_AUTH_SOCK"), sshAuthSock.hasPrefix("/") {
+            arguments.append(contentsOf: ["--ssh-agent-socket", sshAuthSock])
+        }
         if bool("DORYD_SHARE_HOME", default: true) {
             arguments.append(contentsOf: ["--share", "home=\(home):\(home):rw"])
+        }
+        if string("DORYD_PUBLISH_HOST") == "0.0.0.0" {
+            arguments.append(contentsOf: ["--publish-host", "0.0.0.0"])
         }
 
         return VmmDockerProcessConfiguration(
@@ -361,12 +412,72 @@ public struct DorydEnvironment: Sendable {
         )
     }
 
+    private func dataDrive() -> DoryDataDrive? {
+        do {
+            return try dataDriveConfiguration()
+        } catch {
+            FileHandle.standardError.write(Data("doryd: invalid data drive: \(error)\n".utf8))
+            return nil
+        }
+    }
+
     private func shares() -> [String] {
         if let explicit = string("DORYD_SHARES") {
             return explicit.split(separator: ";").map(String.init).filter { !$0.isEmpty }
         }
         guard bool("DORYD_SHARE_HOME", default: true) else { return [] }
         return ["home=\(home):rw:at=\(home):safe"]
+    }
+
+    /// DORYD_GPU is authoritative when the app supplies it, including the explicit `off` value.
+    /// The legacy variable remains a development fallback only when no daemon-owned choice exists.
+    private var venusRequested: Bool {
+        if let configured = string("DORYD_GPU") {
+            return configured.lowercased() == "venus"
+        }
+        return string("DORY_EXPERIMENTAL_GPU")?.lowercased() == "venus"
+    }
+
+    /// Selects the kernel that matches the requested device contract. GPU mode accepts only a
+    /// GPU-specific override or the architecture-suffixed GPU resource and prepares the compressed
+    /// release asset into doryd's state directory. It intentionally has no headless fallback.
+    private func hvKernelPath(stateDirectory: String) -> String? {
+        guard venusRequested else {
+            return existingPath(firstOf: ["DORYD_HV_KERNEL", "DORY_HV_KERNEL"])
+                ?? bundledResource(named: ["dory-hv-kernel-\(hostGuestArch)", "dory-hv-kernel"])
+        }
+
+        guard hostGuestArch == "arm64" else {
+            reportEngineConfigurationError("no release-verified Venus GPU kernel exists for \(hostGuestArch)")
+            return nil
+        }
+        let resourceName = "dory-hv-kernel-gpu-\(hostGuestArch)"
+        if let explicit = existingPath(firstOf: [
+            "DORYD_HV_GPU_KERNEL_ARM64",
+            "DORYD_HV_GPU_KERNEL",
+            "DORY_HV_GPU_KERNEL_ARM64",
+            "DORY_HV_GPU_KERNEL",
+        ]) {
+            return explicit
+        }
+        if let raw = bundledResource(named: [resourceName]) {
+            return raw
+        }
+        if let prepared = preparedBundledCompressedResource(
+            named: [resourceName],
+            outputName: resourceName,
+            stateDirectory: stateDirectory
+        ) {
+            return prepared
+        }
+        reportEngineConfigurationError(
+            "Venus GPU mode requested but \(resourceName).lzfse is missing or could not be prepared"
+        )
+        return nil
+    }
+
+    private func reportEngineConfigurationError(_ message: String) {
+        FileHandle.standardError.write(Data("doryd: \(message)\n".utf8))
     }
 
     private func helperCandidates(named name: String) -> [String] {

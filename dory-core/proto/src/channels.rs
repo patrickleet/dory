@@ -17,6 +17,8 @@ pub const PORT_SHELL: u32 = 1027;
 /// invalidation has completed; the agent performs a same-mode metadata operation so Linux fsnotify
 /// and inotify-backed development tools observe the host edit natively.
 pub const PORT_FSEVENTS: u32 = 1028;
+/// Guest `/run/host-services/ssh-auth.sock` → same-user macOS SSH agent, one raw stream per client.
+pub const PORT_SSH_AGENT: u32 = 1029;
 
 /// Guest-initiated dial-back targets on the host (the AI bridge): the guest connects to
 /// `VMADDR_CID_HOST` on these ports and doryd forwards to `127.0.0.1:<same>`. The forwarding side

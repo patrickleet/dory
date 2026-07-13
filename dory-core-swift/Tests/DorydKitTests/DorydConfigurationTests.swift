@@ -62,6 +62,7 @@ final class DorydConfigurationTests: XCTestCase {
             "DORYD_HOME": directory + "/home",
             "DORYD_HV_HELPER": helper,
             "DORYD_HV_KERNEL": kernel,
+            "DORYD_HV_GPU_KERNEL": kernel,
             "DORYD_GVPROXY": gvproxy,
             "DORYD_ENGINE_ROOTFS": rootfs,
             "DORYD_STATE_DIR": directory + "/state",
@@ -73,7 +74,8 @@ final class DorydConfigurationTests: XCTestCase {
             "DORYD_SHARES": "src=/tmp/src:rw;cache=/tmp/cache:ro",
             "DORYD_HV_RESTART_LIMIT": "5",
             "DORYD_HV_RESTART_DELAY": "0.1",
-        ], cwd: directory, hostPlatform: supportedRawHVPlatform())
+            "DORYD_SSH_AUTH_SOCK": "/private/tmp/com.apple.launchd.fixture/Listeners",
+        ], cwd: directory, hostPlatform: DorydHostPlatform(architecture: .arm64, macOSMajorVersion: 15))
 
         let config = try XCTUnwrap(env.dockerTierConfiguration())
         XCTAssertEqual(config.home, directory + "/home")
@@ -93,12 +95,23 @@ final class DorydConfigurationTests: XCTestCase {
         XCTAssertArgumentPair(hv.arguments, "--kernel", kernel)
         XCTAssertArgumentPair(hv.arguments, "--gvproxy", gvproxy)
         XCTAssertArgumentPair(hv.arguments, "--state-dir", directory + "/state")
+        XCTAssertArgumentPair(
+            hv.arguments,
+            "--data-drive",
+            directory + "/home/Library/Application Support/Dory/Dory.dorydrive"
+        )
         XCTAssertArgumentPair(hv.arguments, "--mem-mb", "4096")
         XCTAssertArgumentPair(hv.arguments, "--cpus", "6")
+        XCTAssertArgumentPair(
+            hv.arguments,
+            "--ssh-agent-socket",
+            "/private/tmp/com.apple.launchd.fixture/Listeners"
+        )
         XCTAssertArgumentPair(hv.arguments, "--rootfs", rootfs)
         XCTAssertArgumentPair(hv.arguments, "--gpu", "venus")
         XCTAssertArgumentPair(hv.arguments, "--publish-host", "0.0.0.0")
         XCTAssertTrue(hv.arguments.contains("--direct-ip"))
+        XCTAssertTrue(hv.arguments.contains("--direct-ipv6"))
         XCTAssertTrue(hv.arguments.contains("--amd64"))
         XCTAssertArgumentPair(hv.arguments, "--share", "src=/tmp/src:rw")
         XCTAssertArgumentPair(hv.arguments, "--share", "cache=/tmp/cache:ro")
@@ -114,6 +127,16 @@ final class DorydConfigurationTests: XCTestCase {
         XCTAssertEqual(config.forwardSocketPath, "/tmp/forward.sock")
         XCTAssertEqual(config.agentControl, AgentControlConfiguration(forwardSocketPath: "/tmp/forward.sock"))
         XCTAssertNil(config.hvProcess)
+    }
+
+    func testVenusCannotClaimAnUnverifiedExternalForward() {
+        let env = DorydEnvironment(values: [
+            "DORYD_HOME": "/tmp/doryd-home",
+            "DORYD_AGENT_VSOCK_FORWARD": "/tmp/forward.sock",
+            "DORYD_GPU": "venus",
+        ], cwd: "/tmp", hostPlatform: DorydHostPlatform(architecture: .arm64, macOSMajorVersion: 15))
+
+        XCTAssertNil(env.dockerTierConfiguration())
     }
 
     func testDockerTierIsUnconfiguredWhenConfiguredKernelIsMissing() throws {
@@ -150,10 +173,8 @@ final class DorydConfigurationTests: XCTestCase {
 
         #if arch(x86_64)
         let guestArch = "amd64"
-        let expectsAMD64Emulation = false
         #else
         let guestArch = "arm64"
-        let expectsAMD64Emulation = true
         #endif
 
         let kernel = resources + "/dory-hv-kernel-\(guestArch)"
@@ -169,7 +190,113 @@ final class DorydConfigurationTests: XCTestCase {
         XCTAssertArgumentPair(hv.arguments, "--kernel", kernel)
         XCTAssertArgumentPair(hv.arguments, "--gvproxy", helpers + "/gvproxy")
         XCTAssertArgumentPair(hv.arguments, "--guest-agent", guestAgent)
-        XCTAssertEqual(hv.arguments.contains("--amd64"), expectsAMD64Emulation)
+        XCTAssertFalse(hv.arguments.contains("--amd64"), "amd64 emulation must remain an explicit Settings opt-in")
+    }
+
+    func testVenusPreparesAndSelectsArchitectureMatchedCompressedGPUKernel() throws {
+        let directory = "/tmp/doryd-config-gpu-kernel-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        let helpers = directory + "/Helpers"
+        let resources = directory + "/Resources"
+        let state = directory + "/state"
+        try FileManager.default.createDirectory(atPath: helpers, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(atPath: resources, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+
+        let helper = try executableFixture(at: helpers + "/dory-hv")
+        let gvproxy = try executableFixture(at: helpers + "/gvproxy")
+        let headlessKernel = resources + "/dory-hv-kernel-arm64"
+        try Data("headless-kernel".utf8).write(to: URL(fileURLWithPath: headlessKernel))
+        let gpuKernel = directory + "/gpu-kernel"
+        try Data("gpu-kernel".utf8).write(to: URL(fileURLWithPath: gpuKernel))
+        try DorydLZFSE.compress(
+            source: gpuKernel,
+            destination: resources + "/dory-hv-kernel-gpu-arm64.lzfse"
+        )
+
+        let environment = DorydEnvironment(values: [
+            "DORYD_HOME": directory + "/home",
+            "DORYD_STATE_DIR": state,
+            "DORYD_HV_HELPER": helper,
+            "DORYD_GVPROXY": gvproxy,
+            "DORYD_RESOURCES_DIR": resources,
+            "DORYD_GPU": "venus",
+        ], cwd: directory, hostPlatform: DorydHostPlatform(architecture: .arm64, macOSMajorVersion: 15))
+
+        let configuration = try XCTUnwrap(environment.dockerTierConfiguration())
+        let hv = try XCTUnwrap(configuration.hvProcess)
+        let prepared = state + "/assets/dory-hv-kernel-gpu-arm64"
+        XCTAssertArgumentPair(hv.arguments, "--kernel", prepared)
+        XCTAssertArgumentPair(hv.arguments, "--gpu", "venus")
+        XCTAssertTrue(configuration.gpuSupported)
+        XCTAssertEqual(FileManager.default.contents(atPath: prepared), Data("gpu-kernel".utf8))
+    }
+
+    func testVenusIsRejectedOnIntelEvenWithAnExplicitGPUKernel() throws {
+        let directory = "/tmp/doryd-config-gpu-intel-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let gpuKernel = directory + "/gpu-kernel"
+        FileManager.default.createFile(atPath: gpuKernel, contents: Data())
+
+        let environment = DorydEnvironment(values: [
+            "DORYD_HOME": directory + "/home",
+            "DORYD_GPU": "venus",
+            "DORYD_HV_GPU_KERNEL": gpuKernel,
+        ], cwd: directory, hostPlatform: DorydHostPlatform(architecture: .x86_64, macOSMajorVersion: 15))
+
+        XCTAssertNil(environment.dockerTierConfiguration())
+    }
+
+    func testVenusNeverFallsBackToHeadlessKernelOrVmm() throws {
+        let directory = "/tmp/doryd-config-gpu-missing-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+
+        let hvHelper = try executableFixture(at: directory + "/dory-hv")
+        let vmmHelper = try executableFixture(at: directory + "/dory-vmm")
+        let gvproxy = try executableFixture(at: directory + "/gvproxy")
+        let headlessKernel = directory + "/headless-kernel"
+        let rootfs = directory + "/rootfs.ext4"
+        FileManager.default.createFile(atPath: headlessKernel, contents: Data())
+        FileManager.default.createFile(atPath: rootfs, contents: Data())
+
+        let environment = DorydEnvironment(values: [
+            "DORYD_HOME": directory + "/home",
+            "DORYD_HV_HELPER": hvHelper,
+            "DORYD_HV_KERNEL": headlessKernel,
+            "DORYD_GVPROXY": gvproxy,
+            "DORYD_VMM_HELPER": vmmHelper,
+            "DORYD_VMM_KERNEL": headlessKernel,
+            "DORYD_VMM_ROOTFS": rootfs,
+            "DORYD_GPU": "venus",
+        ], cwd: directory, hostPlatform: DorydHostPlatform(architecture: .arm64, macOSMajorVersion: 15))
+
+        XCTAssertNil(environment.dockerTierConfiguration())
+    }
+
+    func testExplicitGPUOffOverridesLegacyDevelopmentVariable() throws {
+        let directory = "/tmp/doryd-config-gpu-off-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+
+        let helper = try executableFixture(at: directory + "/dory-hv")
+        let gvproxy = try executableFixture(at: directory + "/gvproxy")
+        let headlessKernel = directory + "/headless-kernel"
+        FileManager.default.createFile(atPath: headlessKernel, contents: Data())
+        let environment = DorydEnvironment(values: [
+            "DORYD_HOME": directory + "/home",
+            "DORYD_HV_HELPER": helper,
+            "DORYD_HV_KERNEL": headlessKernel,
+            "DORYD_GVPROXY": gvproxy,
+            "DORYD_GPU": "off",
+            "DORY_EXPERIMENTAL_GPU": "venus",
+        ], cwd: directory, hostPlatform: DorydHostPlatform(architecture: .arm64, macOSMajorVersion: 15))
+
+        let configuration = try XCTUnwrap(environment.dockerTierConfiguration())
+        let hv = try XCTUnwrap(configuration.hvProcess)
+        XCTAssertArgumentPair(hv.arguments, "--kernel", headlessKernel)
+        XCTAssertFalse(hv.arguments.contains("--gpu"))
+        XCTAssertFalse(configuration.gpuSupported)
     }
 
     func testDockerTierPreparesBundledEngineRootfs() throws {
@@ -264,6 +391,7 @@ final class DorydConfigurationTests: XCTestCase {
 
         let doryd = try executableFixture(at: helpers + "/doryd")
         let helper = try executableFixture(at: helpers + "/dory-vmm")
+        let gvproxy = try executableFixture(at: helpers + "/gvproxy")
 
         #if arch(x86_64)
         let guestArch = "amd64"
@@ -288,6 +416,8 @@ final class DorydConfigurationTests: XCTestCase {
             "DORYD_HOME": directory + "/home",
             "DORYD_STATE_DIR": state,
             "DORYD_RAW_HV_SUPPORTED": "0",
+            "DORYD_PUBLISH_HOST": "0.0.0.0",
+            "DORYD_SSH_AUTH_SOCK": "/private/tmp/com.apple.launchd.fixture/Listeners",
         ], cwd: directory, executablePath: doryd)
 
         let config = try XCTUnwrap(env.dockerTierConfiguration())
@@ -300,6 +430,13 @@ final class DorydConfigurationTests: XCTestCase {
         XCTAssertEqual(vmm.handoffSocketPath, state + "/dory-vmm-docker-handoff.sock")
         XCTAssertArgumentPair(vmm.arguments, "--kernel", state + "/assets/dory-vm-kernel-\(guestArch)")
         XCTAssertArgumentPair(vmm.arguments, "--rootfs", state + "/assets/dory-vz-engine-rootfs-\(guestArch).ext4")
+        XCTAssertArgumentPair(vmm.arguments, "--gvproxy", gvproxy)
+        XCTAssertArgumentPair(vmm.arguments, "--publish-host", "0.0.0.0")
+        XCTAssertArgumentPair(
+            vmm.arguments,
+            "--ssh-agent-socket",
+            "/private/tmp/com.apple.launchd.fixture/Listeners"
+        )
         XCTAssertArgumentPair(vmm.arguments, "--cmdline", "console=hvc0 root=/dev/vda rw rootwait panic=1 dory.machine_id=docker dory.home=\(directory)/home")
         XCTAssertEqual(FileManager.default.contents(atPath: state + "/assets/dory-vz-engine-rootfs-\(guestArch).ext4"), Data("vmm-rootfs-fixture".utf8))
     }
@@ -411,8 +548,37 @@ final class DorydConfigurationTests: XCTestCase {
 
         let config = try XCTUnwrap(env.machineManagerConfiguration())
         XCTAssertEqual(config.vmmExecutablePath, helper)
-        XCTAssertEqual(config.stateDirectory, directory + "/home/.dory/machines")
+        XCTAssertEqual(
+            config.stateDirectory,
+            directory + "/home/Library/Application Support/Dory/Dory.dorydrive/machines"
+        )
         XCTAssertTrue(config.requiresReadyHandoff)
+    }
+
+    func testDataDriveOverrideRoutesDockerAndMachinePersistenceTogether() throws {
+        let directory = "/tmp/doryd-data-drive-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let helper = try executableFixture(at: directory + "/dory-hv")
+        let vmm = try executableFixture(at: directory + "/dory-vmm")
+        let gvproxy = try executableFixture(at: directory + "/gvproxy")
+        let kernel = directory + "/kernel"
+        FileManager.default.createFile(atPath: kernel, contents: Data())
+        let home = directory + "/home"
+        let drive = home + "/Library/Application Support/Dory/External.dorydrive"
+        let env = DorydEnvironment(values: [
+            "DORYD_HOME": home,
+            "DORYD_DATA_DRIVE": drive,
+            "DORYD_HV_HELPER": helper,
+            "DORYD_VMM_HELPER": vmm,
+            "DORYD_HV_KERNEL": kernel,
+            "DORYD_GVPROXY": gvproxy,
+        ], cwd: directory, hostPlatform: supportedRawHVPlatform())
+
+        let hv = try XCTUnwrap(env.dockerTierConfiguration()?.hvProcess)
+        XCTAssertArgumentPair(hv.arguments, "--data-drive", drive)
+        XCTAssertFalse(hv.arguments.contains("--legacy-data-disk"))
+        XCTAssertEqual(env.machineManagerConfiguration()?.stateDirectory, drive + "/machines")
     }
 
     private func executableFixture(at path: String) throws -> String {

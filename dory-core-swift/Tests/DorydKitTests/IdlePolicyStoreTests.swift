@@ -34,6 +34,7 @@ final class IdlePolicyStoreTests: XCTestCase {
 
     func testManagedEngineSleepFollowsRuntimeMode() throws {
         let directory = NSTemporaryDirectory() + "dory-idle-\(getpid())-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: directory) }
         let configPath = directory + "/config.json"
         let store = IdlePolicyStore(environment: ["DORY_CONFIG": configPath])
 

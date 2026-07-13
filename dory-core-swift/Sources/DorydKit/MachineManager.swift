@@ -299,6 +299,13 @@ public final class MachineManager: @unchecked Sendable {
     public typealias AgentConnector = @Sendable (String) throws -> any AgentControlClient
 
     private static let handoffReadyTimeoutSeconds: TimeInterval = 60
+    /// Public Apple-Silicon machine resource contract. These match the app's steppers; enforcing
+    /// them again in doryd prevents CLI/XPC callers from persisting values that the VMM would later
+    /// clamp silently, which would make status disagree with the running guest.
+    public static let minimumMachineMemoryMB: UInt64 = 1024
+    public static let maximumMachineMemoryMB: UInt64 = 16 * 1024
+    public static let minimumMachineCPUCount = 1
+    public static let maximumMachineCPUCount = 8
 
     private let configuration: MachineManagerConfiguration
     private let agentConnector: AgentConnector
@@ -330,6 +337,7 @@ public final class MachineManager: @unchecked Sendable {
             throw MachineManagerError.invalidID(machine.id)
         }
         var machine = machine
+        try Self.validateResources(memoryMB: machine.memoryMB, cpuCount: machine.cpuCount)
         machine.address = try Self.normalizedAddress(machine.address)
         try Self.validateShares(machine.shares)
         try Self.validateEnvironment(machine.environment)
@@ -505,11 +513,12 @@ public final class MachineManager: @unchecked Sendable {
         environment: [String: String]? = nil,
         updatesEnvironment: Bool = false
     ) throws -> DoryMachineStatus {
-        if let memoryMB, memoryMB == 0 {
-            throw MachineManagerError.persistence("memoryMB must be positive")
-        }
-        if let cpuCount, cpuCount <= 0 {
-            throw MachineManagerError.persistence("cpuCount must be positive")
+        if memoryMB != nil || cpuCount != nil {
+            let current = try configurationAndRunningState(id: id).0
+            try Self.validateResources(
+                memoryMB: memoryMB ?? current.memoryMB,
+                cpuCount: cpuCount ?? current.cpuCount
+            )
         }
         if let shares {
             try Self.validateShares(shares)
@@ -1111,6 +1120,19 @@ public final class MachineManager: @unchecked Sendable {
             guard !value.contains("\0") else {
                 throw MachineManagerError.invalidEnvironment(key)
             }
+        }
+    }
+
+    private static func validateResources(memoryMB: UInt64, cpuCount: Int) throws {
+        guard (minimumMachineMemoryMB...maximumMachineMemoryMB).contains(memoryMB) else {
+            throw MachineManagerError.persistence(
+                "memoryMB must be between \(minimumMachineMemoryMB) and \(maximumMachineMemoryMB)"
+            )
+        }
+        guard (minimumMachineCPUCount...maximumMachineCPUCount).contains(cpuCount) else {
+            throw MachineManagerError.persistence(
+                "cpuCount must be between \(minimumMachineCPUCount) and \(maximumMachineCPUCount)"
+            )
         }
     }
 

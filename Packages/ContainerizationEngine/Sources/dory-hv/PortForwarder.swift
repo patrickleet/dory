@@ -1,5 +1,6 @@
 import Foundation
 import DoryHV
+import DoryCore
 
 /// Publishes container ports to the host through gvproxy. dockerd inside the guest binds published
 /// ports (`docker run -p 8080:80`) to the guest's address; gvproxy's userspace network is not
@@ -12,15 +13,33 @@ final class PortForwarder: MachinePortForwarding, @unchecked Sendable {
     /// Host address published ports bind to: 127.0.0.1 (default, localhost-only) or 0.0.0.0 when the
     /// user opts into LAN visibility.
     private let localHost: String
+    private let sourcePreservingLANClient: (any SourcePreservingLANApplying)?
+    private let sourcePreservingLANSessionID: String?
+    private let sourcePreservingLANGVProxySocketPath: String?
     private let log: (String) -> Void
     private let timer: any DispatchSourceTimer
     private var exposed = Set<PublishedPortForward>()
+    private var lastForwardFailureLog: [PublishedPortForward: Date] = [:]
+    private var lastLANFailureLog = Date.distantPast
+    private var recoveringLANSession = false
 
-    init(engineSocket: String, apiSocket: String, guestIP: String, localHost: String = "127.0.0.1", log: @escaping (String) -> Void) {
+    init(
+        engineSocket: String,
+        apiSocket: String,
+        guestIP: String,
+        localHost: String = "127.0.0.1",
+        sourcePreservingLANClient: (any SourcePreservingLANApplying)? = nil,
+        sourcePreservingLANSessionID: String? = nil,
+        sourcePreservingLANGVProxySocketPath: String? = nil,
+        log: @escaping (String) -> Void
+    ) {
         self.engineSocket = engineSocket
         self.apiSocket = apiSocket
         self.guestIP = guestIP
         self.localHost = localHost
+        self.sourcePreservingLANClient = sourcePreservingLANClient
+        self.sourcePreservingLANSessionID = sourcePreservingLANSessionID
+        self.sourcePreservingLANGVProxySocketPath = sourcePreservingLANGVProxySocketPath
         self.log = log
         self.timer = DispatchSource.makeTimerSource(queue: .global())
         timer.schedule(deadline: .now() + 3, repeating: 2)
@@ -30,22 +49,85 @@ final class PortForwarder: MachinePortForwarding, @unchecked Sendable {
     func start() { timer.resume() }
 
     private func sync() {
-        guard let wanted = wantedForwards() else { return }  // docker not ready or unreachable
-        for forward in wanted.subtracting(exposed) where expose(forward) {
-            exposed.insert(forward)
-            log("port forward: \(forward.localEndpoint)/\(forward.protocol.rawValue) -> container:\(forward.guestPort)/\(forward.protocol.rawValue)")
+        guard let ports = publishedPorts() else { return }  // docker not ready or unreachable
+        if let client = sourcePreservingLANClient, let sessionID = sourcePreservingLANSessionID {
+            do {
+                _ = try client.apply(SourcePreservingLANRequest(
+                    operation: .refresh,
+                    sessionID: sessionID,
+                    bindings: ports
+                ))
+                if recoveringLANSession {
+                    recoveringLANSession = false
+                    log("source-preserving LAN session recovered")
+                }
+            } catch {
+                recoverLANSession(client: client, sessionID: sessionID, bindings: ports, refreshError: error)
+            }
+        }
+        let loopbackPolicy = sourcePreservingLANClient == nil ? localHost : "127.0.0.1"
+        let wanted = PublishedPortForwardPlan.forwards(
+            for: ports,
+            publishHost: loopbackPolicy,
+            guestIP: guestIP
+        )
+        for forward in wanted.subtracting(exposed) {
+            if expose(forward) {
+                exposed.insert(forward)
+                lastForwardFailureLog.removeValue(forKey: forward)
+                log("port forward: \(forward.localEndpoint)/\(forward.protocol.rawValue) -> container:\(forward.guestPort)/\(forward.protocol.rawValue)")
+            } else {
+                let now = Date()
+                if now.timeIntervalSince(lastForwardFailureLog[forward] ?? .distantPast) >= 30 {
+                    lastForwardFailureLog[forward] = now
+                    log("port forward unavailable: \(forward.localEndpoint)/\(forward.protocol.rawValue); retaining bounded retry")
+                }
+            }
         }
         // Only forget the port once gvproxy confirms the forward is gone; a failed unexpose stays
         // tracked and is retried on the next tick, so a stale host forward can't leak.
         for forward in exposed.subtracting(wanted) where unexpose(forward) {
             exposed.remove(forward)
+            lastForwardFailureLog.removeValue(forKey: forward)
             log("port forward: released \(forward.localEndpoint)/\(forward.protocol.rawValue)")
+        }
+        lastForwardFailureLog = lastForwardFailureLog.filter { wanted.contains($0.key) }
+    }
+
+    private func recoverLANSession(
+        client: any SourcePreservingLANApplying,
+        sessionID: String,
+        bindings: Set<PublishedPortBinding>,
+        refreshError: Error
+    ) {
+        recoveringLANSession = true
+        guard let socketPath = sourcePreservingLANGVProxySocketPath else {
+            logLANFailure("source-preserving LAN refresh failed closed: \(refreshError)")
+            return
+        }
+        do {
+            let response = try client.apply(SourcePreservingLANRequest(
+                operation: .activate,
+                sessionID: sessionID,
+                gvproxySocketPath: socketPath,
+                bindings: bindings
+            ))
+            guard response.status == "active" else {
+                logLANFailure("source-preserving LAN recovery failed closed: unexpected status \(response.status)")
+                return
+            }
+            recoveringLANSession = false
+            log("source-preserving LAN session recovered after helper restart")
+        } catch {
+            logLANFailure("source-preserving LAN recovery failed closed after refresh error \(refreshError): \(error)")
         }
     }
 
-    private func wantedForwards() -> Set<PublishedPortForward>? {
-        guard let ports = publishedPorts() else { return nil }
-        return PublishedPortForwardPlan.forwards(for: ports, publishHost: localHost, guestIP: guestIP)
+    private func logLANFailure(_ message: String) {
+        let now = Date()
+        guard now.timeIntervalSince(lastLANFailureLog) >= 30 else { return }
+        lastLANFailureLog = now
+        log(message)
     }
 
     /// The set of host ports currently published by any running container.
@@ -56,11 +138,26 @@ final class PortForwarder: MachinePortForwarding, @unchecked Sendable {
         }
         var ports = Set<PublishedPortBinding>()
         for container in containers {
+            let labels = container["Labels"] as? [String: String]
+            let loopbackIntents = PublishedPortForwardPlan.loopbackIntents(
+                fromLabel: labels?[PublishedPortForwardPlan.loopbackPortIntentLabel]
+            )
             guard let list = container["Ports"] as? [[String: Any]] else { continue }
             for entry in list {
                 let proto = entry["Type"] as? String ?? "tcp"
+                let requestedHost = PublishedPortForwardPlan.requestedHost(
+                    dockerHost: entry["IP"] as? String,
+                    containerPort: entry["PrivatePort"] as? Int,
+                    publicPort: entry["PublicPort"] as? Int,
+                    dockerType: proto,
+                    loopbackIntents: loopbackIntents
+                )
                 guard let publicPort = entry["PublicPort"] as? Int,
-                      let binding = PublishedPortBinding(dockerType: proto, publicPort: publicPort) else {
+                      let binding = PublishedPortBinding(
+                        dockerType: proto,
+                        publicPort: publicPort,
+                        hostIP: requestedHost
+                      ) else {
                     continue
                 }
                 ports.insert(binding)

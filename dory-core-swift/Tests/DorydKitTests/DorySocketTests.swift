@@ -44,4 +44,33 @@ final class DorySocketTests: XCTestCase {
         defer { close(fresh) }
         XCTAssertTrue(FileManager.default.fileExists(atPath: socket.path))
     }
+
+    func testBindAtExplicitPath() throws {
+        let root = NSTemporaryDirectory() + "dory-sock-explicit-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        defer { try? FileManager.default.removeItem(atPath: root) }
+
+        let socket = DorySocket(path: root + "/nested/engine.sock")
+        let fd = try socket.bind()
+        defer { close(fd) }
+
+        XCTAssertEqual(socket.path, root + "/nested/engine.sock")
+        let directoryAttributes = try FileManager.default.attributesOfItem(atPath: root + "/nested")
+        let directoryMode = (directoryAttributes[.posixPermissions] as? NSNumber)?.uint16Value ?? 0
+        XCTAssertEqual(directoryMode & 0o777, 0o700)
+    }
+
+    func testBindRefusesToDeleteRegularFileAtSocketPath() throws {
+        let root = NSTemporaryDirectory() + "dory-sock-file-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+        let path = root + "/engine.sock"
+        try Data("do-not-delete".utf8).write(to: URL(fileURLWithPath: path))
+
+        XCTAssertThrowsError(try DorySocket(path: path).bind()) { error in
+            guard case DorySocket.SocketError.unsafeExistingPath(path) = error else {
+                return XCTFail("expected unsafeExistingPath, got \(error)")
+            }
+        }
+        XCTAssertEqual(try String(contentsOfFile: path, encoding: .utf8), "do-not-delete")
+    }
 }

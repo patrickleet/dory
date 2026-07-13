@@ -1,3 +1,4 @@
+import DoryCore
 import DoryHV
 import Foundation
 import Synchronization
@@ -17,14 +18,19 @@ enum EngineMode {
         var memoryMB: UInt64
         var cpus: Int
         var stateDirectory: String
+        /// Durable user-data drive path. Runtime sockets/rootfs clones stay in stateDirectory.
+        var dockerDataDiskPath: String?
+        /// Ordered rollback sources to clone on first boot. The newest Dory layout is checked before
+        /// the v0.2 Apple-container store; an invalid newer source fails closed.
+        var legacyDockerDataDiskPaths: [String] = []
         /// Offline builds pass a decompressed engine rootfs here so first launch needs no network;
         /// online builds leave it nil and the engine fetches the image once.
         var bundledRootfs: String?
         var shares: [VirtioFSShareConfiguration] = []
         var directIP: DirectIPBridgeConfiguration?
         var gpuMode: GPUAccelerationMode = .off
-        /// Register a qemu binfmt handler in the guest so `--platform linux/amd64` images run on the
-        /// arm64 engine. Opt-in (Settings → Rosetta x86) to keep the default guest lean.
+        /// Register FEX's seccomp-correct binfmt handler and Dory OCI runtime so
+        /// `--platform linux/amd64` images run on the arm64 engine.
         var amd64Emulation: Bool = false
         /// Host address published container ports bind to. Defaults to loopback; set to 0.0.0.0 only
         /// when the user opts into LAN visibility (Settings → Network / `dory network --lan-visible`).
@@ -32,6 +38,7 @@ enum EngineMode {
         /// Unix socket the Rust dataplane's ForwardBackend dials (re-platform docker tier): each
         /// connection opens a preamble-named guest vsock stream. nil keeps the forward off.
         var agentVsockForward: String?
+        var sshAgentSocket: String?
         /// Current guest agent binary supplied by the app/doryd bundle for this boot. It is copied
         /// into the read-only boot-config share so stale files under the user's home cannot shadow it.
         var guestAgentPath: String?
@@ -90,8 +97,9 @@ enum EngineMode {
                         usleep(250_000)
                     }
                 }
-                DispatchQueue.global().asyncAfter(deadline: .now() + 12) {
-                    note("guest did not stop in 12s, forcing exit")
+                let watchdog = DoryEngineShutdownTiming.helperWatchdogSeconds
+                DispatchQueue.global().asyncAfter(deadline: .now() + watchdog) {
+                    note("guest did not stop in \(watchdog)s, forcing exit")
                     stopGVProxy()
                     exit(1)
                 }
@@ -168,18 +176,187 @@ enum EngineMode {
         return result == 0
     }
 
+    /// Monitors a private gvproxy forward without depending on public Internet reachability. The
+    /// Docker witness takes the independent engine.sock -> vsock path, so only a repeated canary
+    /// failure while Docker still answers is allowed to restart the VM.
+    private static func monitorGVProxyDatapath(
+        healthSocket: String,
+        dockerSocket: String,
+        apiSocket: String,
+        diagnosticPath: String,
+        gvproxyPID: Int32,
+        network: VirtioNet,
+        machine: Machine
+    ) -> Task<Void, Never> {
+        Task.detached(priority: .utility) {
+            // Guest boot, dockerd readiness, and the asynchronous forward registration all happen
+            // after machine.run() starts. Keep that startup window outside the recovery policy.
+            do {
+                try await Task.sleep(nanoseconds: 30_000_000_000)
+            } catch {
+                return
+            }
+
+            var guardState = GVProxyDatapathGuard(failureThreshold: 3)
+            var reportedInconclusive = false
+            while !Task.isCancelled {
+                let canaryResponse = UnixSocketHTTPClient.get(
+                    socketPath: healthSocket,
+                    path: "/_ping",
+                    timeout: 2,
+                    maximumBodyBytes: 64
+                )
+                let canaryReachable = canaryResponse.map {
+                    $0.statusCode == 200 && String(decoding: $0.body, as: UTF8.self)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        == "OK"
+                } ?? false
+                let dockerResponse = UnixSocketHTTPClient.get(
+                    socketPath: dockerSocket,
+                    path: "/_ping",
+                    timeout: 2,
+                    maximumBodyBytes: 64
+                )
+                let dockerReachable = dockerResponse.map {
+                    $0.statusCode == 200 && String(decoding: $0.body, as: UTF8.self)
+                        .trimmingCharacters(in: .whitespacesAndNewlines) == "OK"
+                } ?? false
+
+                switch guardState.observe(
+                    gvproxyCanaryReachable: canaryReachable,
+                    dockerAPIReachable: dockerReachable
+                ) {
+                case .healthy, .restartAlreadyRequested:
+                    reportedInconclusive = false
+                case .recovered(let previousFailures):
+                    persistGVProxyDiagnostic(
+                        path: diagnosticPath,
+                        reason: "recovered",
+                        consecutiveFailures: previousFailures,
+                        gvproxyPID: gvproxyPID,
+                        apiSocket: apiSocket,
+                        statistics: network.statistics
+                    )
+                    note("gvproxy datapath canary recovered after \(previousFailures) failed probe(s)")
+                    reportedInconclusive = false
+                case .inconclusive:
+                    // Do not blame gvproxy when the independent guest witness is unavailable. Log
+                    // once per inconclusive run and leave VM lifecycle to the Docker supervisor.
+                    if !reportedInconclusive {
+                        note("gvproxy datapath probe inconclusive: Docker witness is unavailable; no restart requested")
+                        reportedInconclusive = true
+                    }
+                case .suspected(let failures):
+                    reportedInconclusive = false
+                    persistGVProxyDiagnostic(
+                        path: diagnosticPath,
+                        reason: "suspected",
+                        consecutiveFailures: failures,
+                        gvproxyPID: gvproxyPID,
+                        apiSocket: apiSocket,
+                        statistics: network.statistics
+                    )
+                    note("gvproxy datapath canary failed while Docker remained responsive (\(failures)/\(guardState.failureThreshold))")
+                case .restartRequired(let failures):
+                    let reason = "gvproxy remained alive but its local datapath canary failed \(failures) consecutive times while Docker remained responsive"
+                    persistGVProxyDiagnostic(
+                        path: diagnosticPath,
+                        reason: "restart-required",
+                        consecutiveFailures: failures,
+                        gvproxyPID: gvproxyPID,
+                        apiSocket: apiSocket,
+                        statistics: network.statistics
+                    )
+                    note("\(reason); requesting bounded engine restart (diagnostic: \(diagnosticPath))")
+                    machine.requestStop(.crash(reason))
+                    return
+                }
+
+                do {
+                    try await Task.sleep(nanoseconds: 10_000_000_000)
+                } catch {
+                    return
+                }
+            }
+        }
+    }
+
+    private static func persistGVProxyDiagnostic(
+        path: String,
+        reason: String,
+        consecutiveFailures: Int,
+        gvproxyPID: Int32,
+        apiSocket: String,
+        statistics: VirtioNetStatistics
+    ) {
+        let proxyStats = UnixSocketHTTPClient.get(
+            socketPath: apiSocket,
+            path: "/stats",
+            timeout: 2,
+            maximumBodyBytes: 32 * 1_024
+        ).flatMap { response in
+            response.statusCode == 200 ? String(decoding: response.body, as: UTF8.self) : nil
+        }
+        let diagnostic = GVProxyDatapathDiagnostic(
+            recordedAt: ISO8601DateFormatter().string(from: Date()),
+            reason: reason,
+            consecutiveFailures: consecutiveFailures,
+            gvproxyPID: gvproxyPID,
+            transmitPackets: statistics.transmitPackets,
+            transmitBytes: statistics.transmitBytes,
+            transmitDrops: statistics.transmitDrops,
+            receivePackets: statistics.receivePackets,
+            receiveBytes: statistics.receiveBytes,
+            receiveDeferred: statistics.receiveDeferred,
+            receiveDrops: statistics.receiveDrops,
+            receiveTruncations: statistics.receiveTruncations,
+            gvproxyStats: proxyStats
+        )
+        guard let data = try? JSONEncoder().encode(diagnostic) else { return }
+        try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
+    }
+
+    private struct GVProxyDatapathDiagnostic: Codable {
+        var recordedAt: String
+        var reason: String
+        var consecutiveFailures: Int
+        var gvproxyPID: Int32
+        var transmitPackets: UInt64
+        var transmitBytes: UInt64
+        var transmitDrops: UInt64
+        var receivePackets: UInt64
+        var receiveBytes: UInt64
+        var receiveDeferred: UInt64
+        var receiveDrops: UInt64
+        var receiveTruncations: UInt64
+        var gvproxyStats: String?
+    }
+
     static func run(_ configuration: Configuration) async throws {
         try DockerSocketBridge.validateSocketPath(configuration.engineSocket)
         if let forwardSocket = configuration.agentVsockForward {
             try AgentVsockForward.validateSocketPath(forwardSocket)
         }
+        let sshAgentBridge = try configuration.sshAgentSocket.map {
+            try HostSSHAgentBridge(socketPath: $0, log: { note($0) })
+        }
         try VirtioFSShareConfiguration.validateWritableTopology(configuration.shares)
-        let state = configuration.stateDirectory
+        let nativeIPv6 = try NativeIPv6NetworkPlan(directIP: configuration.directIP)
+        let sourcePreservingLAN = configuration.publishHost == "0.0.0.0"
+        let state = URL(fileURLWithPath: configuration.stateDirectory).standardizedFileURL.path
         try FileManager.default.createDirectory(atPath: state, withIntermediateDirectories: true)
+        let stateDirectoryLock = try EngineStateDirectoryLock(stateDirectory: state)
+        defer { withExtendedLifetime(stateDirectoryLock) {} }
 
         let pristineRootfs = state + "/rootfs-pristine.ext4"
         let bootRootfs = state + "/rootfs-boot.ext4"
-        let dataDisk = state + "/docker-data.ext4"
+        let dataDisk = URL(fileURLWithPath: configuration.dockerDataDiskPath ?? (state + "/docker-data.ext4"))
+            .standardizedFileURL.path
+        let dataDiskDirectory = URL(fileURLWithPath: dataDisk).deletingLastPathComponent().path
+        let dataDriveLock: EngineStateDirectoryLock? = dataDiskDirectory == state
+            ? nil
+            : try EngineStateDirectoryLock(stateDirectory: dataDiskDirectory)
+        defer { withExtendedLifetime(dataDriveLock) {} }
 
         // Both one-time artifacts are built at a temp path and atomically renamed into place, so an
         // interrupted first run leaves no half-written file that the fileExists guard would then
@@ -198,19 +375,37 @@ enum EngineMode {
         try? FileManager.default.removeItem(atPath: bootRootfs)
         try FileManager.default.copyItem(atPath: pristineRootfs, toPath: bootRootfs)
 
-        if !FileManager.default.fileExists(atPath: dataDisk) {
-            note("first run: creating docker data disk…")
-            let temporary = dataDisk + ".partial"
-            try? FileManager.default.removeItem(atPath: temporary)
-            try createSparseFile(at: temporary, size: 16 * 1024 * 1024 * 1024)
-            try fsyncFile(temporary)
-            try FileManager.default.moveItem(atPath: temporary, toPath: dataDisk)
+        let dataDiskPreparation = try LegacyDockerDataDisk.prepare(
+            destination: dataDisk,
+            legacySources: configuration.legacyDockerDataDiskPaths
+        )
+        switch dataDiskPreparation {
+        case .alreadyPresent:
+            break
+        case .adoptedLegacy(let source):
+            note("first run: adopted a non-destructive clone of the legacy data drive from \(source)")
+        case .createdBlank:
+            note("first run: created docker data disk")
+        }
+        let allowDockerDataFormat: Bool
+        switch dataDiskPreparation {
+        case .createdBlank:
+            allowDockerDataFormat = true
+        case .alreadyPresent:
+            // Host validation admits a non-ext4 existing file only when it has zero allocated
+            // blocks, which is a first-boot sparse blank left by an interrupted earlier launch.
+            allowDockerDataFormat = try !LegacyDockerDataDisk.isExt4Image(at: dataDisk)
+        case .adoptedLegacy:
+            allowDockerDataFormat = false
         }
 
         let bootConfigShare = try writeBootConfiguration(stateDirectory: state, script: guestBootScript(
             shares: configuration.shares,
             gpuMode: configuration.gpuMode,
-            amd64Emulation: configuration.amd64Emulation
+            amd64Emulation: configuration.amd64Emulation,
+            nativeIPv6: nativeIPv6,
+            sourcePreservingLAN: sourcePreservingLAN,
+            allowDockerDataFormat: allowDockerDataFormat
         ), guestAgentPath: configuration.guestAgentPath)
         let guestLogShare = try guestLogShareConfiguration(stateDirectory: state)
 
@@ -229,24 +424,26 @@ enum EngineMode {
         backends.append(VirtioBalloon(memory: machine.memory) { note($0) })
         var daxSlot: UInt64 = 0
         if configuration.gpuMode == .venus {
-            do {
-                let renderer = try VirglRenderer.discover()
-                let hostMemoryBase = GuestLayout.daxWindowBase + daxSlot * DaxWindow.defaultSize
-                let hostVisibleMemory = try VirtioGPUHostVisibleMemory(guestBase: hostMemoryBase)
-                daxSlot += 1
-                backends.append(VirtioGPU(
-                    hostMemoryBase: hostMemoryBase,
-                    renderer: renderer,
-                    hostVisibleMemory: hostVisibleMemory
-                ))
-                note("experimental gpu=venus: attached virtio-gpu with virglrenderer \(renderer.libraryPath) and MoltenVK ICD \(renderer.moltenVKICDPath)")
-            } catch {
-                note("experimental gpu=venus unavailable, continuing headless: \(error)")
+            let renderer = try VenusModeRequirement.require {
+                try VirglRenderer.discover()
             }
+            let hostMemoryBase = GuestLayout.daxWindowBase + daxSlot * DaxWindow.defaultSize
+            let hostVisibleMemory = try VirtioGPUHostVisibleMemory(guestBase: hostMemoryBase)
+            daxSlot += 1
+            backends.append(VirtioGPU(
+                hostMemoryBase: hostMemoryBase,
+                renderer: renderer,
+                hostVisibleMemory: hostVisibleMemory
+            ))
+            note(
+                "experimental gpu=venus: attached virtio-gpu with virglrenderer "
+                    + "\(renderer.libraryPath) and MoltenVK ICD \(renderer.moltenVKICDPath)"
+            )
         }
         let vsock = VirtioVsock(guestCID: 3)
         backends.append(vsock)
         HostAIBridge(log: { note($0) }).attach(to: vsock)
+        sshAgentBridge?.attach(to: vsock)
         let requestedFuseQueues = ProcessInfo.processInfo.environment["DORY_FUSE_QUEUES"]
             .flatMap(Int.init) ?? configuration.cpus
         let fuseRequestQueues = min(8, max(1, requestedFuseQueues))
@@ -276,9 +473,12 @@ enum EngineMode {
         }
 
         let datapathSocket = state + "/net.sock"
+        let lanDatapathSocket = state + "/lan-net.sock"
         let apiSocket = state + "/gvproxy-api.sock"
         let shutdownSocket = state + "/shutdown.sock"
+        let gvproxyHealthSocket = state + "/gvproxy-health.sock"
         try? FileManager.default.removeItem(atPath: datapathSocket)
+        try? FileManager.default.removeItem(atPath: lanDatapathSocket)
         try? FileManager.default.removeItem(atPath: apiSocket)
         // Install before spawning gvproxy. A signal arriving during the remaining VM setup must use
         // the watchdog cleanup path rather than taking the default signal action and orphaning it.
@@ -290,6 +490,20 @@ enum EngineMode {
             "-listen-vfkit", "unixgram://\(datapathSocket)",
             "-listen", "unix://\(apiSocket)",
         ]
+        if sourcePreservingLAN {
+            gvproxy.arguments?.append(contentsOf: [
+                "-listen-qemu", "unix://\(lanDatapathSocket)",
+            ])
+        }
+        if let nativeIPv6 {
+            let configPath = state + "/gvproxy-dual-stack.yaml"
+            try nativeIPv6.gvproxyYAML.write(toFile: configPath, atomically: true, encoding: .utf8)
+            gvproxy.arguments?.append(contentsOf: ["-config", configPath])
+        } else {
+            // In flag-only mode gvproxy otherwise creates its legacy 127.0.0.1:2222 SSH forward.
+            // Config-file mode never creates that default and warns if -ssh-port is supplied.
+            gvproxy.arguments?.append(contentsOf: ["-ssh-port", "-1"])
+        }
         gvproxy.standardOutput = FileHandle.standardError
         gvproxy.standardError = FileHandle.standardError
         let gvproxyTerminationExpected = Atomic<Bool>(false)
@@ -311,26 +525,37 @@ enum EngineMode {
         }
         try launchGVProxy(gvproxy)
         for _ in 0..<100 {
-            if FileManager.default.fileExists(atPath: datapathSocket) { break }
+            let primaryReady = FileManager.default.fileExists(atPath: datapathSocket)
+            let lanReady = !sourcePreservingLAN
+                || FileManager.default.fileExists(atPath: lanDatapathSocket)
+            if primaryReady && lanReady { break }
             usleep(50_000)
         }
         let virtioNet = try VirtioNet(socketPath: state + "/vm-net.sock", remotePath: datapathSocket)
         backends.append(virtioNet)
-        var directIPBridge: DirectIPBridge?
-        if let config = configuration.directIP {
-            do {
-                let bridge = try DirectIPBridge(configuration: DirectIPBridgeConfiguration(
-                    subnetCIDR: config.subnetCIDR,
-                    gateway: config.gateway,
-                    gvproxySocketPath: datapathSocket,
-                    localSocketPath: config.localSocketPath,
-                    interfaceNamePath: config.interfaceNamePath
-                )) { note($0) }
-                try bridge.start()
-                directIPBridge = bridge
-            } catch {
-                note("direct-ip disabled: \(error)")
-                directIPBridge = nil
+        var sourcePreservingLANClient: SourcePreservingLANPrivilegedClient?
+        var sourcePreservingLANSessionID: String?
+        if sourcePreservingLAN {
+            let client = SourcePreservingLANPrivilegedClient()
+            let sessionID = "hv-\(getpid())"
+            let response = try client.apply(SourcePreservingLANRequest(
+                operation: .activate,
+                sessionID: sessionID,
+                gvproxySocketPath: lanDatapathSocket
+            ))
+            guard response.status == "active" else {
+                throw VMError.invalidConfiguration("source-preserving LAN helper did not activate")
+            }
+            sourcePreservingLANClient = client
+            sourcePreservingLANSessionID = sessionID
+            note("source-preserving LAN packet bridge active on \(response.interfaceName ?? "unknown interface")")
+        }
+        defer {
+            if let client = sourcePreservingLANClient, let sessionID = sourcePreservingLANSessionID {
+                _ = try? client.apply(SourcePreservingLANRequest(
+                    operation: .deactivate,
+                    sessionID: sessionID
+                ))
             }
         }
 
@@ -362,6 +587,12 @@ enum EngineMode {
         // dataplane forward. Propagate bind/listen/chmod failures before entering machine.run().
         try DockerSocketBridge(socketPath: configuration.engineSocket, log: { note($0) }).attach(to: vsock)
         publishForward(local: shutdownSocket, guestPort: 2377, apiSocket: apiSocket, label: "shutdown channel")
+        publishForward(
+            local: gvproxyHealthSocket,
+            guestPort: 2375,
+            apiSocket: apiSocket,
+            label: "gvproxy datapath canary"
+        )
         installClockSyncSignal(vsock: vsock)
         if reclaimModeIsSenpai {
             let reclaimSocket = state + "/reclaim.sock"
@@ -376,9 +607,22 @@ enum EngineMode {
             apiSocket: apiSocket,
             guestIP: "192.168.127.2",
             localHost: configuration.publishHost,
+            sourcePreservingLANClient: sourcePreservingLANClient,
+            sourcePreservingLANSessionID: sourcePreservingLANSessionID,
+            sourcePreservingLANGVProxySocketPath: sourcePreservingLANClient == nil ? nil : lanDatapathSocket,
             log: { note($0) }
         )
         portForwarder.start()
+        let gvproxyDatapathTask = monitorGVProxyDatapath(
+            healthSocket: gvproxyHealthSocket,
+            dockerSocket: configuration.engineSocket,
+            apiSocket: apiSocket,
+            diagnosticPath: state + "/gvproxy-health-last-failure.json",
+            gvproxyPID: gvproxy.processIdentifier,
+            network: virtioNet,
+            machine: machine
+        )
+        defer { gvproxyDatapathTask.cancel() }
         note("engine starting: \(configuration.memoryMB)MiB ceiling, \(configuration.cpus) cpus, socket \(configuration.engineSocket)")
 
         // The host usbip bridge exists, but attach/detach is deliberately unavailable until the
@@ -424,6 +668,7 @@ enum EngineMode {
             )
             let relay = HostFSEventRelay(
                 shares: activeEndpoints.map(\.share),
+                observeRootsOnDemand: true,
                 send: { changes in
                     try await coordinator.process(changes)
                     coordinator.relayDeliverySucceeded()
@@ -441,6 +686,17 @@ enum EngineMode {
                 started: relayStarted,
                 productionShareCount: activeEndpoints.count
             )
+            for endpoint in activeEndpoints {
+                endpoint.backend.hostFS.setEventObservationHandler { hostPath in
+                    guard relay.observe(hostPath: hostPath) else {
+                        let reason = "failed to start narrow host-share observation for \(hostPath)"
+                        coordinator.relayDeliveryFailed(reason)
+                        note(reason)
+                        machine.requestStop(.crash(reason))
+                        return
+                    }
+                }
+            }
             hostFSEventRelay = relay
             let watcherCount = activeEndpoints.filter(\.watcherNudgesEnabled).count
             note("host-share invalidation relay active for \(activeEndpoints.count) share(s), watcher nudges on \(watcherCount)")
@@ -474,38 +730,15 @@ enum EngineMode {
         }
         defer {
             cacheReadinessTask?.cancel()
+            for endpoint in coherenceEndpoints {
+                endpoint.backend.hostFS.setEventObservationHandler(nil)
+            }
             hostFSEventRelay?.stop()
         }
 
         let stop = try machine.run()
-        directIPBridge?.stop()
         gauge.cancel()
         note("engine stopped: \(stop)")
-    }
-
-    /// Flushes a freshly written file to stable storage before it is renamed into place, so a
-    /// crash right after the rename can never expose a file whose contents are still in the page
-    /// cache (EXT4.Formatter.close does not fsync).
-    private static func fsyncFile(_ path: String) throws {
-        let descriptor = open(path, O_RDONLY)
-        guard descriptor >= 0 else {
-            throw VMError.invalidConfiguration("cannot open \(path) to fsync: errno \(errno)")
-        }
-        defer { close(descriptor) }
-        guard fcntl(descriptor, F_FULLFSYNC) == 0 || fsync(descriptor) == 0 else {
-            throw VMError.invalidConfiguration("cannot fsync \(path): errno \(errno)")
-        }
-    }
-
-    private static func createSparseFile(at path: String, size: Int64) throws {
-        let descriptor = open(path, O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR)
-        guard descriptor >= 0 else {
-            throw VMError.invalidConfiguration("cannot create \(path): errno \(errno)")
-        }
-        defer { close(descriptor) }
-        guard ftruncate(descriptor, off_t(size)) == 0 else {
-            throw VMError.invalidConfiguration("cannot size \(path): errno \(errno)")
-        }
     }
 
     private static func writeBootConfiguration(
@@ -564,7 +797,10 @@ enum EngineMode {
     private static func guestBootScript(
         shares: [VirtioFSShareConfiguration] = [],
         gpuMode: GPUAccelerationMode = .off,
-        amd64Emulation: Bool = false
+        amd64Emulation: Bool = false,
+        nativeIPv6: NativeIPv6NetworkPlan? = nil,
+        sourcePreservingLAN: Bool = false,
+        allowDockerDataFormat: Bool = false
     ) -> String {
         var script = [
             "export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin",
@@ -586,9 +822,39 @@ enum EngineMode {
             // the macOS 14 helper does not need Apple's macOS 15-only EXT4 formatter.
             "DORY_DOCKER_MOUNT_OPTS=noatime,lazytime,commit=30",
             "DORY_DOCKER_MOUNT_FALLBACK_OPTS=noatime,commit=30",
+            "DORY_ALLOW_DATA_FORMAT=\(allowDockerDataFormat ? 1 : 0)",
             "dory_mount_docker_data() { mount -t ext4 -o \"$DORY_DOCKER_MOUNT_OPTS\" /dev/vdb /var/lib/docker || mount -t ext4 -o \"$DORY_DOCKER_MOUNT_FALLBACK_OPTS\" /dev/vdb /var/lib/docker || mount -t ext4 /dev/vdb /var/lib/docker; }",
             "dory_format_docker_data() { mkfs.ext4 -F -O fast_commit /dev/vdb >/var/log/dory-data-mkfs.log 2>&1 || mkfs.ext4 -F /dev/vdb >>/var/log/dory-data-mkfs.log 2>&1; }",
-            "dory_mount_docker_data || { echo DATA-DISK-FORMAT; dory_format_docker_data && dory_mount_docker_data; } || { echo DATA-DISK-MOUNT-FAILED; sync; poweroff -f; }",
+            "dory_grow_docker_data() {",
+            "  DORY_DATA_DEVICE_BYTES=$(blockdev --getsize64 /dev/vdb 2>/dev/null || true)",
+            "  DORY_DATA_GEOMETRY=$(dumpe2fs -h /dev/vdb 2>/dev/null | awk '/^Block count:/{blocks=$3} /^Block size:/{size=$3} END{if(blocks && size) print blocks, size}')",
+            "  set -- $DORY_DATA_GEOMETRY",
+            "  DORY_DATA_FS_BLOCKS=${1:-}; DORY_DATA_FS_BLOCK_SIZE=${2:-}",
+            "  case \"$DORY_DATA_DEVICE_BYTES\" in ''|*[!0-9]*) echo invalid block-device size >/var/log/dory-data-resize.log; return 2;; esac",
+            "  case \"$DORY_DATA_FS_BLOCKS\" in ''|*[!0-9]*) echo invalid ext4 block count >/var/log/dory-data-resize.log; return 2;; esac",
+            "  case \"$DORY_DATA_FS_BLOCK_SIZE\" in ''|*[!0-9]*) echo invalid ext4 block size >/var/log/dory-data-resize.log; return 2;; esac",
+            "  DORY_DATA_FS_BYTES=$((DORY_DATA_FS_BLOCKS * DORY_DATA_FS_BLOCK_SIZE))",
+            "  [ \"$DORY_DATA_FS_BYTES\" -le \"$DORY_DATA_DEVICE_BYTES\" ] || { echo ext4 geometry exceeds block device >/var/log/dory-data-resize.log; return 2; }",
+            "  if [ $((DORY_DATA_FS_BYTES + DORY_DATA_FS_BLOCK_SIZE)) -gt \"$DORY_DATA_DEVICE_BYTES\" ]; then echo ext4 already spans block device >/var/log/dory-data-resize.log; return 0; fi",
+            "  e2fsck -p /dev/vdb >/var/log/dory-data-resize.log 2>&1",
+            "  DORY_E2FSCK_STATUS=$?; [ $DORY_E2FSCK_STATUS -le 1 ] || return $DORY_E2FSCK_STATUS",
+            "  resize2fs /dev/vdb >>/var/log/dory-data-resize.log 2>&1",
+            "}",
+            "if blkid /dev/vdb 2>/dev/null | grep -q 'TYPE=\"ext4\"'; then",
+            "  dory_grow_docker_data || { echo DATA-DISK-RESIZE-FAILED; cat /var/log/dory-data-resize.log 2>/dev/null; sync; poweroff -f; exit 1; }",
+            "  dory_mount_docker_data || { echo DATA-DISK-MOUNT-FAILED-EXISTING-EXT4; sync; poweroff -f; exit 1; }",
+            "elif [ \"$DORY_ALLOW_DATA_FORMAT\" -eq 1 ]; then",
+            "  echo DATA-DISK-FORMAT-PROVEN-BLANK",
+            "  dory_format_docker_data && dory_mount_docker_data || { echo DATA-DISK-FORMAT-OR-MOUNT-FAILED; sync; poweroff -f; exit 1; }",
+            "else",
+            "  echo DATA-DISK-UNKNOWN-FILESYSTEM-REFUSING-FORMAT",
+            "  sync; poweroff -f; exit 1",
+            "fi",
+            // The raw virtio-blk backend maps DISCARD to APFS hole punching. Reclaim blocks from
+            // deleted Docker layers/volumes before admission checks so an old sparse image does
+            // not remain physically full even though ext4 reports substantial free space.
+            "fstrim -v /var/lib/docker >/var/log/dory-data-trim.log 2>&1 || true",
+            "cp /var/log/dory-data-trim.log /mnt/dory-logs/data-trim.log 2>/dev/null || true",
             "awk '$2==\"/var/lib/docker\"{print $4}' /proc/mounts >/var/log/dory-data-mount-options.log 2>&1 || true",
             "ip link set lo up",
             "ip link set eth0 up",
@@ -597,7 +863,18 @@ enum EngineMode {
             // a way that looks like a container or registry bug. Preserve the DHCP transcript in the
             // host-visible guest log before powering off so the supervisor can retry the whole tier.
             "udhcpc -i eth0 -q -n -t 5 -T 1 >/var/log/dory-dhcp.log 2>&1 || { echo DORY-DHCP-FAILED >&2; cat /var/log/dory-dhcp.log >&2; cp /var/log/dory-dhcp.log /mnt/dory-logs/network.log 2>/dev/null || true; sync; poweroff -f; exit 1; }",
-            "{ ip -details address show dev eth0; ip route show; echo RESOLV-CONF; cat /etc/resolv.conf; } >/mnt/dory-logs/network.log 2>&1 || true",
+        ]
+        if let nativeIPv6 {
+            script += nativeIPv6.guestSetupCommands
+            script.append("DORY_IPV6_DOCKER_ARGS='\(nativeIPv6.dockerDaemonArguments)'")
+        } else {
+            script.append("DORY_IPV6_DOCKER_ARGS=''")
+        }
+        if sourcePreservingLAN {
+            script += SourcePreservingLANPlan.guestSetupCommands
+        }
+        script += [
+            "{ ip -details address show dev eth0; ip route show; ip -6 route show; echo RESOLV-CONF; cat /etc/resolv.conf; } >/mnt/dory-logs/network.log 2>&1 || true",
             "echo 2 > /sys/module/page_reporting/parameters/page_reporting_order 2>/dev/null",
             // Keep the normal kernel dentry/inode balance during active workloads. Free page
             // reporting and the idle cache cap below handle reclaim without making metadata-heavy
@@ -614,6 +891,9 @@ enum EngineMode {
         }
         if amd64Emulation {
             script += BinfmtRegistration.bootCommands()
+            script.append("DORY_AMD64_RUNTIME_ARGS='--add-runtime dory-runc=/usr/local/bin/dory-runc --default-runtime dory-runc'")
+        } else {
+            script.append("DORY_AMD64_RUNTIME_ARGS=''")
         }
         for share in shares {
             let tag = shellQuote(share.tag)
@@ -625,15 +905,12 @@ enum EngineMode {
         }
         script += [
             guestAgentStartCommand(shares: shares),
-            // Prefer crun (faster container create/start) ONLY when the guest kernel provides the
-            // cgroup-v2 io.max file: crun opens it unconditionally, so on a kernel built without
-            // CONFIG_BLK_DEV_THROTTLING it fails every container create with "open io.max: No such
-            // file". runc tolerates the absence, so we fall back to it there. Probe by delegating io
-            // and checking a throwaway cgroup; this auto-enables crun once the kernel gains throttling.
-            "if [ -x /usr/local/bin/crun ]; then echo +io > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null; mkdir -p /sys/fs/cgroup/.dory-crun-probe 2>/dev/null; [ -e /sys/fs/cgroup/.dory-crun-probe/io.max ] && DORY_RUNTIME_ARGS='--add-runtime crun=/usr/local/bin/crun --default-runtime crun' || DORY_RUNTIME_ARGS=''; rmdir /sys/fs/cgroup/.dory-crun-probe 2>/dev/null; else DORY_RUNTIME_ARGS=''; fi",
-            "dockerd -H unix:///var/run/docker.sock -H tcp://0.0.0.0:2375 --tls=false --log-level=warn --feature containerd-snapshotter=true $DORY_RUNTIME_ARGS >/var/log/dockerd.log 2>&1 & true",
-            amd64Emulation ? BinfmtRegistration.dockerFallbackCommand() : "true",
-            "( while true; do nc -l -p 2377 >/dev/null 2>&1; echo shutdown requested; sync; umount /var/lib/docker 2>/dev/null; sync; poweroff -f; done ) & true",
+            // Keep Docker's reference runc as the normal default. When amd64 translation is enabled,
+            // dory-runc becomes the default and delegates to that same runc after injecting the
+            // private FEX bundle. crun remains an explicit opt-in only when io.max is available.
+            "if [ -x /usr/local/bin/crun ]; then echo +io > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null; mkdir -p /sys/fs/cgroup/.dory-crun-probe 2>/dev/null; [ -e /sys/fs/cgroup/.dory-crun-probe/io.max ] && DORY_RUNTIME_ARGS='--add-runtime crun=/usr/local/bin/crun' || DORY_RUNTIME_ARGS=''; rmdir /sys/fs/cgroup/.dory-crun-probe 2>/dev/null; else DORY_RUNTIME_ARGS=''; fi",
+            "dockerd -H unix:///var/run/docker.sock -H tcp://0.0.0.0:2375 --tls=false --log-level=warn --feature containerd-snapshotter=true $DORY_RUNTIME_ARGS $DORY_AMD64_RUNTIME_ARGS $DORY_IPV6_DOCKER_ARGS >/var/log/dockerd.log 2>&1 & true",
+            GuestShutdownCommand.listener(),
             GuestMemoryReclaimBootCommand.hostPressureListener(
                 experimentalSenpai: reclaimModeIsSenpai
             ),

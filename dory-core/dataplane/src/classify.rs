@@ -1,6 +1,6 @@
 //! Route a docker request to one of three dispositions. Everything is passthrough now that the
 //! backend is a real `dockerd`; the exceptions are the streaming/hijack endpoints (which must not be
-//! buffered — buffering `build`/`pull` reintroduces the `/wait`-before-`/start` deadlock) and
+//! buffered — buffering `build`/`load` reintroduces the `/wait`-before-`/start` deadlock) and
 //! container create (which needs the compatibility rewrites).
 
 use crate::http_head::RequestHead;
@@ -9,10 +9,12 @@ use crate::http_head::RequestHead;
 pub enum Disposition {
     /// Relay bytes verbatim to dockerd and back.
     Passthrough,
-    /// Hand the raw connection to the half-close splice (attach/exec/build/pull, or any Upgrade).
+    /// Hand the raw connection to the half-close splice (attach/exec/build/load, or any Upgrade).
     Hijack,
     /// Rewrite the create body for shared-VM compatibility, then relay.
     CreateRewrite,
+    /// Verify fixed macOS host ports before asking guest dockerd to start the container.
+    ContainerStartPreflight,
 }
 
 pub fn classify(head: &RequestHead) -> Disposition {
@@ -23,13 +25,19 @@ pub fn classify(head: &RequestHead) -> Disposition {
     if m == "POST" && p == "/containers/create" {
         return Disposition::CreateRewrite;
     }
+    if m == "POST" && p.starts_with("/containers/") && p.ends_with("/start") {
+        return Disposition::ContainerStartPreflight;
+    }
     if p.ends_with("/attach") || p.ends_with("/attach/ws") {
         return Disposition::Hijack;
     }
     if p.starts_with("/exec/") && p.ends_with("/start") {
         return Disposition::Hijack;
     }
-    if m == "POST" && (p == "/build" || p == "/images/create" || p == "/images/load") {
+    // Image pull (`POST /images/create`) has a tiny fixed request and a streamed *response*. The
+    // response pump is already byte-transparent, while keeping the request parser alive is vital:
+    // Docker SDKs reuse that connection for later creates after the pull stream reaches EOF.
+    if m == "POST" && (p == "/build" || p == "/images/load") {
         return Disposition::Hijack;
     }
     Disposition::Passthrough
@@ -69,6 +77,18 @@ mod tests {
     }
 
     #[test]
+    fn container_start_requires_host_port_preflight() {
+        assert_eq!(
+            disp("POST /v1.47/containers/abc/start HTTP/1.1\r\n\r\n"),
+            Disposition::ContainerStartPreflight
+        );
+        assert_eq!(
+            disp("POST /containers/name/start HTTP/1.1\r\n\r\n"),
+            Disposition::ContainerStartPreflight
+        );
+    }
+
+    #[test]
     fn streaming_and_hijack_endpoints() {
         assert_eq!(
             disp("POST /containers/abc/attach HTTP/1.1\r\n\r\n"),
@@ -84,7 +104,7 @@ mod tests {
         );
         assert_eq!(
             disp("POST /images/create?fromImage=alpine HTTP/1.1\r\n\r\n"),
-            Disposition::Hijack
+            Disposition::Passthrough
         );
     }
 

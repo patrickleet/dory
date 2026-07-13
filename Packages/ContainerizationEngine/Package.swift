@@ -41,11 +41,15 @@ let package = Package(
             name: "dory-hv",
             dependencies: [
                 "DoryHV",
+                .product(name: "DoryCore", package: "dory-core-swift"),
             ]
         ),
         .testTarget(
             name: "DoryHVTests",
-            dependencies: ["DoryHV"]
+            dependencies: [
+                "DoryHV",
+                .product(name: "DoryCore", package: "dory-core-swift"),
+            ]
         ),
     ]
 )

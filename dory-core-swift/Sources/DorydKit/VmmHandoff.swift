@@ -288,7 +288,7 @@ public enum VmmHandoffClient {
                                 .copyMemory(from: fdRaw.baseAddress!, byteCount: fdBytes)
                         }
                     }
-                    return sendmsg(fd, &message, 0)
+                    return sendmsg(fd, &message, MSG_NOSIGNAL)
                 }
             }
         }

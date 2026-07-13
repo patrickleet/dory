@@ -134,7 +134,7 @@ public enum MachineRecipeProvisioner {
         return MachineRecipeProvisionResult(recipeID: recipe.id, install: install, verify: verify)
     }
 
-    private static func requireSuccess(
+    static func requireSuccess(
         _ result: DoryExecResult,
         recipe: String,
         stage: String

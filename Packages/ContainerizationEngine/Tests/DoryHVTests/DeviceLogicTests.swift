@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import Testing
 @testable import DoryHV
 
@@ -158,15 +159,96 @@ import Testing
         #expect(block.configSpace.count == 36)
     }
 
-    @Test func discardPunchesHoleReadingBackZeros() throws {
+    @Test func disabledDiscardRejectsRequestsWithoutChangingData() throws {
+        let path = try makeDisk(byteCount: 4096)
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        try Data(repeating: 0xA5, count: 4096).write(to: URL(fileURLWithPath: path))
+        let block = try VirtioBlk(path: path, identity: "test", queueCount: 1, discard: false)
+        var range = [UInt8]()
+        range.appendLE(UInt64(0))
+        range.appendLE(UInt32(8))
+        range.appendLE(UInt32(0))
+
+        let status = range.withUnsafeMutableBytes { buffer -> VirtioBlk.RequestStatus in
+            let segment = VirtqueueSegment(pointer: buffer.baseAddress!, length: buffer.count, isDeviceWritable: false)
+            return block.applyDiscardOrWriteZeroes([segment][...], writeZeroes: false)
+        }
+
+        #expect(status == .unsupported)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: path)).allSatisfy { $0 == 0xA5 })
+    }
+
+    @Test func discardRejectsMoreThanAdvertisedSegmentsBeforeMutation() throws {
+        let path = try makeDisk(byteCount: 4096)
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        try Data(repeating: 0x5A, count: 4096).write(to: URL(fileURLWithPath: path))
+        let block = try VirtioBlk(path: path, identity: "test", queueCount: 1)
+        var ranges = [UInt8]()
+        for _ in 0...256 {
+            ranges.appendLE(UInt64(0))
+            ranges.appendLE(UInt32(1))
+            ranges.appendLE(UInt32(0))
+        }
+
+        let status = ranges.withUnsafeMutableBytes { buffer -> VirtioBlk.RequestStatus in
+            let segment = VirtqueueSegment(pointer: buffer.baseAddress!, length: buffer.count, isDeviceWritable: false)
+            return block.applyDiscardOrWriteZeroes([segment][...], writeZeroes: false)
+        }
+
+        #expect(status == .ioError)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: path)).allSatisfy { $0 == 0x5A })
+    }
+
+    @Test func writeZeroesRejectsUnknownFlagsWithoutChangingData() throws {
         let path = try makeDisk(byteCount: 8192)
         defer { try? FileManager.default.removeItem(atPath: path) }
-        try Data(repeating: 0xFF, count: 8192).write(to: URL(fileURLWithPath: path))
+        try Data(repeating: 0x3C, count: 8192).write(to: URL(fileURLWithPath: path))
+        let block = try VirtioBlk(path: path, identity: "test", queueCount: 1)
+        var range = [UInt8]()
+        range.appendLE(UInt64(0))
+        range.appendLE(UInt32(8))
+        range.appendLE(UInt32(0))
+        // A later malformed range must be rejected before the first valid range is zeroed.
+        range.appendLE(UInt64(8))
+        range.appendLE(UInt32(8))
+        range.appendLE(UInt32(2))
+
+        let status = range.withUnsafeMutableBytes { buffer -> VirtioBlk.RequestStatus in
+            let segment = VirtqueueSegment(pointer: buffer.baseAddress!, length: buffer.count, isDeviceWritable: false)
+            return block.applyDiscardOrWriteZeroes([segment][...], writeZeroes: true)
+        }
+
+        #expect(status == .unsupported)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: path)).allSatisfy { $0 == 0x3C })
+    }
+
+    @Test func writeZeroesRejectsRangeLargerThanAdvertisedLimit() throws {
+        let path = try makeDisk()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        #expect(truncate(path, off_t(3) * 1024 * 1024 * 1024) == 0)
+        let block = try VirtioBlk(path: path, identity: "test", queueCount: 1)
+        var range = [UInt8]()
+        range.appendLE(UInt64(0))
+        range.appendLE(UInt32((1 << 22) + 1))
+        range.appendLE(UInt32(0))
+
+        let status = range.withUnsafeMutableBytes { buffer -> VirtioBlk.RequestStatus in
+            let segment = VirtqueueSegment(pointer: buffer.baseAddress!, length: buffer.count, isDeviceWritable: false)
+            return block.applyDiscardOrWriteZeroes([segment][...], writeZeroes: true)
+        }
+
+        #expect(status == .ioError)
+    }
+
+    @Test func discardPunchesHoleReadingBackZeros() throws {
+        let path = try makeDisk(byteCount: 12288)
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        try Data(repeating: 0xFF, count: 12288).write(to: URL(fileURLWithPath: path))
         let block = try VirtioBlk(path: path, identity: "test", queueCount: 1)
 
         var range = [UInt8]()
-        range.appendLE(UInt64(2))   // start sector 2 -> byte 1024
-        range.appendLE(UInt32(4))   // 4 sectors -> 2048 bytes
+        range.appendLE(UInt64(8))   // start sector 8 -> byte 4096
+        range.appendLE(UInt32(8))   // 8 sectors -> 4096 bytes
         range.appendLE(UInt32(0))   // flags
         let status = range.withUnsafeMutableBytes { buffer -> VirtioBlk.RequestStatus in
             let segment = VirtqueueSegment(pointer: buffer.baseAddress!, length: buffer.count, isDeviceWritable: false)
@@ -175,9 +257,65 @@ import Testing
 
         #expect(status == .ok)
         let data = try Data(contentsOf: URL(fileURLWithPath: path))
-        #expect(data[1023] == 0xFF)
-        #expect(Array(data[1024..<3072]).allSatisfy { $0 == 0 })
-        #expect(data[3072] == 0xFF)
+        #expect(data[4095] == 0xFF)
+        #expect(Array(data[4096..<8192]).allSatisfy { $0 == 0 })
+        #expect(data[8192] == 0xFF)
+    }
+
+    @Test func alignedDiscardReturnsAllocatedBlocksToHost() throws {
+        let byteCount = 1 << 20
+        let path = try makeDisk(byteCount: byteCount)
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        try Data(repeating: 0xA5, count: byteCount).write(to: URL(fileURLWithPath: path))
+        var beforeInfo = stat()
+        let beforeStatus = path.withCString { Darwin.lstat($0, &beforeInfo) }
+        try #require(beforeStatus == 0)
+        let before = Int64(beforeInfo.st_blocks) * 512
+        let block = try VirtioBlk(path: path, identity: "test", queueCount: 1)
+
+        var range = [UInt8]()
+        range.appendLE(UInt64(0))
+        range.appendLE(UInt32(byteCount / 512))
+        range.appendLE(UInt32(0))
+        let status = range.withUnsafeMutableBytes { buffer -> VirtioBlk.RequestStatus in
+            let segment = VirtqueueSegment(
+                pointer: buffer.baseAddress!,
+                length: buffer.count,
+                isDeviceWritable: false
+            )
+            return block.applyDiscardOrWriteZeroes([segment][...], writeZeroes: false)
+        }
+
+        var afterInfo = stat()
+        let afterStatus = path.withCString { Darwin.lstat($0, &afterInfo) }
+        try #require(afterStatus == 0)
+        let after = Int64(afterInfo.st_blocks) * 512
+        #expect(status == .ok)
+        #expect(after < before)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: path)).allSatisfy { $0 == 0 })
+    }
+
+    @Test func subBlockDiscardMayNoOpInsteadOfAllocatingAZeroFallback() throws {
+        let path = try makeDisk(byteCount: 8192)
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        try Data(repeating: 0xCC, count: 8192).write(to: URL(fileURLWithPath: path))
+        let block = try VirtioBlk(path: path, identity: "test", queueCount: 1)
+
+        var range = [UInt8]()
+        range.appendLE(UInt64(2))
+        range.appendLE(UInt32(4))
+        range.appendLE(UInt32(0))
+        let status = range.withUnsafeMutableBytes { buffer -> VirtioBlk.RequestStatus in
+            let segment = VirtqueueSegment(
+                pointer: buffer.baseAddress!,
+                length: buffer.count,
+                isDeviceWritable: false
+            )
+            return block.applyDiscardOrWriteZeroes([segment][...], writeZeroes: false)
+        }
+
+        #expect(status == .ok)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: path)).allSatisfy { $0 == 0xCC })
     }
 
     @Test func writeZeroesWithoutUnmapZerosRange() throws {
@@ -199,6 +337,32 @@ import Testing
         let data = try Data(contentsOf: URL(fileURLWithPath: path))
         #expect(Array(data[0..<1024]).allSatisfy { $0 == 0 })
         #expect(data[1024] == 0xAB)
+    }
+
+    @Test func unalignedWriteZeroesWithUnmapStillUsesZeroFallback() throws {
+        let path = try makeDisk(byteCount: 8192)
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        try Data(repeating: 0xAB, count: 8192).write(to: URL(fileURLWithPath: path))
+        let block = try VirtioBlk(path: path, identity: "test", queueCount: 1)
+
+        var range = [UInt8]()
+        range.appendLE(UInt64(2))
+        range.appendLE(UInt32(4))
+        range.appendLE(UInt32(1)) // VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP
+        let status = range.withUnsafeMutableBytes { buffer -> VirtioBlk.RequestStatus in
+            let segment = VirtqueueSegment(
+                pointer: buffer.baseAddress!,
+                length: buffer.count,
+                isDeviceWritable: false
+            )
+            return block.applyDiscardOrWriteZeroes([segment][...], writeZeroes: true)
+        }
+
+        #expect(status == .ok)
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        #expect(data[1023] == 0xAB)
+        #expect(Array(data[1024..<3072]).allSatisfy { $0 == 0 })
+        #expect(data[3072] == 0xAB)
     }
 
     @Test func discardBeyondCapacityIsRejected() throws {

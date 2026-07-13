@@ -288,6 +288,22 @@ public final class DorydService: NSObject, DorydControl {
         reply(machineManager.list().map(\.xpcDictionary) as NSArray, "")
     }
 
+    public func machineStats(
+        _ machineID: String,
+        reply: @escaping (Bool, NSDictionary, String) -> Void
+    ) {
+        guard let machineManager else {
+            reply(false, [:], "machine manager is not configured")
+            return
+        }
+        do {
+            let stats = try machineManager.stats(id: machineID)
+            reply(true, stats.xpcDictionary, "")
+        } catch {
+            reply(false, [:], "\(error)")
+        }
+    }
+
     public func machineExec(
         _ machineID: String,
         request: NSDictionary,
@@ -1176,6 +1192,24 @@ private extension DoryTelemetry {
             "memAvailableKB": memAvailableKB,
             "psiSomeAvg10": psiSomeAvg10,
             "psiFullAvg10": psiFullAvg10,
+        ]
+    }
+}
+
+private extension DoryMachineStats {
+    var xpcDictionary: NSDictionary {
+        [
+            "schema": "dev.dory.machine.stats",
+            "version": 1,
+            "cpuPercent": cpuPercent,
+            "memoryUsedBytes": memoryUsedBytes,
+            "memoryTotalBytes": memoryTotalBytes,
+            "networkReceiveBytes": networkReceiveBytes,
+            "networkTransmitBytes": networkTransmitBytes,
+            "blockReadBytes": blockReadBytes,
+            "blockWriteBytes": blockWriteBytes,
+            "processCount": processCount,
+            "uptimeSeconds": uptimeSeconds,
         ]
     }
 }

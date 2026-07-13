@@ -1,8 +1,10 @@
 import Darwin
+import DoryCore
 import DorydKit
 import Foundation
 
 private let engineColdStartTimeout: TimeInterval = 240
+private let engineShutdownTimeout = DoryEngineShutdownTiming.hostTerminationSeconds + 5
 
 enum DorydCtlError: Error, CustomStringConvertible {
     case daemon(String)
@@ -151,6 +153,7 @@ func usage(exitCode: Int32 = 2) -> Never {
           dorydctl [global] docker agent-info|ports|telemetry|clock-sync
           dorydctl [global] machine list
           dorydctl [global] machine status NAME
+          dorydctl [global] machine stats NAME
           dorydctl [global] machine create NAME --kernel PATH --rootfs PATH [--memory-mb N] [--cpus N] [--address IPv4] [--share TAG=HOST:GUEST[:ro|rw]] [--env KEY=VALUE]
           dorydctl [global] machine update NAME [--memory-mb N] [--cpus N] [--address IPv4 | --clear-address] [--share TAG=HOST:GUEST[:ro|rw] ... | --clear-shares] [--env KEY=VALUE ... | --clear-env]
           dorydctl [global] machine start|stop|delete NAME
@@ -472,9 +475,9 @@ func runEngine(cursor: inout ArgumentCursor, client: DorydCtlClient) throws {
     case "start":
         try emitCommandResult(try client.withTimeout(atLeast: engineColdStartTimeout).command { $0.engineStart(reply: $1) })
     case "stop":
-        try emitCommandResult(try client.command { $0.engineStop(reply: $1) })
+        try emitCommandResult(try client.withTimeout(atLeast: engineShutdownTimeout).command { $0.engineStop(reply: $1) })
     case "sleep":
-        try emitCommandResult(try client.command { $0.engineSleep(reply: $1) })
+        try emitCommandResult(try client.withTimeout(atLeast: engineShutdownTimeout).command { $0.engineSleep(reply: $1) })
     case "wake":
         try emitCommandResult(try client.withTimeout(atLeast: engineColdStartTimeout).command { $0.engineWake(reply: $1) })
     default:
@@ -637,6 +640,15 @@ func runMachine(cursor: inout ArgumentCursor, client: DorydCtlClient) throws {
     case "status":
         let name = try cursor.take("usage: dorydctl machine status NAME")
         try emitJSON(try machineDictionary(name: name, client: client))
+    case "stats":
+        let name = try cursor.take("usage: dorydctl machine stats NAME")
+        guard cursor.values.isEmpty else {
+            throw DorydCtlError.usage("unexpected machine stats argument: \(cursor.values[0])")
+        }
+        let stats: NSDictionary = try client.withTimeout(atLeast: 10).statusCommand { proxy, reply in
+            proxy.machineStats(name, reply: reply)
+        }
+        try emitJSON(stats)
     case "create":
         let name = try cursor.take("usage: dorydctl machine create NAME --kernel PATH --rootfs PATH")
         guard let kernel = try cursor.optionValue("--kernel"),

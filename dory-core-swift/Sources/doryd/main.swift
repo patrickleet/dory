@@ -1,3 +1,4 @@
+import DoryCore
 import DorydKit
 import Darwin
 import Foundation
@@ -12,6 +13,14 @@ _ = signal(SIGPIPE, SIG_IGN)
 
 let env = ProcessInfo.processInfo.environment
 let dorydEnvironment = DorydEnvironment(values: env)
+do {
+    let drive = try dorydEnvironment.dataDriveConfiguration()
+    try drive.prepare()
+    FileHandle.standardError.write(Data("doryd: data drive ready at \(drive.root)\n".utf8))
+} catch {
+    FileHandle.standardError.write(Data("doryd: data drive unavailable: \(error)\n".utf8))
+    exit(1)
+}
 let socket = DorySocket(home: dorydEnvironment.home)
 let hostCLIInstaller = HostCLIInstaller(environment: dorydEnvironment, dockerSocketPath: socket.path)
 let hostCLIReconciler: HostCLIReconciler?
@@ -33,7 +42,8 @@ if dorydEnvironment.hostCLIEnabled {
     hostCLIReconciler = reconciler
 } else {
     let removal = hostCLIInstaller.remove()
-    if !removal.removed.isEmpty || removal.pathProfileChanged || removal.composePluginRemoved {
+    if !removal.removed.isEmpty || removal.pathProfileChanged
+        || removal.composePluginRemoved || removal.buildxPluginRemoved {
         FileHandle.standardError.write(Data("doryd: host CLI integration disabled and removed from \(dorydEnvironment.home)/.dory/bin\n".utf8))
     } else {
         FileHandle.standardError.write(Data("doryd: host CLI integration disabled by settings\n".utf8))

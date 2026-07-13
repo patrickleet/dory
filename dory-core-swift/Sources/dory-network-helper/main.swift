@@ -1,6 +1,14 @@
 import DorydKit
 import Foundation
 
+if CommandLine.arguments.dropFirst().first == "--daemon" {
+    guard geteuid() == 0 else {
+        FileHandle.standardError.write(Data("dory-network-helper: --daemon must run as root\n".utf8))
+        exit(77)
+    }
+    SourcePreservingLANPrivilegedDaemon().run()
+}
+
 struct HelperOptions {
     var planPath: String?
     var dryRun = false

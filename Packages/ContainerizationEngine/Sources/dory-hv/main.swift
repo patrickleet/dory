@@ -1,4 +1,5 @@
 import DoryHV
+import DoryCore
 import Foundation
 
 signal(SIGPIPE, SIG_IGN)
@@ -412,29 +413,78 @@ case "engine":
     var memoryMB: UInt64 = 2048
     var cpus = 4
     var rootfs: String?
-    var stateDirectory = "\(NSHomeDirectory())/.dory/hv"
+    var stateDirectory: String?
+    var dockerDataDisk: String?
+    var legacyDockerDataDisks: [String] = []
     var shares: [VirtioFSShareConfiguration] = []
+    var directIPRequested = false
     var directIPSubnet: String?
     var directIPGateway = "192.168.127.2"
+    var directIPv6Subnet: String?
+    var directIPv6Guest = "fd7d:6f72:7900::2"
+    var directIPv6VirtualNetwork = "fd7d:6f72:7900::/64"
+    var directIPv6HostGateway = "fd7d:6f72:7900::1"
     var gpuMode = EngineMode.GPUAccelerationMode.off
     var amd64Emulation = false
     var publishHost = "127.0.0.1"
     var agentVsockForward: String?
+    var sshAgentSocket: String?
     var guestAgent: String?
     var iterator = arguments.dropFirst().makeIterator()
     while let argument = iterator.next() {
         switch argument {
         case "--engine-sock": engineSocket = iterator.next() ?? engineSocket
         case "--agent-vsock-forward": agentVsockForward = iterator.next()
+        case "--ssh-agent-socket": sshAgentSocket = iterator.next()
         case "--kernel": kernel = iterator.next()
         case "--gvproxy": gvproxy = iterator.next()
         case "--rootfs": rootfs = iterator.next()
-        case "--state-dir": stateDirectory = iterator.next() ?? stateDirectory
+        case "--state-dir":
+            guard let value = iterator.next(), !value.isEmpty else {
+                fail("engine --state-dir requires a non-empty path")
+            }
+            stateDirectory = value
+        case "--data-disk":
+            guard let value = iterator.next(), !value.isEmpty else {
+                fail("engine --data-disk requires a non-empty absolute path")
+            }
+            guard value.hasPrefix("/") else { fail("engine --data-disk requires an absolute path") }
+            dockerDataDisk = value
+        case "--data-drive":
+            guard let value = iterator.next(), !value.isEmpty else {
+                fail("engine --data-drive requires a non-empty absolute .dorydrive path")
+            }
+            do {
+                let environmentHome = ProcessInfo.processInfo.environment["HOME"]
+                    .flatMap { $0.hasPrefix("/") ? $0 : nil }
+                    ?? NSHomeDirectory()
+                let drive = try DoryDataDrive(home: environmentHome, overrideRoot: value)
+                try drive.prepare()
+                dockerDataDisk = drive.engineDataDiskPath
+            } catch {
+                fail("invalid Dory data drive: \(error)")
+            }
+        case "--legacy-data-disk":
+            guard let value = iterator.next(), !value.isEmpty else {
+                fail("engine --legacy-data-disk requires a non-empty path")
+            }
+            legacyDockerDataDisks.append(value)
+        case "--no-legacy-data-import":
+            legacyDockerDataDisks.removeAll()
         case "--mem-mb": memoryMB = iterator.next().flatMap(UInt64.init) ?? memoryMB
         case "--cpus": cpus = iterator.next().flatMap(Int.init) ?? cpus
-        case "--direct-ip": directIPSubnet = directIPSubnet ?? "192.168.215.0/24"
+        case "--direct-ip":
+            directIPRequested = true
+            directIPSubnet = directIPSubnet ?? "192.168.215.0/24"
         case "--container-subnet": directIPSubnet = iterator.next()
         case "--guest-gateway": directIPGateway = iterator.next() ?? directIPGateway
+        case "--direct-ipv6":
+            directIPSubnet = directIPSubnet ?? "192.168.215.0/24"
+            directIPv6Subnet = directIPv6Subnet ?? "fd7d:6f72:7901::/64"
+        case "--container-subnet-v6": directIPv6Subnet = iterator.next()
+        case "--guest-ipv6": directIPv6Guest = iterator.next() ?? directIPv6Guest
+        case "--virtual-network-v6": directIPv6VirtualNetwork = iterator.next() ?? directIPv6VirtualNetwork
+        case "--host-gateway-v6": directIPv6HostGateway = iterator.next() ?? directIPv6HostGateway
         case "--gpu":
             gpuMode = parseGPUMode(iterator.next() ?? "")
         case let value where value.hasPrefix("--gpu="):
@@ -459,6 +509,9 @@ case "engine":
     }
     guard let kernel else { fail("engine requires --kernel") }
     guard let gvproxy else { fail("engine requires --gvproxy") }
+    guard let stateDirectory else {
+        fail("engine requires explicit --state-dir; refusing to select persistent Docker state implicitly")
+    }
     let configuration = EngineMode.Configuration(
         engineSocket: engineSocket,
         kernelPath: kernel,
@@ -466,12 +519,19 @@ case "engine":
         memoryMB: memoryMB,
         cpus: cpus,
         stateDirectory: stateDirectory,
+        dockerDataDiskPath: dockerDataDisk,
+        legacyDockerDataDiskPaths: legacyDockerDataDisks,
         bundledRootfs: rootfs,
         shares: shares,
         directIP: directIPSubnet.map {
             DirectIPBridgeConfiguration(
                 subnetCIDR: $0,
                 gateway: directIPGateway,
+                tunnelEnabled: directIPRequested,
+                ipv6SubnetCIDR: directIPv6Subnet,
+                ipv6Gateway: directIPv6Subnet == nil ? nil : directIPv6Guest,
+                ipv6VirtualNetworkCIDR: directIPv6Subnet == nil ? nil : directIPv6VirtualNetwork,
+                ipv6HostGateway: directIPv6Subnet == nil ? nil : directIPv6HostGateway,
                 gvproxySocketPath: "",
                 localSocketPath: "\(stateDirectory)/direct-ip.sock",
                 interfaceNamePath: "\(stateDirectory)/direct-ip.interface"
@@ -481,6 +541,7 @@ case "engine":
         amd64Emulation: amd64Emulation,
         publishHost: publishHost,
         agentVsockForward: agentVsockForward,
+        sshAgentSocket: sshAgentSocket,
         guestAgentPath: guestAgent
     )
     // Top-level code is implicitly MainActor; a plain Task would inherit it and deadlock behind

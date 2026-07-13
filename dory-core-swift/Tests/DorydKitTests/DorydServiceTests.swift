@@ -1232,6 +1232,10 @@ private struct ServiceFakeDockerAPIProbe: DockerAPIProbing {
     func ping(socketPath: String) -> DockerAPIPingResult {
         result
     }
+
+    func systemDF(socketPath: String) -> DockerAPISystemDFResult {
+        .ok
+    }
 }
 
 private final class ServiceFakeHealthCommandRunner: HealthCommandRunning, @unchecked Sendable {

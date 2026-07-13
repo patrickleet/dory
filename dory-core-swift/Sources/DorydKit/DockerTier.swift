@@ -76,13 +76,13 @@ private protocol DockerManagedProcess: AnyObject, Sendable {
 
 extension HvProcess: DockerManagedProcess {
     public func stop() {
-        stop(signal: SIGTERM, timeout: 5)
+        stop(signal: SIGTERM, timeout: DoryEngineShutdownTiming.hostTerminationSeconds)
     }
 }
 
 extension VmmDockerProcess: DockerManagedProcess {
     public func stop() {
-        stop(signal: SIGTERM, timeout: 5)
+        stop(signal: SIGTERM, timeout: DoryEngineShutdownTiming.hostTerminationSeconds)
     }
 }
 
@@ -520,7 +520,8 @@ public final class DockerTier: @unchecked Sendable {
            ) {
             killed.append(contentsOf: HelperProcessJanitor.terminateStaleHelpers(
                 executablePath: hvConfiguration.executablePath,
-                stateDirectory: stateDirectory
+                stateDirectory: stateDirectory,
+                timeout: DoryEngineShutdownTiming.hostTerminationSeconds
             ))
         }
         if let vmmConfiguration = configuration.vmmProcess {

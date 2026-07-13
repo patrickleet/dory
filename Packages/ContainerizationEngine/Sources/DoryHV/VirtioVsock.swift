@@ -168,6 +168,9 @@ public enum VsockPorts {
     /// Host-edit batches sent only after virtio-fs invalidation has completed. The guest agent turns
     /// them into Linux VFS metadata operations so inotify-backed tools receive native events.
     public static let fsevents: UInt32 = 1028
+    /// Guest-side `/run/host-services/ssh-auth.sock` dials this host listener. The bridge connects
+    /// only to the configured, same-user macOS SSH agent Unix socket.
+    public static let sshAgent: UInt32 = 1029
 }
 
 public final class VirtioVsock: VirtioDeviceBackend {

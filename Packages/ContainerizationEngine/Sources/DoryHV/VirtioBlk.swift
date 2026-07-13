@@ -303,11 +303,34 @@ public final class VirtioBlk: VirtioDeviceBackend {
     // plain write-zeroes overwrites with zeros while keeping the allocation. Ranges are bounds-checked
     // in sector space so a malformed guest request cannot touch bytes outside the image.
     func applyDiscardOrWriteZeroes(_ segments: ArraySlice<VirtqueueSegment>, writeZeroes: Bool) -> RequestStatus {
+        guard discardEnabled else { return .unsupported }
+        var entryCount = 0
         for segment in segments {
-            guard !segment.isDeviceWritable else { return .ioError }
-            guard segment.length >= Discard.entryByteCount, segment.length % Discard.entryByteCount == 0 else {
-                return .ioError
+            guard !segment.isDeviceWritable,
+                  segment.length >= Discard.entryByteCount,
+                  segment.length % Discard.entryByteCount == 0 else { return .ioError }
+            let segmentEntries = segment.length / Discard.entryByteCount
+            guard segmentEntries <= Int(Discard.maxSegments) - entryCount else { return .ioError }
+            entryCount += segmentEntries
+            var validationOffset = 0
+            while validationOffset + Discard.entryByteCount <= segment.length {
+                let base = segment.pointer + validationOffset
+                let sector = UInt64(littleEndian: base.loadUnaligned(fromByteOffset: 0, as: UInt64.self))
+                let numSectors = UInt64(UInt32(littleEndian: base.loadUnaligned(fromByteOffset: 8, as: UInt32.self)))
+                let flags = UInt32(littleEndian: base.loadUnaligned(fromByteOffset: 12, as: UInt32.self))
+                validationOffset += Discard.entryByteCount
+                guard numSectors <= UInt64(Discard.maxSectors) else { return .ioError }
+                if writeZeroes {
+                    guard flags & ~Discard.unmapFlag == 0 else { return .unsupported }
+                } else {
+                    guard flags == 0 else { return .unsupported }
+                }
+                guard sector <= capacitySectors,
+                      numSectors <= capacitySectors - sector else { return .ioError }
             }
+        }
+        guard entryCount > 0 else { return .ioError }
+        for segment in segments {
             var offset = 0
             while offset + Discard.entryByteCount <= segment.length {
                 let base = segment.pointer + offset
@@ -317,13 +340,16 @@ public final class VirtioBlk: VirtioDeviceBackend {
                 offset += Discard.entryByteCount
 
                 guard numSectors > 0 else { continue }
-                guard sector <= capacitySectors, numSectors <= capacitySectors - sector else { return .ioError }
 
                 let byteOffset = off_t(sector * 512)
                 let byteLength = off_t(numSectors * 512)
                 let deallocate = !writeZeroes || (flags & Discard.unmapFlag) != 0
                 let ok = deallocate
-                    ? deallocateRange(offset: byteOffset, length: byteLength)
+                    ? deallocateRange(
+                        offset: byteOffset,
+                        length: byteLength,
+                        zeroFallback: writeZeroes
+                    )
                     : writeZerosPreservingAllocation(offset: byteOffset, length: byteLength)
                 guard ok else { return .ioError }
             }
@@ -332,27 +358,29 @@ public final class VirtioBlk: VirtioDeviceBackend {
     }
 
     // Deallocates a byte range so it reads back as zeros and returns blocks to the host. F_PUNCHHOLE
-    // only accepts fs-block-aligned ranges, so this punches the aligned interior and zero-writes the
-    // leading/trailing sub-block slivers. A range too small to contain a whole block is zero-written.
-    private func deallocateRange(offset: off_t, length: off_t) -> Bool {
+    // only accepts fs-block-aligned ranges, so this punches the aligned interior. WRITE_ZEROES must
+    // still read back as zero and therefore zero-writes unsupported/unaligned pieces; plain DISCARD
+    // may be ignored by the device and must never inflate a sparse image when hole punching is not
+    // available (for example, an external exFAT/SMB-backed home directory).
+    private func deallocateRange(offset: off_t, length: off_t, zeroFallback: Bool) -> Bool {
         let block = off_t(discardBlockSize)
         let end = offset + length
         let alignedStart = ((offset + block - 1) / block) * block
         let alignedEnd = (end / block) * block
         guard alignedEnd > alignedStart else {
-            return writeZerosPreservingAllocation(offset: offset, length: length)
+            return zeroFallback ? writeZerosPreservingAllocation(offset: offset, length: length) : true
         }
         var punch = fpunchhole_t(fp_flags: 0, reserved: 0, fp_offset: alignedStart, fp_length: alignedEnd - alignedStart)
         let punched = withUnsafeMutablePointer(to: &punch) { fcntl(fileDescriptor, F_PUNCHHOLE, $0) }
         guard punched == 0 else {
-            // Backing filesystem lacks hole punching (exFAT/SMB/NFS-hosted image). Still satisfy the
-            // read-back-zeros contract by writing zeros over the whole range; space is not reclaimed.
-            return writeZerosPreservingAllocation(offset: offset, length: length)
+            return zeroFallback ? writeZerosPreservingAllocation(offset: offset, length: length) : true
         }
-        if alignedStart > offset, !writeZerosPreservingAllocation(offset: offset, length: alignedStart - offset) {
+        if zeroFallback, alignedStart > offset,
+           !writeZerosPreservingAllocation(offset: offset, length: alignedStart - offset) {
             return false
         }
-        if end > alignedEnd, !writeZerosPreservingAllocation(offset: alignedEnd, length: end - alignedEnd) {
+        if zeroFallback, end > alignedEnd,
+           !writeZerosPreservingAllocation(offset: alignedEnd, length: end - alignedEnd) {
             return false
         }
         return true

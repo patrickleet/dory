@@ -22,6 +22,42 @@ final class DockerAPIProbeTests: XCTestCase {
         )
         XCTAssertTrue(server.wait())
     }
+
+    func testUnixDockerAPIProbeRequestsSystemDiskInventory() throws {
+        let server = try FakeDockerAPIServer(
+            response: "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+        )
+        defer { server.stop() }
+
+        XCTAssertEqual(UnixDockerAPIProbe(timeout: 1).systemDF(socketPath: server.path), .ok)
+        XCTAssertTrue(server.wait())
+        XCTAssertTrue(server.request.contains("GET /system/df?type=container HTTP/1.1"))
+    }
+
+    func testUnixDockerAPIProbeDrainsContainerInventoryLargerThanLegacy64KiBLimit() throws {
+        let body = String(repeating: "x", count: 128 * 1024)
+        let server = try FakeDockerAPIServer(
+            response: "HTTP/1.1 200 OK\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
+        )
+        defer { server.stop() }
+
+        XCTAssertEqual(UnixDockerAPIProbe(timeout: 1).systemDF(socketPath: server.path), .ok)
+        XCTAssertTrue(server.wait())
+    }
+
+    func testUnixDockerAPIProbePreservesSystemDiskFailureBody() throws {
+        let body = #"{"message":"rw layer snapshot not found"}"#
+        let server = try FakeDockerAPIServer(
+            response: "HTTP/1.1 500 Internal Server Error\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
+        )
+        defer { server.stop() }
+
+        XCTAssertEqual(
+            UnixDockerAPIProbe(timeout: 1).systemDF(socketPath: server.path),
+            .badResponse(statusCode: 500, body: body)
+        )
+        XCTAssertTrue(server.wait())
+    }
 }
 
 private final class FakeDockerAPIServer: @unchecked Sendable {

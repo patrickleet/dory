@@ -6,12 +6,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use dory_proto::channels::{PORT_CONTROL, PORT_DOCKER, PORT_FSEVENTS, PORT_SHELL};
+use dory_proto::channels::{PORT_CONTROL, PORT_DOCKER, PORT_FSEVENTS, PORT_SHELL, PORT_SSH_AGENT};
 use dory_proto::half_close::splice;
 use dory_proto::handshake::{handshake, Hello};
 use dory_proto::mux::{Handler, HandlerFuture, Mux};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tokio_vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY, VMADDR_CID_HOST};
@@ -20,6 +20,8 @@ use crate::dispatch::agent_build;
 use crate::handler::handle;
 
 const GUEST_DOCKER_SOCK: &str = "/var/run/docker.sock";
+const GUEST_SSH_AUTH_SOCK: &str = "/run/host-services/ssh-auth.sock";
+const MAX_CONCURRENT_SSH_AGENT_CONNECTIONS: usize = 64;
 const MAX_CONCURRENT_FSEVENT_CONNECTIONS: usize = 4;
 const FSEVENT_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const FSEVENT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -33,9 +35,56 @@ pub async fn run() -> std::io::Result<()> {
         serve_control(),
         serve_docker(),
         serve_shell(),
-        serve_fsevents()
+        serve_fsevents(),
+        serve_ssh_agent()
     )?;
     Ok(())
+}
+
+/// A real Linux Unix socket for containers, backed by one guest→host vsock connection per SSH
+/// agent client. Host special files never enter virtio-fs, avoiding both cross-kernel AF_UNIX
+/// ambiguity and the pre-FUSE FIFO blocking class.
+async fn serve_ssh_agent() -> std::io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+    let directory = std::path::Path::new(GUEST_SSH_AUTH_SOCK)
+        .parent()
+        .expect("SSH agent socket has a parent");
+    std::fs::create_dir_all(directory)?;
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o755))?;
+    match std::fs::symlink_metadata(GUEST_SSH_AUTH_SOCK) {
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            std::fs::remove_file(GUEST_SSH_AUTH_SOCK)?;
+        }
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "refusing to replace non-socket SSH agent path",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let listener = UnixListener::bind(GUEST_SSH_AUTH_SOCK)?;
+    std::fs::set_permissions(GUEST_SSH_AUTH_SOCK, std::fs::Permissions::from_mode(0o666))?;
+    let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_SSH_AGENT_CONNECTIONS));
+    loop {
+        let (client, _) = listener.accept().await?;
+        let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+            continue;
+        };
+        tokio::spawn(async move {
+            let _permit = permit;
+            let host = timeout(
+                Duration::from_secs(5),
+                tokio_vsock::VsockStream::connect(VsockAddr::new(VMADDR_CID_HOST, PORT_SSH_AGENT)),
+            )
+            .await;
+            if let Ok(Ok(host)) = host {
+                let _ = splice(client, host).await;
+            }
+        });
+    }
 }
 
 /// Host-edit event batches. This is a dedicated host-only channel rather than part of the remote

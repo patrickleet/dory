@@ -8,17 +8,24 @@ public struct DorySocket {
     private let directory: String
 
     public init(home: String = NSHomeDirectory()) {
-        self.directory = home + "/.dory"
-        self.path = self.directory + "/dory.sock"
+        self.init(path: home + "/.dory/dory.sock")
+    }
+
+    /// Bind a Dory-owned Docker API socket at an explicit path. This is used by the standalone
+    /// runtime's public `engine.sock`; doryd continues to use the home-based initializer above.
+    public init(path: String) {
+        self.path = path
+        self.directory = URL(fileURLWithPath: path).deletingLastPathComponent().path
     }
 
     public enum SocketError: Error {
         case tooLong
         case syscall(String, Int32)
         case alreadyInUse(String)
+        case unsafeExistingPath(String)
     }
 
-    /// Create `~/.dory` (0700), remove any stale socket, bind + listen, then chmod 0600.
+    /// Create the socket directory (0700), remove any stale socket, bind + listen, then chmod 0600.
     public func bind() throws -> Int32 {
         try FileManager.default.createDirectory(
             atPath: directory,
@@ -69,10 +76,14 @@ public struct DorySocket {
 
     private func removeStaleSocketIfNeeded() throws {
         guard FileManager.default.fileExists(atPath: path) else { return }
+        let attributes = try FileManager.default.attributesOfItem(atPath: path)
+        guard attributes[.type] as? FileAttributeType == .typeSocket else {
+            throw SocketError.unsafeExistingPath(path)
+        }
         if Self.canConnect(to: path) {
             throw SocketError.alreadyInUse(path)
         }
-        unlink(path)
+        guard unlink(path) == 0 else { throw SocketError.syscall("unlink", errno) }
     }
 
     private static func canConnect(to path: String) -> Bool {

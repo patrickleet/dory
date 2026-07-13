@@ -782,22 +782,53 @@ public final class HealthReporter: @unchecked Sendable {
 
     private func diskChecks(dockerReachable: Bool) -> [HealthCheck] {
         let host = hostDiskCheck()
-        let docker = dockerReachable
-            ? HealthCheck(
-                id: "disk.docker",
-                status: .pass,
-                code: "disk.docker_df_ok",
-                title: "Docker disk usage readable",
-                detail: "Docker API reachable",
-                data: ["available": "true"]
-            )
-            : HealthCheck(
+        let dataDrive = doryDataDriveCheck()
+        let docker: HealthCheck
+        if !dockerReachable {
+            docker = HealthCheck(
                 id: "disk.docker",
                 status: .warn,
                 code: "disk.docker_df_unavailable",
                 title: "Docker disk usage unavailable",
                 detail: "Docker API is not reachable."
             )
+        } else {
+            switch dockerAPIProbe.systemDF(socketPath: socketPath) {
+            case .ok:
+                docker = HealthCheck(
+                    id: "disk.docker",
+                    status: .pass,
+                    code: "disk.docker_df_ok",
+                    title: "Docker disk usage readable",
+                    detail: "Docker API returned its disk usage inventory.",
+                    data: ["available": "true"]
+                )
+            case let .badResponse(statusCode, body):
+                let summary = String(body.trimmingCharacters(in: .whitespacesAndNewlines).prefix(240))
+                let missingSnapshot = dockerStorageSnapshotMissing(body)
+                docker = HealthCheck(
+                    id: "disk.docker",
+                    status: .fail,
+                    code: missingSnapshot ? "disk.docker_snapshot_missing" : "disk.docker_df_failed",
+                    title: missingSnapshot ? "Docker storage metadata is inconsistent" : "Docker disk usage failed",
+                    detail: "HTTP \(statusCode): \(summary)",
+                    action: missingSnapshot
+                        ? "Create a support bundle, then run `dory cleanup --json` to review the unusable container records before applying cleanup."
+                        : "Create a support bundle and inspect the Docker daemon log before retrying.",
+                    data: ["available": "false"]
+                )
+            case let .unreachable(detail):
+                docker = HealthCheck(
+                    id: "disk.docker",
+                    status: .fail,
+                    code: "disk.docker_df_unreachable",
+                    title: "Docker disk usage probe became unreachable",
+                    detail: detail,
+                    action: "Retry the check; if it persists, create a support bundle and restart the engine.",
+                    data: ["available": "false"]
+                )
+            }
+        }
         let state = doryStateDiskCheck()
         let guest = HealthCheck(
             id: "disk.guest",
@@ -807,7 +838,13 @@ public final class HealthReporter: @unchecked Sendable {
             detail: "Run `dory doctor --active` to measure free space inside the engine VM."
         )
         let logs = doryLogCapCheck()
-        return [host, docker, state, guest, logs]
+        return [host, dataDrive, docker, state, guest, logs]
+    }
+
+    private func dockerStorageSnapshotMissing(_ body: String) -> Bool {
+        let lowercased = body.lowercased()
+        return lowercased.contains("snapshot")
+            && (lowercased.contains("not found") || lowercased.contains("missing"))
     }
 
     private func memoryCheck() -> HealthCheck {
@@ -1250,6 +1287,62 @@ public final class HealthReporter: @unchecked Sendable {
         )
     }
 
+    private func doryDataDriveCheck() -> HealthCheck {
+        do {
+            let drive = try DoryDataDrive(
+                home: home,
+                overrideRoot: environment["DORYD_DATA_DRIVE"] ?? environment["DORY_DATA_DRIVE"]
+            )
+            switch try drive.inspect(fileManager: fileManager) {
+            case .absent:
+                return HealthCheck(
+                    id: "disk.dory_drive",
+                    status: .warn,
+                    code: "disk.dory_drive_not_initialized",
+                    title: "Dory data drive is not initialized",
+                    detail: drive.root,
+                    action: "Start Dory once to create its managed workload drive.",
+                    data: ["path": drive.root, "available": "false"]
+                )
+            case .ready:
+                let allocated = allocatedDirectoryBytes(at: drive.root)
+                var stats = statfs()
+                let hasFilesystemStats = statfs(drive.root, &stats) == 0
+                let free = hasFilesystemStats ? UInt64(stats.f_bavail) * UInt64(stats.f_bsize) : 0
+                let total = hasFilesystemStats ? UInt64(stats.f_blocks) * UInt64(stats.f_bsize) : 0
+                return HealthCheck(
+                    id: "disk.dory_drive",
+                    status: .pass,
+                    code: "disk.dory_drive_ok",
+                    title: "Dory data drive is ready",
+                    detail: "\(drive.root) — \(formatBytes(Int64(allocated))) physically allocated",
+                    data: [
+                        "path": drive.root,
+                        "available": "true",
+                        "allocated_bytes": String(allocated),
+                        "free_bytes": String(free),
+                        "total_bytes": String(total),
+                        "manifest": drive.manifestPath,
+                    ]
+                )
+            }
+        } catch {
+            let path = (try? DoryDataDrive(
+                home: home,
+                overrideRoot: environment["DORYD_DATA_DRIVE"] ?? environment["DORY_DATA_DRIVE"]
+            ).root) ?? "invalid data-drive path"
+            return HealthCheck(
+                id: "disk.dory_drive",
+                status: .fail,
+                code: error is DoryDataDriveError ? "disk.dory_drive_unavailable" : "disk.dory_drive_failed",
+                title: "Dory data drive is unavailable",
+                detail: String(describing: error),
+                action: "Reconnect the configured drive or restore a valid Dory.dorydrive bundle before starting the engine.",
+                data: ["path": path, "available": "false"]
+            )
+        }
+    }
+
     private func doryLogCapCheck() -> HealthCheck {
         let usage = doryStateUsage()
         let cap = Int64(environment["DORY_LOG_HARD_MAX_BYTES"] ?? "").flatMap(Int.init) ?? 64 * 1024 * 1024
@@ -1314,7 +1407,11 @@ public final class HealthReporter: @unchecked Sendable {
                     continue
                 }
                 let bytes = size.intValue
-                total += bytes
+                var fileStatus = stat()
+                let allocatedBytes = stat(path, &fileStatus) == 0
+                    ? max(0, Int(fileStatus.st_blocks) * 512)
+                    : bytes
+                total += allocatedBytes
                 let lower = relativePath.lowercased()
                 if lower.hasSuffix(".log") {
                     logs += bytes
@@ -1323,8 +1420,10 @@ public final class HealthReporter: @unchecked Sendable {
                         largestLogPath = path
                     }
                 }
-                if lower.contains("vm") || lower.hasSuffix(".img") || lower.hasSuffix(".qcow2") || lower.hasSuffix(".raw") {
-                    vm += bytes
+                if lower.contains("vm") || lower.hasSuffix(".img") || lower.hasSuffix(".qcow2")
+                    || lower.hasSuffix(".raw") || lower.hasSuffix(".ext4") || lower.hasSuffix(".vhd")
+                    || lower.hasSuffix(".vhdx") {
+                    vm += allocatedBytes
                 }
             }
         }
@@ -1335,6 +1434,28 @@ public final class HealthReporter: @unchecked Sendable {
             largestLogPath: largestLogPath,
             largestLogBytes: largestLogBytes
         )
+    }
+
+    private func allocatedDirectoryBytes(at root: String) -> UInt64 {
+        guard fileManager.fileExists(atPath: root),
+              let enumerator = fileManager.enumerator(atPath: root) else {
+            return 0
+        }
+        var total: UInt64 = 0
+        for case let relativePath as String in enumerator {
+            let path = URL(fileURLWithPath: root).appendingPathComponent(relativePath).path
+            var fileStatus = stat()
+            guard lstat(path, &fileStatus) == 0, (fileStatus.st_mode & S_IFMT) == S_IFREG else {
+                continue
+            }
+            let blocks = max(Int64(0), Int64(fileStatus.st_blocks))
+            let bytes = UInt64(blocks).multipliedReportingOverflow(by: 512)
+            if bytes.overflow || UInt64.max - total < bytes.partialValue {
+                return UInt64.max
+            }
+            total += bytes.partialValue
+        }
+        return total
     }
 }
 

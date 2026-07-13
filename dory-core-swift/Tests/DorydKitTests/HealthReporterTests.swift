@@ -1,4 +1,5 @@
 import Darwin
+import DoryCore
 @testable import DorydKit
 import Foundation
 import XCTest
@@ -61,6 +62,7 @@ final class HealthReporterTests: XCTestCase {
             "mount.watch",
             "vm.clock",
             "disk.host",
+            "disk.dory_drive",
             "disk.docker",
             "disk.dory_state",
             "disk.guest",
@@ -79,6 +81,33 @@ final class HealthReporterTests: XCTestCase {
         XCTAssertEqual(doctor.results.first { $0.id == "mount.basic" }?.code, "mount.active_probe_skipped")
         XCTAssertEqual(doctor.results.first { $0.id == "vm.clock" }?.code, "vm.active_probe_skipped")
         XCTAssertEqual(doctor.results.first { $0.id == "disk.guest" }?.code, "disk.active_probe_skipped")
+        XCTAssertEqual(doctor.results.first { $0.id == "disk.dory_drive" }?.code, "disk.dory_drive_not_initialized")
+    }
+
+    func testDataDriveHealthReportsManagedPathAndPhysicalAllocation() throws {
+        let base = "/tmp/dory-health-drive-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        defer { try? FileManager.default.removeItem(atPath: base) }
+        let drive = try DoryDataDrive(home: base)
+        try drive.prepare()
+        try Data(repeating: 0x44, count: 4096).write(to: URL(fileURLWithPath: drive.backupsDirectory + "/sample.bin"))
+
+        let reporter = HealthReporter(
+            socketPath: base + "/missing.sock",
+            dockerTier: nil,
+            remoteManager: nil,
+            dockerAPIProbe: HealthFakeDockerAPIProbe(result: .unreachable("missing")),
+            commandRunner: HealthFakeCommandRunner(),
+            registryProbe: HealthFakeRegistryProbe(),
+            environment: ["PATH": base + "/bin", "DORY_CONFIG": base + "/config.json"],
+            home: base
+        )
+
+        let check = try XCTUnwrap(reporter.doctorReport().results.first { $0.id == "disk.dory_drive" })
+        XCTAssertEqual(check.status, .pass)
+        XCTAssertEqual(check.code, "disk.dory_drive_ok")
+        XCTAssertEqual(check.data["path"], drive.root)
+        XCTAssertEqual(check.data["available"], "true")
+        XCTAssertGreaterThan(Int(check.data["allocated_bytes"] ?? "0") ?? 0, 0)
     }
 
     func testDockerCLIResolverFindsInstalledDoryBinOutsideLaunchdPath() throws {
@@ -132,6 +161,33 @@ final class HealthReporterTests: XCTestCase {
         XCTAssertEqual(report.results.first { $0.id == "socket.ping" }?.code, "socket.ping_ok")
         XCTAssertEqual(report.results.first { $0.id == "engine.status" }?.code, "engine.running")
         XCTAssertEqual(report.results.first { $0.id == "disk.docker" }?.code, "disk.docker_df_ok")
+    }
+
+    func testDoctorFailsDockerDiskCheckWhenSnapshotMetadataIsMissing() throws {
+        let base = "/tmp/dory-health-storage-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        defer { try? FileManager.default.removeItem(atPath: base) }
+        let reporter = HealthReporter(
+            socketPath: base + "/dory.sock",
+            dockerTier: nil,
+            remoteManager: nil,
+            dockerAPIProbe: HealthFakeDockerAPIProbe(
+                result: .ok,
+                systemDFResult: .badResponse(
+                    statusCode: 500,
+                    body: #"{"message":"rw layer snapshot not found for container 846e"}"#
+                )
+            ),
+            commandRunner: HealthFakeCommandRunner(),
+            registryProbe: HealthFakeRegistryProbe(),
+            environment: ["PATH": base + "/bin", "DORY_CONFIG": base + "/config.json"],
+            home: base
+        )
+
+        let disk = try XCTUnwrap(reporter.doctorReport().results.first { $0.id == "disk.docker" })
+        XCTAssertEqual(disk.status, .fail)
+        XCTAssertEqual(disk.code, "disk.docker_snapshot_missing")
+        XCTAssertEqual(disk.data["available"], "false")
+        XCTAssertTrue(disk.action?.contains("dory cleanup --json") == true)
     }
 
     func testReportNeverPassesEngineAfterManagedChildExit() throws {
@@ -472,9 +528,14 @@ private final class HealthFakeSSHKeyStore: SSHKeyStore, @unchecked Sendable {
 
 private struct HealthFakeDockerAPIProbe: DockerAPIProbing {
     var result: DockerAPIPingResult
+    var systemDFResult: DockerAPISystemDFResult = .ok
 
     func ping(socketPath: String) -> DockerAPIPingResult {
         result
+    }
+
+    func systemDF(socketPath: String) -> DockerAPISystemDFResult {
+        systemDFResult
     }
 }
 
