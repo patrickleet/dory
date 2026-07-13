@@ -33,6 +33,37 @@ partial output tree, stale cache, wrong-platform image, or unkillable container 
 Every competitive run is same-session, resource-matched, position-balanced, immutable-input
 verified, and keeps raw correctness evidence alongside timings.
 
+## Release Readiness Gates
+
+[`scripts/readiness.sh`](scripts/readiness.sh) is the compatibility/correctness smoke, not a
+performance benchmark. Use `--strict` for release evidence. In strict mode, every engine named in
+`--engines` is required, and an enabled probe cannot disappear behind a skip because its CLI,
+socket, hardware, or implementation is unavailable. Probes left disabled remain visible `SKIP`
+rows so the artifact still shows exactly what was not exercised.
+
+The physical Intel and same-host competitor checks are explicit external coverage rows. Require
+them when producing the corresponding release artifact:
+
+```sh
+# Apple-silicon same-host Dory/OrbStack correctness campaign
+scripts/readiness.sh --strict --require-competitor \
+  --engines dory,orbstack --file-watch --domains --vpn
+
+# Run only on a physical Intel Mac after recording its host facts. Rosetta/qemu does not qualify.
+READINESS_PHYSICAL_INTEL_CONFIRMED=1 \
+scripts/readiness.sh --strict --require-physical-intel --engines dory --file-watch
+```
+
+Do not set `READINESS_PHYSICAL_INTEL_CONFIRMED=1` on Apple silicon, a hosted VM, or an emulated
+shell. The harness also rejects Rosetta, arm64-capable, and nested-VM hosts even when the marker is
+set. A Dory-only run without `--require-competitor` clearly records the competitor gate as not
+covered; it is not evidence of market parity.
+
+The non-native BuildKit probe creates a deterministic Node package, runs `npm ci`, builds an output
+artifact through an npm script, runs Node's test runner, and executes the built image on the target
+architecture. It intentionally has no registry dependencies beyond the base image, so an npm
+registry outage cannot masquerade as an emulation failure.
+
 ## Nine-Round Workflow Comparison
 
 The [workflow harness](scripts/benchmark-user-workflows.sh) is the stricter Dory/OrbStack/Colima

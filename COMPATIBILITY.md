@@ -55,16 +55,16 @@ experiments; the shipping shared-VM path fronts a real `dockerd` socket.
 | Healthchecks | ✅ | Exec-based probing + Docker-faithful state machine |
 | `up` / `down` | ✅ | Native engine; AND the real `docker compose up/down` CLI drives Dory's socket (verified) |
 | GUI Compose view | ✅ | Projects grouped by service with per-project + per-service start/stop |
-| Named/anonymous volumes | 🟡 | Declared top-level volumes are created as `<project>_<vol>` with compose labels on `up`, service references to them are project-prefixed, and `down(removeVolumes:)` removes them (`compose down -v`); anonymous volumes pass through to the runtime. `external: true` volumes and long-form `type: volume` mounts not special-cased yet |
+| Named/anonymous volumes | 🟡 current-worktree proof | Current source preserves top-level `name`, `external`, `driver`, `driver_opts`, and labels; validates external volumes before creating project state; never creates/removes external volumes; resolves relative bind sources from the first Compose file; maps long-form volume/bind/tmpfs/image options; pulls image mounts; rejects undefined named volumes; and removes attached anonymous volumes on `down -v`. The 712-test app gate and isolated runtime named-volume gates pass; repeat on the final notarized artifact. |
 | Profiles | ✅ | Unprofiled services start by default; `COMPOSE_PROFILES` and `*` activate profiled services. Targeted service activation is not exposed in the GUI |
-| Multiple files / overrides | 🟡 | Default override files plus `COMPOSE_FILE` ordered merge for common fields, including inline `!reset` (drop a key) and `!override` (replace instead of merge) tags; block-form tags (tag on the `key:` line with the value indented below) not yet |
-| `network_mode: service:` / shared pid/ipc | ⛔ | Co-schedule related processes into one Dory machine or one container image instead |
+| Multiple files / overrides | 🟡 current-worktree proof | Default override files plus `COMPOSE_FILE` ordered merge for common fields, including inline and block-form `!reset` (drop a key) and `!override` (replace instead of merge) tags. Focused tests pass; full Compose-spec merge breadth remains intentionally delegated to the bundled `docker compose` CLI and must be repeated on the final artifact. |
+| `network_mode: service:` / shared pid/ipc | 🟡 current-worktree proof | Current source adds implicit dependency edges and rewrites service namespace references to the exact project container name before Docker create. Focused tests pass; exact final-artifact proof remains. |
 
 ## Engine backends
 
 | Backend | Standalone? | Memory model | Notes |
 |---|---|---|---|
-| **Dory engine** (default; `DORY_RUNTIME=shared`) | ✅ yes | **One shared VM for all containers** (OrbStack-style) | Dory provisions one persistent Linux micro-VM running `dockerd` (DinD) on `dory-hv`, publishes its socket to the host over vsock with full half-close fidelity, and drives it with the verified Docker runtime. The engine keeps a TCP fallback while the guest agent starts, then promotes to the vsock bridge so `docker run`, attach, exec, logs, and Compose preserve stdout/stderr and stdin EOF correctly. Internal guest control ports are reserved and are not auto-forwarded as public localhost services. Intel prefers the raw `dory-hv` tier when signed PVH kernel/initfs assets are bundled, with Docker-compatible proxy fallback when assets or hypervisor support are missing. Verified on Apple silicon: standalone (engine 29.6.x, no Docker Desktop/OrbStack/Colima), workloads share one VM. Measured on Apple silicon: 2 containers = **1 VM @ ~122 MB** vs **~574 MB** as 2 per-container VMs. Persistent `/var/lib/docker` (preserved across restarts); memory is returned to macOS as workloads idle. Also available headless as the `dory-engine` runtime tarball. |
+| **Dory engine** (default; `DORY_RUNTIME=shared`) | ✅ yes | **One shared VM for all containers** (OrbStack-style) | Dory provisions one persistent Linux micro-VM running `dockerd` on `dory-hv`, publishes its socket to the host over vsock with full half-close fidelity, and drives it with the verified Docker runtime. The engine keeps a TCP fallback while the guest agent starts, then promotes to the vsock bridge so `docker run`, attach, exec, logs, and Compose preserve stdout/stderr and stdin EOF correctly. Internal guest control ports are reserved and are not auto-forwarded as public localhost services. Verified on Apple Silicon: standalone (engine 29.6.x, no Docker Desktop/OrbStack/Colima), workloads share one VM. Persistent workload state lives in the managed `Dory.dorydrive`, survives replacement of transient VM state, and guest free-page reporting can return idle pages to macOS. A defensible total-product memory win over current OrbStack has not yet been measured; see `BENCHMARKS.md`. Also available headless as the `dory-engine` runtime tarball. |
 | **Existing engine** (Settings → Engine Backend; `DORY_RUNTIME=docker`) | ❌ proxies host engine | Docker Desktop / OrbStack / Colima / Rancher Desktop / Podman | First-class selectable backend (not just a fallback): transparent proxy to the detected local engine socket (`DOCKER_HOST`, Docker contexts, and common engine sockets), or a custom socket path. Compatibility follows the installed host engine. Companion GUI, not standalone. |
 
 ## Diagnostics and Auto-Idle foundation
@@ -81,8 +81,8 @@ experiments; the shipping shared-VM path fronts a real `dockerd` socket.
 | Non-destructive repair CLI | ✅ foundation | `dory repair [target]` covers socket, Docker context, DNS cache, routes, domains, ports, dockerd reachability, the `engine` (headless restart), and guest-agent wake/clock resync signalling. `dory repair all --apply` only acts on subsystems that report a problem. GUI recovery actions and true in-app subsystem restarts remain. |
 | P0 release smoke | ✅ | `scripts/p0-smoke.sh` gates doctor, network, mount, Docker CLI stdout, Compose up/down, and localhost port publish against a running Dory socket. It now passes against the rebuilt/relaunched app bundle. |
 | Runtime mode settings | 🛠️ foundation | `dory mode manual|auto-idle|always-on|battery-saver|show` persists the user's intended availability mode, and `dory idle status` explains current sleep blockers such as running containers, published ports, pinned labels, and Kubernetes config. |
-| App-managed Auto-Idle | 🛠️ foundation | The app can attach to a sleeping `doryd` without calling `engineStart()`, so simply opening Dory does not wake `dory-hv`. doryd's Docker-tier idle policy stops an empty engine and keeps state on disk; active or unknown workloads are suspended/preserved instead of discarded. Focused app and core tests cover the sleeping attach path and idle stop policy. |
-| Socket-level Auto-Idle wake/sleep proxy | 🛠️ headless foundation | `dory idle proxy --foreground` keeps a Docker-compatible socket available, wakes the headless engine on API use, forwards requests to `engine.sock`, writes `idle-state.json` state transitions, and can stop the engine after the idle policy has no blockers. `dory idle proxy-status [--json]` reports the last recorded transition. `scripts/test-dory-doctor.sh` now covers the deterministic socket bind -> fake-engine wake -> forwarded `/_ping` -> state-file path. `dory idle launch-agent` can print/install the opt-in LaunchAgent. Wake UX polish, concurrent-client behavior, and release soak gates remain. |
+| App-managed Auto-Idle | 🛠️ foundation | Opening Dory is an explicit request to make Docker usable, so the app promotes a sleeping doryd-owned tier to running. doryd remains the owner of runtime mode and may stop an empty engine again after the configured idle period while keeping state on disk; active or unknown workloads are preserved. Focused app and core tests cover app-triggered promotion and the idle stop policy. |
+| Socket-level Auto-Idle wake/sleep proxy | 🛠️ strong headless foundation | `dory idle proxy --foreground` keeps a Docker-compatible socket available, wakes the headless engine on API use, forwards requests to `engine.sock`, writes `idle-state.json` state transitions, and can stop the engine after the idle policy has no blockers. Tests cover deterministic wake/forward/state, half-close behavior, app-socket coexistence, awake concurrency, and a 16-client cold-wake herd in which every request succeeds while the engine start command runs exactly once. `dory idle launch-agent` can print/install the opt-in LaunchAgent. Wake UX polish and an exact-candidate release soak remain. |
 
 ## OrbStack parity surface
 
@@ -92,19 +92,19 @@ CA trust install remain consent-gated, the same one-time admin grant OrbStack ne
 | Capability | Status | Notes |
 |---|---|---|
 | Native GUI (menu bar + main window) | ✅ | All screens, both themes; one-click toggles for k8s/machines/shared-VM |
-| Standalone engine + shared-VM memory | ✅ | Default backend; Dory runs its own `dockerd` in one VM, no OrbStack/Docker/Colima/Apple container install. ~4.7× leaner than per-container |
-| `localhost` access to published ports | ✅ | `HostPortForwarder`; verified `localhost:port → 200`, dynamic add/teardown |
+| Standalone engine + shared-VM memory | ✅ architecture | Default backend; Dory runs its own `dockerd` in one VM, with guest free-page reporting and no OrbStack/Docker/Colima/Apple container install. Current total-product competitor measurements do not support a memory multiplier; see `BENCHMARKS.md`. |
+| Native IPv6 + `localhost` publishing | ✅ current-source gate | Dory's provenance-pinned gvproxy derivative carries an IPv6 gVisor stack, NDP multicast switching, AAAA forwarding, and IPv4/IPv6 NAT. Docker's bridge assigns global-scope ULA addresses and registry AAAA works; the formal gate proves IPv6 TCP through gvproxy, restart persistence, and published TCP through both `127.0.0.1` and `[::1]`. Publication additionally requires external IPv6 TCP on the exact notarized artifact. Explicit IPv4-loopback bindings are never widened by LAN mode. |
 | Automatic `*.dory.local` domains | ✅ | `DoryDNS` resolver + `DoryReverseProxy`; verified `http://name.dory.local → 200`. System-wide via consent script |
 | Automatic local HTTPS | ✅ | `DoryTLSProxy` terminates TLS with a `LocalCA` identity; verified `https://name.dory.local → 200` |
-| **Bind-mount file sharing** | ✅ | Home dir shared into the VM (virtiofs); verified `docker run -v ~/proj:/app` reads/writes host files live |
+| **Bind-mount file sharing** | 🔒 current source; exact physical gates pending | Home and `/Volumes` are shared into the VM at identical paths (virtiofs), so `docker run -v ~/proj:/app` and explicit `/Volumes/MySSD/...` binds resolve to host storage. Current source virtualizes guest `chown` UID/GID without changing host APFS ownership, rejects special-file opens without blocking a vCPU, and implements owner-isolated POSIX record locks and BSD `flock`, including interruptible blocking requests and release/crash cleanup. Mandatory gates cover two-container shared/exclusive/upgrade/range/blocking/crash behavior, 10,000-open FD stability, restrictive hard links, and marked dedicated-volume unmount/missing-bind rejection/remount without an internal shadow path. Home-path protocol/coherence proof is green; the exact notarized candidate and writable physical external APFS drive still require certification. Virtual ownership is engine-lifetime state, so normal image entrypoints should reapply it after an engine restart. |
 | Apple GPU AI workloads | ✅ host-service bridge | Containers can reach Metal-backed macOS services at `host.dory.internal` on ports `11434` (Ollama), `1234` (LM Studio/OpenAI-compatible local servers), and `18190` (readiness/custom). Verified from the default Docker bridge and a user-defined bridge network |
-| In-guest GPU compute (Venus/Vulkan) | 🟡 experimental, working | Opt-in via **Settings → GPU Acceleration**: virtio-gpu with Mesa's Venus driver in the container → virglrenderer → MoltenVK → Metal. Verified end-to-end: `vulkaninfo` in a Debian container enumerates `Virtio-GPU Venus (Apple M2 Pro)` with compute queues, and real fence workloads pass (25 `vkQueueSubmit` + `vkWaitForFences` cycles). Device-level virtio-gpu fence signalling is implemented (deferred completion via virglrenderer's async callbacks); Venus's own sync rides its shared-memory ring. The renderer ships inside Dory.app (no Homebrew needed); the container needs Mesa Venus (`mesa-vulkan-drivers` + `--device /dev/dri/renderD128`). Not raw GPU passthrough — no such thing exists on Apple silicon for any hypervisor; API remoting is the platform's strongest form of GPU access |
+| In-guest GPU compute (Venus/Vulkan) | 🟡 experimental, Apple silicon | Opt-in via **Settings → GPU Acceleration** on Apple silicon: virtio-gpu with Mesa's Venus driver in the container → virglrenderer → MoltenVK → Metal. Verified end-to-end on an Apple M2 Pro: `vulkaninfo` enumerates `Virtio-GPU Venus (Apple M2 Pro)` with compute queues, and real fence workloads pass (25 `vkQueueSubmit` + `vkWaitForFences` cycles). Public full releases require a provenance-verified arm64 GPU kernel and the renderer payload; the Intel toggle is disabled because no physical Intel Venus result or x86 GPU kernel is claimed. The container needs Mesa Venus (`mesa-vulkan-drivers` + `--device /dev/dri/renderD128`). Not raw GPU passthrough — API remoting is the platform's strongest form of GPU access |
 | One-click Kubernetes | ✅ | `KubernetesProvisioner` runs k3s in the shared VM; verified host `kubectl` + pod deploy; GUI "Enable" button |
-| Linux machines (Ubuntu/Debian/Fedora/Alpine) | ✅ | Full Linux machines are isolated VMs, not Docker containers. doryd owns one `dory-vmm` helper per machine with durable machine definitions, status, start/stop/delete, snapshots, terminal/shell attach, mounts, ports, resources, recipes, and assignable `*.dory.local` addresses. The UI shows copyable terminal commands such as `dory ssh dev` / `dory machine shell dev`. |
-| Non-native CPU emulation | ✅ (qemu, with limits) | Opt-in via **Settings → Run Intel (x86/amd64) images**: registers qemu binfmt in the guest so `--platform linux/amd64` runs on Dory's own engine (verified: alpine and debian report `x86_64`/`amd64`, pulls fetch the right platform variant). `scripts/nonnative-build-smoke.sh` is the focused reproduction gate for Node/npm BuildKit builds like GitHub #13. First x86 use installs the qemu handlers via `tonistiigi/binfmt` (cached afterwards). **Heavy amd64 workloads can segfault** under qemu-user — SQL Server (`mcr.microsoft.com/mssql/server`), Oracle, and some AVX/threading-heavy images hit `qemu: uncaught target signal 11`. This is a qemu-user emulation limit, not a Dory bug; Rosetta cannot run on a raw Hypervisor.framework VMM, and the former Virtualization.framework Rosetta engine switch was retired (its guest handshake was unreliable). (GitHub #3) |
+| Linux machines (Ubuntu/Debian/Fedora/Alpine) | 🔒 exact resource-cycle gate pending | Full Linux machines are isolated VMs, not Docker containers. doryd owns one `dory-vmm` helper per machine with durable machine definitions, status, start/stop/delete, snapshots, terminal/shell attach, mounts, ports, resources, recipes, and assignable `*.dory.local` addresses. Running cards sample real guest CPU and used/total memory every two seconds instead of showing allocated memory as usage; `dorydctl machine stats` exposes the versioned CPU, memory, network, block-I/O, process, and uptime contract. CPU/memory edits are enforced at the same 1–8 CPU and 1–16 GiB boundary in both UI and daemon before a running VM is stopped or its definition changes. The rebuilt 8/8 Apple-Silicon UI suite exercises both complete bounds without a crash; the exact public signed-artifact 1→8→2 guest-visible restart cycle and stats proof remain required. |
+| Non-native CPU translation | ✅ FEX on Apple Silicon | New Apple Silicon installs enable Dory's bundled FEX/binfmt runtime by default; **Settings → Run Intel (x86/amd64) images** remains an opt-out. `--platform linux/amd64` uses the same networked arm64 VM, while Dory's OCI wrapper supplies FEX to ordinary containers, `docker exec`, and BuildKit. Gates cover Alpine/Debian execution, Node/npm build/test/runtime, Nix GC, GNU tar hard links, and an unmodified Arch `pacman` sandbox that installs its own nested seccomp filter. The runtime is provenance-pinned and offline; it does not pull `tonistiigi/binfmt` on Apple Silicon. Native arm64 remains faster, and an untested x86-only product is not implied merely by this development-image contract. (GitHub #3) |
 | Volume file browser | ✅ | `VolumeBrowser`; verified list + read files inside volumes; GUI sheet |
 | Terminal / SSH into containers + machines | ✅ | `TerminalLauncher` opens Terminal.app against Dory's socket/engine |
-| Docker Desktop / OrbStack migration | ✅ | `MigrationAssistant` imports images + containers into Dory's shared VM; Docker-compatible sources stream image archives directly when possible, so local/private images do not require a registry pull or a full tarball buffered in app memory. The preflight confidence report lists transfer items, attention items, estimated image disk, Compose projects, bind mounts, volume references, privileged containers, host-network containers, and published ports before any write. |
+| Docker Desktop / OrbStack migration | ✅ full current-source gate | `MigrationAssistant` imports images, container writable layers, named-volume contents, user networks, and containers into Dory's shared VM. It preserves custom-network driver/IPAM/options and container endpoint intent, uses collision-resistant per-source ownership for safe retries, verifies same-tag images by portable config/rootfs contract, rejects unsafe collisions before writes, never pauses source workloads implicitly, and bounds/cancels multi-gigabyte transfers. Inventory and cleanup are transactional and capacity admission fails closed. The 66-test migration suite and disposable two-engine gate pass with two volumes, a 64 MiB checksum, metadata/links, custom IPAM, writable-layer recovery, state restoration, fixed-port handoff, and exact baseline cleanup. The gate is mandatory in Apple Silicon release qualification. |
 | Managed local settings | ✅ foundation | Settings can generate an MDM/config-friendly JSON profile covering engine route, domains, DNS/proxy ports, Auto-Idle policy, file-sharing policy, scoped sandbox mounts, hidden credential stores, env allow-list, and telemetry mode `none`. No server is required. |
 | `*.k8s.dory.local` service domains | ✅ HTTP + HTTPS | `doryd` keeps `kubectl proxy` and service-domain routes reconciled; the reverse/TLS proxy rewrites `<svc>.<ns>.k8s.dory.local` → the API service proxy. Verified `http`+`https → 200`. TLS cert carries per-namespace wildcard SANs (`*.default.k8s.dory.local`, `*.kube-system.k8s.dory.local`); other namespaces would need their wildcard added |
 | `dory` CLI (OrbStack's `orb`) | ✅ | `scripts/dory` wraps the engine, machines, kubectl, diagnostics, disk/routes, repair, and runtime mode/idle status |
@@ -118,24 +118,25 @@ positioning.
 
 | Capability | Status | Delivery |
 |---|---|---|
-| Shared Docker engine VM | ✅ | doryd owns one persistent `dory-hv` helper for Docker/Compose/Kubernetes workloads and can stop an empty engine while preserving `/var/lib/docker` on disk |
-| Isolated Linux machines | ✅ | doryd owns one `dory-vmm` helper per machine; machines are real Linux VMs, not Docker containers |
+| Shared Docker engine VM | ✅ | doryd owns one persistent `dory-hv` helper for Docker/Compose/Kubernetes workloads and can stop an empty engine while preserving `/var/lib/docker` on disk. Current raw-HV and VZ helpers require an explicit state directory and take a nonblocking exclusive lock before attaching persistent storage, preventing two VMs from mounting the same ext4 disk. |
+| Isolated Linux machines | ✅ | doryd owns one `dory-vmm` helper per machine; machines are real Linux VMs, not Docker containers. The app shows live guest CPU and used/total memory, and the CLI's versioned stats output includes network, block I/O, PIDs, and uptime. |
 | Machine addresses | ✅ | Machine definitions include assignable addresses; the app and CLI surface copyable terminal commands such as `dory ssh dev` |
 | Host file mounts | ✅ | Containers use Docker bind mounts through the shared engine; machine mount definitions are persisted by doryd and applied on restart |
-| x86 / amd64 images | 🟡 | Apple silicon uses the qemu binfmt toggle for day-to-day amd64 images; Intel runs amd64 natively when the bundled engine assets pass hardware gates |
-| Memory reclaim | ✅ | The shared engine returns memory as workloads idle, and the Auto-Idle policy stops an empty engine automatically while keeping state on disk |
+| Common x86 / amd64 images | ✅ | Apple Silicon uses the bundled FEX runtime for the tested day-to-day contract: Alpine/Debian execution, Node/npm BuildKit build/test/runtime, Nix GC, nested-seccomp Arch/pacman, and GNU tar. It is on by default for new installs and can be disabled in Settings. Intel-host support is a later track. |
+| Memory reclaim | 🟡 | Guest free-page reporting is implemented. Pressure-triggered target reclaim is the opt-in experimental `senpai` mode, not the production default. Auto-Idle can stop an empty engine while keeping state on disk. No total-product memory winner is claimed without attributed same-host measurements. |
 | USB/audio passthrough | 🚧 | Not a 0.3 release claim. USB remains the usbip-over-vsock roadmap path; audio device UX is not exposed in the app |
 
 ## Packaging: does the user need anything besides Dory.app?
 
-The goal is a single download, and since 0.3 every release ships three flavors so you take only
-what you need:
+The public production track is Apple Silicon first. Intel remains a later roadmap phase and is not
+part of the current release, Sparkle, Homebrew, or qualification contract:
 
 | Flavor | Contents |
 |---|---|
-| `Dory-x.y.z.dmg` / `.zip` | Full app: bundled engine, kernel (headless + GPU), offline engine rootfs, Venus GPU renderer, Docker/Compose/kubectl CLIs |
+| `Dory-x.y.z.dmg` / `.zip` | Full arm64 app: bundled engine, provenance-verified Apple-silicon kernel/GPU payload, Venus renderer, offline engine rootfs, Docker/Compose/kubectl CLIs |
+| `Dory-x.y.z.cdx.json` | CycloneDX 1.6 inventory cryptographically bound to every file and symlink in the exact shipped app and to its source commit |
 | `Dory-x.y.z-lite.zip` | The app alone (~6 MB): fronts an engine you already run via Settings → Engine Backend |
-| `dory-engine-x.y.z-arm64.tar.gz` | Headless engine runtime (Colima-style): `dory-hv`, `gvproxy`, kernel, guest agent, and a `dory-engine start/stop/status` launcher that publishes `~/.dory/engine.sock` and a `dory-engine` docker context |
+| `dory-engine-x.y.z-arm64.tar.gz` | Headless engine runtime (Colima-style): `dory-hv`, `gvproxy`, the same Docker-create dataplane used by Dory.app, kernel, guest agent, and a `dory-engine start/stop/status` launcher that publishes `~/.dory/engine.sock` and a `dory-engine` docker context. Apple Silicon starts with bundled FEX/amd64 enabled; `--no-amd64` is the explicit opt-out. CPU, memory, translation, GPU, LAN, and selected data-drive settings persist across stop/start. `start --lan-visible` remains explicit opt-in; explicit loopback Docker binds remain loopback-only. |
 
 Status of the full flavor:
 
@@ -144,22 +145,19 @@ Status of the full flavor:
 | In-process engine (`dory-hv` + `dory-vm` helpers) | ✅ verified | `scripts/bundle-engine.sh` builds + signs the Hypervisor.framework `dory-hv` helper, `gvproxy`, and the Virtualization.framework fallback helper into `Contents/Helpers` with the required entitlements. |
 | VM kernel + initfs | ✅ verified | Compressed into `Contents/Resources/*.lzfse`; decompressed once on first launch with Apple's Compression framework. No external `zstd` binary or dylib is required. |
 | Engine rootfs / `dockerd` payload | ✅ bundled for offline releases; internal one-time fetch in dev bundles | Offline releases include `dory-engine-rootfs.ext4.lzfse` when the release runner provides `DORY_ENGINE_ROOTFS` or a prepared rootfs. Development bundles can still fetch `docker:dind` once internally on first boot. Neither path requires Docker Desktop, Colima, OrbStack, Homebrew, or Apple `container` on the user's Mac. |
-| `docker` CLI + Compose + `kubectl` | ✅ bundled | `Contents/Helpers/docker`, `docker-compose`, and `kubectl` ship with the app. Optional shell integration links them into `~/.dory/bin` and installs the Compose plugin into `~/.docker/cli-plugins`, all per-user and reversible. |
+| `docker` CLI + Buildx + Compose + `kubectl` | ✅ bundled | `Contents/Helpers/docker`, `docker-buildx`, `docker-compose`, and `kubectl` ship with the app. Optional shell integration links them into `~/.dory/bin` and installs the Buildx and Compose plugins into `~/.docker/cli-plugins`, all per-user and reversible. |
 | macOS 14+ (Sonoma) | app requirement | The SwiftUI app and Docker-compatible host-engine mode build and run with a macOS 14 deployment target, matching OrbStack's floor. The app links no Virtualization/Hypervisor code and uses no macOS-15-only API. |
-| macOS 14+ (Sonoma) built-in engine | supported target | The bundled Dory engine is the default local path on supported hardware. macOS 14 remains a release target for the app and local engine surfaces; hardware/asset gates degrade to Docker-compatible proxy mode instead of requiring Docker Desktop. |
+| macOS 14+ (Sonoma) built-in engine | supported target | With matching guest assets, Sonoma routes the shared Docker VM through the bundled Virtualization.framework `dory-vmm` tier. If neither that tier nor the macOS-15+ raw `dory-hv` tier is available, Dory degrades explicitly to Docker-compatible proxy mode instead of claiming that its own engine is running. |
 | Apple silicon built-in engine | verified standalone engine | The native `dory-hv` shared engine is verified on Apple silicon. |
-| Intel built-in engine | beta, hardware-gated | The universal app, raw `dory-hv` x86 selection, PVH asset selection, amd64 VZ fallback assets, and Virtualization.framework tier routing are implemented. Full Intel readiness still requires a physical Intel Mac with Hypervisor.framework support. |
+| Intel built-in engine | roadmap, not shipped | Implementation remains available for later development, but no Intel/universal artifact is published or claimed complete in the Apple-Silicon-first release. |
 | Apple Container backend | ⛔ unsupported / not required | Dory 0.3 does not expose or require Apple's separate `container` CLI. It may appear only as a benchmark competitor when installed separately on the same Mac. |
 
 So: **a self-contained standalone Dory.app works on Apple silicon**, verified end-to-end
 (`DORY_BUNDLE_ENGINE=1`): a re-signed bundle that passes `codesign --verify --deep --strict`,
 ships the helpers, CLIs, kernel/initfs, networking, and optional offline engine rootfs, and
 requires no Homebrew, no Docker Desktop, no Colima, no OrbStack, and no Apple `container` install.
-On Intel, the raw `dory-hv` tier is wired as a beta when PVH assets are bundled, with the
-Virtualization.framework helper as the amd64 fallback; until the Intel hardware readiness gate is
-green, Dory still has the Docker-compatible fallback path. Building a self-contained bundle needs
-the guest kernel/initfs assets available on the release runner, and a fully offline first boot also
-needs a prepared engine rootfs.
+Building a self-contained bundle needs the arm64 guest kernel/initfs assets available on the release
+runner, and a fully offline first boot also needs a prepared engine rootfs.
 
 ## Tool compatibility (`dory compat`)
 
@@ -173,30 +171,41 @@ gates the recipe surface in CI and runs the engine-backed smoke tests during rel
 |---|---|---|
 | Docker CLI | CLI on PATH, socket reachable, `DOCKER_HOST`/context targets Dory | `docker context use dory` |
 | Docker Compose v2 | Bundled `docker compose` plugin resolves | Shell integration puts the plugin on PATH |
-| VS Code Dev Containers | App installed, `docker` on PATH, engine route | `"dev.containers.dockerPath"` + `dory` context |
-| Cursor Dev Containers | Same as VS Code (fork) | Same recipe |
-| Testcontainers | `DOCKER_HOST` or `/var/run/docker.sock` resolves to Dory; Ryuk note | `export DOCKER_HOST=unix://~/.dory/dory.sock` |
-| GitHub Actions `act` | Default `/var/run/docker.sock` vs Dory | `act --container-daemon-socket unix://…` |
-| Supabase local | CLI present + engine reachable | `docker context use dory` then `supabase start` |
-| LocalStack | CLI present + engine reachable | `localstack start -d`, verify `:4566/_localstack/health` |
-| Skaffold/Tilt (Kubernetes) | `kubectl` + a kubeconfig/context | `kubectl config use-context dory` |
+| VS Code/Cursor Dev Containers | App installed, `docker` on PATH, engine route; the mandatory pinned official CLI gate proves image resolution, create/start, exec, host→container and container→host workspace coherence, and exact cleanup | `"dev.containers.dockerPath"` + `dory` context |
+| Testcontainers | Host client uses Dory; Ryuk mounts the guest-local daemon socket | `export DOCKER_HOST=unix://$HOME/.dory/dory.sock TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock` |
+| SSH agent in containers | The built-in raw-HV and macOS 14 VZ engines expose a dedicated guest-local socket backed by the current same-user macOS agent; release gates compare public identity hashes across one and eight concurrent clients and again after a VZ restart | `-v /run/host-services/ssh-auth.sock:/agent.sock -e SSH_AUTH_SOCK=/agent.sock`; mount only into trusted containers |
+| GitHub Actions `act` | The host process uses Dory's macOS socket while runner containers mount the daemon's guest-local socket; the checksum-pinned gate executes a real workflow on a digest-pinned runner, proves two-way workspace coherence, and cleans every object | `export DOCKER_HOST=unix://$HOME/.dory/dory.sock`, then `act --container-daemon-socket unix:///var/run/docker.sock` |
+| Supabase local | CLI present + engine reachable; the mandatory checksum-pinned 2.109.1 gate starts the complete default 12-container stack, preserves Docker SDK request classification after streamed pulls, maps Vector to the guest-local daemon socket, verifies every declared healthcheck plus Postgres/migration/seed, PostgREST, Auth, Storage, loopback-only listeners, stop, and exact cleanup | `export DOCKER_HOST=unix://$HOME/.dory/dory.sock`, then `supabase start` — no Supabase-specific socket override is required |
+| LocalStack | The digest-pinned 4.14.0 gate proves a loopback-only dynamic host listener, health convergence, S3 bucket/object round-trip, SQS queue/message round-trip, and exact cleanup | `localstack start -d`, verify `:4566/_localstack/health` |
+| Tilt | The checksum-pinned 0.37.5 gates run real `tilt ci` over both Docker Compose and a nested digest-pinned k3s cluster. They prove Compose health/two-way workspace coherence and Kubernetes rollout/NodePort HTTP, then run `tilt down` with namespace deletion and exact cleanup | Docker Compose works immediately; Kubernetes projects use a reachable kubeconfig/context |
+| Skaffold (Kubernetes) | The checksum-pinned 2.23.0 gate deploys to digest-pinned k3s, waits for rollout, proves NodePort HTTP through a loopback-only Dory listener, deletes the namespace, and restores the exact Docker-object baseline | Point `KUBECONFIG` at the target cluster; the release gate exercises the candidate-bundled `kubectl` |
 
 Each row's recipe has a verification command; run `dory compat` for the live status on your machine
-and `dory compat --recipe` for the full set.
+and `dory compat --recipe` for the full set. The current isolated runtime passed
+`@devcontainers/cli` 0.87.0, checksum-pinned `act` 0.2.89, digest-pinned LocalStack 4.14.0,
+checksum-pinned Tilt 0.37.5 (Compose and Kubernetes), Skaffold 2.23.0 on k3s 1.36.2, and checksum-pinned Supabase CLI 2.109.1 end to end. Release qualification rejects missing, rehashed but
+incomplete, version/image-mismatched, wrong-socket, widened-loopback, unhealthy, or non-clean
+evidence.
 
 ## Architectural / environment notes
 
 - **Shared VM vs one-VM-per-container.** Dory's shipping engine runs containers in one shared Linux
   VM. Apple's separate Container CLI is not a Dory backend; it is only a useful competitor row when
-  installed on the same Mac for benchmark context. Measured ~4.7× less memory for 2 containers
-  (122 MB vs 574 MB), with the gap widening per container. This closes the headline memory gap and
-  makes Dory a standalone engine.
+  installed on the same Mac for benchmark context. This makes Dory a standalone engine, but it is
+  not evidence of a total-product memory win over current OrbStack or Docker Desktop; publish a
+  multiplier only after the attribution-safe repeated campaign in `BENCHMARKS.md` is green.
 - **File-sharing performance** for release claims must come from `scripts/benchmark-compare.sh`
   artifacts on the same Mac and engine versions being compared.
-- **Distribution.** Release automation builds Apple-silicon, Intel, and universal app artifacts,
-  signs them with Developer ID, submits them for notarization when Apple credentials are present,
-  staples the tickets, generates the Sparkle appcast, and bumps/syncs the Homebrew Cask. The
-  remaining external gate is operational: the release runner must have the Developer ID/notary
-  credentials, Sparkle key, Homebrew tap token, and bundled engine assets before publishing.
+- **Distribution.** Release automation builds an Apple-silicon app artifact,
+  signs it with Developer ID, submits it for notarization, staples the ticket, generates the
+  Sparkle appcast, and bumps/syncs the Homebrew Cask. A clean-user gate now makes the real
+  `Package.resolved`-pinned Sparkle updater replace and relaunch the previous public app, then
+  verifies the complete installed tree, workload/settings state, and rollback. Strict Homebrew
+  audit runs on an isolated compatible macOS job bound to the candidate ZIP/version/SHA, so the
+  physical Xcode 26.6 release host does not need Xcode 27. The remaining external gate is
+  operational execution with the Developer ID/notary credentials, Sparkle key, Homebrew tap token,
+  and bundled engine assets before publishing.
 - The app runs **unsandboxed** (like Docker Desktop/OrbStack) to reach the engine socket and
   host its own socket.
+- Arbitrary host Unix sockets are not passed through virtiofs. SSH-agent access uses the single
+  dedicated `/run/host-services/ssh-auth.sock` bridge and is opt-in per container mount.

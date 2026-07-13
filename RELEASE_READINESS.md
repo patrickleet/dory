@@ -1,0 +1,643 @@
+# Dory 0.3.0 release readiness
+
+Last updated: 2026-07-13
+
+## Decision
+
+**NO-GO for public release today.** Previously completed local gates remain useful evidence, but
+the release must not publish until the newly identified app-layer blockers and the physical
+release-host, credential, and exact upgrade/rollback gates below are complete. Intel is a later
+roadmap phase and is not part of the Apple-Silicon-first release contract. This document
+intentionally separates verified evidence from claims that still need proof.
+
+**The signed `20260712T035458Z` app candidate is now superseded for app release purposes.** Its
+standalone engine completed the immutable eight-hour baseline, but the post-build
+migration audit found release blockers in the app layer: a stale panel says volume data is not
+copied, image-tag collisions are not preflighted, the deleted-tag snapshot fallback temporarily
+reuses the user's source tag and accepts Docker's default source-container pause, archive I/O has
+no idle timeout/cancel path, and recreated custom
+networks lose IPAM/options. Partial-import ownership is also keyed only as generic `docker`, so a
+retry needs a stable per-source identity before it can safely resume. The user's current OrbStack
+inventory has three explicit custom subnet/gateway contracts. It also contains 15,656,752,870 bytes
+across 79 named volumes while the Mac currently has only about 11–13 GiB free; volumes plus 38
+tagged images cannot fit the superseded candidate's 16 GiB logical Docker disk. Eleven containers
+also carry 497,029,428 bytes of writable-layer changes outside named volumes; current source now
+sizes and snapshots those layers instead of silently recreating only their base images. The failed target
+disk's clean ext4 filesystem has only 13,752,078,336 bytes free, about 1.9 GB less than the source
+volumes alone, and the backing file is 99.02% physically allocated (17,144,496,128 of
+17,314,086,912 bytes). This proves the old target cannot complete the requested import. Offline
+target inspection also found 65 existing target volume entries, including 11 same-name collisions
+with OrbStack. None carries a Dory migration-ownership label. Ten are provably empty, detached, and
+will be adoptable while preserving labels only if the live daemon also reports matching local
+driver/options. The one non-empty collision contains 31 logical bytes and remains a hard preflight
+blocker until the user explicitly backs it up/resolves it. Current source surfaces that distinction
+before writes and implements
+fail-before-write target collisions, exact volume/network contracts, stable source
+ownership, non-pausing unique snapshot tags, cancellable idle-bounded streams, exact volume-size
+and host/target capacity preflight with the additional space-to-free shown explicitly, strict
+all-object inventory, live-volume quiescence blocking,
+container writable-layer sizing/snapshotting with running-change quiescence,
+transactional partial-volume/container cleanup, rollback restoration of adopted empty-volume
+metadata and replaced detached-network contracts, fixed-port deferral, and sparse 128 GiB data-disk growth with
+guest ext4 expansion. Boot and graceful shutdown now issue `fstrim` through Dory's virtio-discard
+path, returning deleted/free ext4 extents to APFS instead of leaving an old sparse file physically
+full. Host validation also rejects invalid ext4 geometry before changing a file, and every guest
+boot path now permits `mkfs.ext4` only for a host-proven unallocated blank; an existing ext4 mount
+failure powers off instead of falling through to reformatting. Current worktree and isolated-runtime
+proof now cover these fixes, including the 16→128 GiB disk gate and disposable two-engine
+migration, but the final arm64 Developer ID/notarized artifact has not been rebuilt. Rebuild and
+re-sign that artifact, then repeat the exact-candidate gates before replacing the hashes below.
+
+## Verified locally
+
+- The full non-UI app gate passes **711 tests in 95 suites** after the final migration, Compose,
+  and ephemeral-port preservation changes.
+- The owned live OrbStack-to-Dory migration passed against both real engine sockets. It preserved:
+  image availability, named-volume bytes, custom networking, environment, command/entrypoint,
+  mounts, restart policy, and running state. It covers deleted tags, normalized cross-daemon image
+  IDs, and a fully unavailable source image recovered through a temporary container snapshot.
+- Migration refuses to overwrite same-name target volumes or networks that Dory does not own, and
+  resumes only migration-labeled partial objects. Bare source-only image IDs are rebound to a
+  portable Dory reference, and failed container start/pause restoration removes the container
+  created by that attempt so the next retry is not blocked by its name.
+- Dory Core tests passed, including non-destructive APFS cloning of the public v0.2 Docker data
+  disk, fail-closed validation of invalid legacy disks, and exclusive engine-state locking.
+- The latest Dory Core run passed **265 tests with zero failures**. The latest
+  ContainerizationEngine/DoryHV run passed **492 tests in 61
+  suites**, including attachment of the
+  persistent Docker data disk on the macOS 14 VZ path, state-lock contention, published-port host-IP
+  planning, and virtiofs ownership behavior.
+- Linux-machine cards no longer claim allocated RAM is usage or display fabricated `0.0%` CPU.
+  Running machines now sample guest `/proc` through the bounded guest-agent exec path every two
+  seconds, while `dorydctl machine stats` exposes a strict versioned CPU, used/total memory,
+  network, block-I/O, process, and uptime schema. Four focused parser/contract tests, 24 XPC/app
+  lifecycle tests, the full Dory Core suite, the full 711-test app suite, and the offline
+  competitor release-policy suite pass. The exact-candidate resource gate now validates live stats
+  after every resource-changing restart.
+- SSH-agent qualification now covers the separate BuildKit session path required by
+  `RUN --mount=type=ssh`: a network-disabled build must receive the same sorted public identity
+  digest as the host and ordinary Dory guest socket, while retaining neither key text nor private
+  material. The disposable current-source raw-HV execution passed one ordinary client, eight
+  concurrent clients, and the required BuildKit mount with the same digest; the throwaway agent
+  identity and isolated 128 GiB sparse state were removed afterward. Retained evidence contains no
+  key text:
+  `~/.dory-new-gate-evidence/20260713T-buildkit-ssh-agent/20260713T022720Z-8891/manifest.txt`.
+  Publication semantically rejects a missing required mount or divergent digest.
+- The competitor runtime gate now additionally reproduces three live Apple-container gaps through
+  Dory's real Docker API: Rails-style nested `.dockerignore` unignores, network-scoped aliases with
+  stable stop/start IPs, and bounded byte-exact `docker cp` in both directions through a mounted
+  named volume. The first expanded run also exposed a Dory host-watcher recovery defect: a
+  guest-side `O_RDONLY` nudge of a host mode-0200 file could be rejected by the unprivileged macOS
+  virtiofs server until reverse-invalidation recovery restarted the VM. The guest agent now selects
+  non-truncating write access for write-only regular files and safely nudges the nearest live parent
+  when neither access mode is permitted. Focused Rust tests preserve bytes and modes for mode-0200
+  and mode-000 files. The latest raw-engine full-default campaign passed all 34 mandatory rows,
+  including 2,000 published connections, 20 restarts, 10,000 bind operations with zero FD growth,
+  1,000 restrictive hard-link reads, and four overlapping required-secret BuildKit sessions with
+  isolated exact context bytes. It additionally proved a genuinely empty fresh named-volume root,
+  exact defaulted Dockerfile ARG expansion, a zero-only stdout image-archive tail, and import/export
+  of a deep hard link whose layer omitted every parent-directory entry. The campaign exposed and
+  fixed the standalone launcher dropping `--amd64` on restart: Apple Silicon now defaults FEX on
+  and persists CPU, memory, translation, GPU, LAN, and selected data-drive settings, so the same
+  `dory-runc` container ID resumed after a plain stop/start. Exact cleanup and cleanup persistence
+  passed. Evidence:
+  `~/.dory-new-gate-evidence/20260713T-competitor-runtime-34-row-image-semantics/run`
+  (archive SHA-256 `3063e81897a5e6d78710c2f91c62516dea4d4ba7de3e2e4bd36007bb87a8a63d`).
+  Each behavior is a named publication-required row rather than an inferred dockerd claim.
+- A subsequent standalone-runtime audit found that the launcher refreshed the bundled guest agent
+  under `~/.dory/bin` while its own `safe` home share deliberately hid `.dory`, causing the guest to
+  execute the stale rootfs agent after a release-runtime boot. The launcher now passes the exact
+  bundle agent through dory-hv's read-only boot-config share. Bundle, launcher, staged, and running
+  guest hashes now match while the different rootfs fallback is demonstrably not selected. The
+  fixed standalone runtime passed all **23** rows, including full engine stop/start with unchanged
+  container identity, state, and published port, and recorded zero watcher nudge failures or
+  reverse-invalidation timeouts. The live bind-lock gate also passed cross-container BSD flock and
+  POSIX range-lock exclusion, shared locks, contended Linux-compatible upgrade/retry, blocking
+  wakeup, explicit unlock, non-overlapping ranges, and crash release. Its isolated qualifier now
+  binds `HOME` to the shared engine tree and requires a real 64-hex digest of the resolved Docker
+  CLI. Development evidence (not release-qualifying because the source tree is uncommitted):
+  `~/.dory-new-gate-evidence/20260713T-standalone-agent-lock-fixes`.
+- A live 2026-07-13 competitor-tracker delta exposed two additional reproducible gaps and both are
+  now release-gated. First, Darwin rejected `F_SETFL(O_APPEND)` on the identity descriptor after a
+  successful `open(O_CREAT|O_EXCL|O_RDONLY, 0000)`, so Dory returned `EACCES` after creating an
+  inaccessible host orphan. HostFS now preserves the creating descriptor without the impossible
+  append upgrade when no write bits exist; the exact non-root container creates mode 0000, verifies
+  it, and unlinks it, while the complete cross-container lock gate still passes. Second, a fixed
+  host port already owned by macOS could be accepted by guest dockerd and retried invisibly by the
+  host forwarder. The dataplane now decodes the real chunked inspect response before container
+  start, waits through one forwarder reconcile window, and returns a bounded Docker conflict while
+  leaving the container stopped. The same start succeeds after the host owner releases the port.
+  The expanded current-source campaign first passed **24** rows, including 2,000 connections at
+  63→62 aggregate FDs, 20 restarts, full engine restart, and the new collision/recovery row.
+  Integrity-checked development evidence:
+  `~/.dory-new-gate-evidence/20260713T-mode-zero-statfs-fixes` and
+  `~/.dory-new-gate-evidence/20260713T-host-port-collision-fix`.
+  The first execution of a 25th cleanup/restart row exposed a real durability failure: the launcher
+  signalled gvproxy at the same time as `dory-hv`, cutting the guest shutdown request off before
+  dockerd could stop, sync, unmount its data drive, and power off. Deleted Docker objects could then
+  reappear after restart. The launcher now keeps the state-owned gvproxy alive until `dory-hv`
+  exits, then reaps it. Two focused deletion/restart cycles ended in `powerOff` with zero resurrected
+  containers, volumes, or custom networks. The complete current-source **25-row** campaign then
+  passed with 2,000 connections at 53→52 aggregate FDs, 20 restarts, two full engine restart paths,
+  and the final owned containers, networks, volume, and build image still absent after restart.
+  Integrity-checked development evidence:
+  `~/.dory-new-gate-evidence/20260713T-cleanup-restart-25-row-fix`.
+  A later GitHub delta added Apple container's ignored custom DNS-domain failure. The now-**27-row**
+  campaign requires both default resolver search isolation and an explicit standard Docker
+  `--dns-search dev.dory.test` entry with a valid nameserver. It also guards Apple container's
+  cross-OS signal serialization failure by sending named `USR1` to both container init and a
+  detached exec process, requiring both delivery markers while init and Docker stay live. The
+  complete current-source rerun passed all 27 rows, 2,000 forwarded connections, 20 restarts, deliberate six-stream
+  backpressure with all 12 control probes completing in 0.016 seconds, cleanup/restart durability,
+  and three graceful `powerOff` events. Evidence:
+  `~/.dory-new-gate-evidence/20260713T-competitor-runtime-27-row-signals`.
+  The latest delta adds Apple container #1940's silently discarded virtiofs mount options. The
+  **28-row** gate now requires unsupported Docker `:nosuid` syntax to fail promptly with an explicit
+  validation error and no partial container, while supported `:ro` must remain `RW=false` in
+  inspect, permit reads, reject writes, and leave the host unchanged. The complete current-source
+  rerun passed all 28 rows, 2,000 connections with zero FD growth, 20 restarts, cleanup persistence,
+  and four graceful `powerOff` events. Evidence:
+  `~/.dory-new-gate-evidence/20260713T-competitor-runtime-28-row-mount-options` (archive SHA-256
+  `2cad44e4c264dea5202de462df25bf15723f3c0c4939f00a998ace39f6db3b39`).
+  The refreshed issue sweep then added Apple container's 16 KiB builder-transport limit and missing
+  seccomp support. The **30-row** campaign builds and runs an image from a 65,582-byte Dockerfile,
+  verifies the engine advertises seccomp, and applies a custom AArch64 profile that blocks
+  `mkdir`/`mkdirat` while reads and Docker control traffic remain live. The complete rerun passed all
+  30 rows with 2,000 connections, 20 restarts, and three graceful `powerOff` events. Evidence:
+  `~/.dory-new-gate-evidence/20260713T-competitor-runtime-30-row-seccomp-large-dockerfile` (archive
+  SHA-256 `bfc4c44b2f0da32c812efd1c39ca99361a2efb89ce63e820a38fbe4af20ed600`).
+- Host-share capacity now has an explicit >16 TiB regression. Dory converts Darwin's native
+  64-bit `fstatfs` fields directly into FUSE_STATFS and the focused test carries block and inode
+  counts above `UInt32.max` without wrapping. Physical external-drive certification still remains
+  mandatory because this Mac has no dedicated writable external test volume.
+- The live competitor delta also found OrbStack's LAN/DNS stall during transient balloon pressure
+  and a rare host `configd` watchdog reboot involving its helper network path, plus Apple
+  container's non-healing route/NAT state after VPN or exit-node churn. Dory's raw-HV LAN and
+  Sonoma VZ physical gates now keep 960 MiB resident while repeatedly requiring exact remote
+  TCP/UDP source identity, responsive Docker DNS/API calls, and bounded macOS `configd` queries.
+  Publication verifies the pressure dimensions and PASS fields rather than accepting an unmeasured
+  claim. A disposable current-source raw-HV run then held 966.6 MiB resident for 20 fail-fast
+  rounds while loopback publication, Docker API, bidirectional container DNS/TCP, and macOS
+  `configd` stayed responsive; the pressure process remained running and was not OOM-killed, and
+  shutdown ended in `powerOff`
+  (`~/.dory-new-gate-evidence/20260713T-memory-pressure-local-20-round`). This validates the
+  workload and local probes, not the physical claim: the real peers, Sonoma host, and extended
+  host-network soak remain mandatory. The notarized physical sleep gate now additionally requires
+  a real configured Tailscale exit node and three explicitly confirmed enable/disable rounds. Host,
+  container, and Docker connectivity must remain live while the competing route is active, and the
+  exact route/DNS/search/proxy/resolver contract must return after every disable. Publication
+  semantically verifies all six churn rows, nonempty Tailscale status artifacts, empty recovery
+  diffs, and a hash binding to the private exit-node input. This harness passes offline adversarial
+  tests but cannot run here because this Mac has no configured exit node or release VPN.
+- Lima's new unattended-start reports exposed one more standalone-supervisor gap: Dory already
+  rejected recycled PID files and stale public sockets, but did not rediscover dory-hv or the
+  dataplane if the exact helper survived while its PID file was lost. The launcher now matches only
+  this HOME's private state/backend/public paths, repairs metadata for a healthy recovered pair,
+  and gracefully replaces an incomplete pair; it also clears a stale backend socket and ignores
+  zombie processes during its shutdown bound. Offline fixtures prove stale socket/PID cleanup,
+  pidfile-less helper recovery, gvproxy cleanup, and that a foreign helper is untouched. A live
+  disposable run repaired both deleted PID files without restart, then recovered from a deliberately
+  SIGKILLed dataplane through guest `powerOff` and a new healthy Docker API; final shutdown was also
+  `powerOff` (`~/.dory-new-gate-evidence/20260713T-stale-supervisor-self-heal`). The start row is now
+  correctly a final-artifact blocker because the previously signed five-start candidate predates
+  this change.
+- Apple container's app-root reports exposed a narrower identity gap in the standalone launcher.
+  If `data-drive.path` disappeared while both helpers and Docker remained healthy, an alternate
+  `--data-drive` request could previously skip the mismatch check and be reported as already
+  running. Recovery now binds the exact live dory-hv PID to this runtime's state/backend paths and
+  the complete `--data-drive … --kernel` argument boundary before restoring metadata. The same
+  drive repairs without restarting either helper; a different drive fails closed, stays absent,
+  and leaves the original Docker API healthy. A read-only Application Support parent also exits
+  normally with a path-specific permission error and no partial bundle. The current-source managed
+  drive gate then preserved image, stopped-container definition, writable layer, named volume,
+  custom network, and their bytes across total transient-runtime replacement, with both shutdowns
+  ending in `powerOff`. Integrity-bound development evidence:
+  `~/.dory-new-gate-evidence/20260713T-data-drive-identity-fix-final3/20260713T050610Z-3067`.
+  The first disposable assembly used an obsolete seed rootfs and correctly failed its second boot
+  because that image predated the required ext4 inspection/growth tools. The rebuilt pinned arm64
+  guest image passes its provenance verifier and contains `dumpe2fs`, `resize2fs`, and `e2fsck`;
+  only the current-asset rerun is counted.
+- Rust formatting, clippy with warnings denied, and workspace tests passed.
+- Release-output, Sparkle key/signature, quarantine, cleanup, compatibility, readiness, benchmark
+  safety, and offline upgrade/rollback regression tests passed.
+- The official `@devcontainers/cli` 0.87.0 passed against a disposable current-worktree engine:
+  image resolution, create/start, exec, two-way workspace coherence, and exact object cleanup. This
+  version-bound semantic evidence is now mandatory in the long release qualifier and publication
+  verifier alongside Testcontainers 12.0.4.
+- Checksum-pinned `act` 0.2.89 executed a real workflow on a digest-pinned runner through the same
+  disposable engine. The host process used Dory's macOS socket while the runner mounted the
+  daemon's guest-local socket; runner execution, two-way workspace coherence, and exact cleanup
+  passed. This semantic evidence is also mandatory in release qualification.
+- Digest-pinned LocalStack 4.14.0 passed health convergence, S3 bucket/object and SQS queue/message
+  round-trips, and exact cleanup. A host `lsof` proof confirmed its requested dynamic port listened
+  only on `127.0.0.1`, even though dockerd's normalized guest binding reports a wildcard. The
+  release verifier now rejects LocalStack evidence without that non-LAN exposure proof.
+- Checksum-pinned Tilt 0.37.5 passed a real `tilt ci` Docker Compose deployment, bounded Docker
+  health convergence, two-way workspace coherence, `tilt down`, and exact cleanup. Its version and
+  semantic proof set are now mandatory in release qualification.
+- Checksum-pinned Supabase CLI 2.109.1 passed its complete default 12-container stack on a
+  disposable Dory runtime. All services stayed running, all ten declared Docker healthchecks were
+  healthy, Vector reached the guest-local Docker socket, migration/seed data round-tripped through
+  Postgres and PostgREST, Auth and Storage were healthy, every published listener stayed host
+  loopback-only, `supabase stop --no-backup` succeeded, and Docker objects returned to the exact
+  empty baseline. This exposed and fixed pooled Docker-SDK creates bypassing rewrites after streamed
+  image pulls; the semantic proof and exact CLI/archive version are now mandatory release evidence.
+- Digest-pinned k3s 1.36.2 booted as a privileged nested control plane on the disposable candidate
+  runtime. The candidate-bundled `kubectl` observed a Ready node on Linux 6.12.30-dory arm64;
+  dynamic API and NodePort listeners stayed on host loopback. Checksum-pinned Skaffold 2.23.0
+  deployed, stabilized, served HTTP, and deleted its namespace. Tilt 0.37.5 independently completed
+  Kubernetes `tilt ci`, rollout, NodePort HTTP, and `tilt down --delete-namespaces`. The gate then
+  restored zero containers, named volumes, and custom networks. Evidence:
+  `~/.dory-final-candidate/current-worktree/evidence/kubernetes-tooling-cache-20260712T172920Z-78934/gate-rerun/manifest.txt`.
+- The socket-level Auto-Idle proxy passed a 16-client cold-wake herd: every Docker request received
+  a complete response, wake state converged, and the engine start command ran exactly once. This
+  closes the untested thundering-herd path; final-candidate wake/sleep soak evidence remains.
+- The UI test runner passes strict recursive code-signature verification and launches. The earlier
+  “damaged” dialog was stale LaunchServices provenance, not an unsigned runner. After the one-time
+  macOS UI-automation authorization was approved, the rebuilt `Dory UI Tests` scheme passed all
+  eight tests on Apple Silicon: every primary section, create/pull sheet open and cancel,
+  onboarding, settings tabs, appearance/theme controls, the machine resource UI's complete
+  2→8→1 CPU and 2→16→1 GiB boundary cycle, launch smoke, and launch performance. Expanding
+  Advanced now scrolls the controls above the fixed footer instead of leaving their click targets
+  obscured. The current Xcode 26.6 rerun passed 8/8 with no failures or skips; five measured launches
+  averaged 0.332 seconds with 9.537% relative standard deviation. The xcresult, source/test hashes,
+  runner hash, and host/toolchain binding are retained at
+  `~/.dory-ui-evidence/20260713T015331Z-xcode-26.6/manifest.txt`.
+  Retained result:
+  `~/.dory-final-candidate/current-worktree/evidence/ui-tests-20260712T231421Z-51894/result.xcresult`.
+- Homebrew cask metadata is prepared and byte-identical in this repository and the sibling
+  `homebrew-dory` tap. `brew style` passes. Strict audit is now a mandatory isolated `macos-15`
+  workflow job: it downloads the immutable candidate, independently matches the ZIP to the exact
+  arm64 SHA-256, stages that version/hash into the cask, runs `brew style` and strict audit, and
+  retains commit/run/attempt-bound evidence that publication reparses. This Mac remains on Xcode
+  26.6 as requested; Homebrew's Xcode 27 requirement on macOS 27 no longer blocks or changes the
+  physical release host toolchain.
+- Source-tree `git diff --check` passed, and live migration fixtures were absent from both engines
+  after the smoke test.
+- The live FD gate completed 25 owned create/start/wait/inspect/log/remove cycles. `doryd` remained
+  at 37 descriptors and `dory-hv` at 32; no fixture containers remained. This is a focused
+  regression, not a substitute for the required overnight soak.
+- A disposable candidate soak exposed a supervisor edge case during forced shutdown: `dory-hv`
+  exited but its reparented `gvproxy` child survived. Current source now reaps only a gvproxy command
+  carrying both exact private state-socket paths, and the offline regression passes. The endurance
+  harness also reserves 2 GiB of free space before each cycle so packaging cannot make evidence logs
+  unwritable. The rebuilt exact runtime passed the forced-stop reproduction: after `dory-hv` was
+  killed, `dory-engine stop` reaped the state-owned gvproxy and left no helper or socket. The latest
+  rebuilt exact runtime repeated this in one second
+  (`~/.dory-final-candidate/20260712T035458Z/forced-stop-gvproxy-gate.txt`). Earlier eight-hour runs
+  were stopped after migration audits exposed a dangling-image leak and retry-blocking partial
+  container edge; they are not counted. The later baseline completed **3,969 PASS cycles over
+  exactly 28,800 seconds** with stable resource medians under
+  `~/.dory-final-candidate/20260712T035458Z`; it is valuable stability evidence but is superseded by
+  later app/release-gate source changes and is not final release evidence.
+- A strict same-host Dory/OrbStack readiness run passed with **28 passes, 0 failures**. Both engines
+  passed API/system-df, lifecycle/logs/exec/stats, copy/export, bind mounts, volumes, service DNS,
+  published ports, BuildKit, Compose, save/load, and resource-update checks; Dory also passed its
+  gvproxy VPN-coexistence probe. The run is stored under
+  `~/.dory-readiness/20260711T184922Z-22449`.
+- A second strict Dory/OrbStack run enabled host-file-to-inotify propagation and passed with
+  **29 passes, 0 failures** on both engines (`~/.dory-readiness/20260711T185206Z-27556`).
+- All committed guest assets converged and passed deterministic provenance verification: arm64
+  headless, arm64 GPU, and amd64. Repeating the arm64 build reproduced the same fingerprint, and
+  switching build contexts did not allow one variant to reuse another variant's outputs.
+- The exact arm64 0.3.0/17 archive was rebuilt from those assets after the final state-lock,
+  virtiofs, dataplane, migration, bind, prune, and clean-install Buildx changes. The app and every
+  nested executable, including `dory-dataplane-proxy` and `docker-buildx`, pass strict recursive
+  Developer ID verification and the clean-Mac bundle/payload checks.
+  `release-build/Dory-0.3.0-arm64.zip` is 428 MiB with SHA-256
+  `c0afcbf75d6176de9166c803b7ee2614e9a2142f086587ccb81699241a11aab7`; the exact standalone
+  runtime is SHA-256 `f7babb2f5e8b37fd2ac7b3b9f38bb93223dc1d44fddcb601f4255ca9e20b7fd1`.
+  The lite ZIP is `1adaeaada006edfdc1a0558608abc5df816bc298384b332252dad32cb5fd0dc7`
+  and the app-update ZIP is
+  `5c6d3a5278c8ecebc1423b97ff36b6895edb7d7a569cb577119110a0b40d30e3`.
+  These are qualification artifacts, not distributable artifacts: they are not notarized or
+  stapled, and the DMG was intentionally omitted after local `hdiutil` ran out of scratch space.
+- A live migration reproduction now covers the user-visible failure where images imported but
+  volumes and containers did not. The owned smoke imported image archives, named-volume bytes,
+  networks, full create configuration, bind/volume mounts, stopped/running state, and an untagged
+  container recovered through a temporary snapshot. Name collisions fail closed instead of
+  overwriting unrelated target data. The same real OrbStack migration passed against the exact
+  packaged runtime in a blank isolated home. The marker-based harness now requires an acknowledgement
+  written only after the Docker fixture finishes, preventing a skipped XCTest from being reported as
+  a live pass. A new real-OrbStack run reproduced the exact failure as a daemon-local committed
+  image ID that Dory could not resolve after archive load. Writable-layer snapshots now fall back
+  to Dory's unique preserved archive tag when the receiving daemon normalizes the image ID. The
+  fixed real OrbStack run passed all **66 migration tests** and preserved the two named volumes,
+  network, paused/stopped state, writable layer, fixed port, and exact source/target baselines at
+  `~/.dory-final-candidate/current-worktree/evidence/real-orbstack-migration-alpine-20260712T160241Z-65303`.
+  The earlier real
+  fixture took 18.802 seconds, preserved volume bytes and container settings, returned both engines
+  to their original image inventories, and produced
+  `~/.dory-final-candidate/20260712T035458Z/live-orbstack-migration/Test-Dory-2026.07.12_03-47-12-+0000.xcresult`
+  (copied out of disposable DerivedData before cache cleanup).
+  A further regression now forces the deleted-tag/content-ID fallback while copying a named volume;
+  it proves the source helper uses the still-valid immutable ID while the target helper uses the
+  restored name, preventing an image-success/volume-failure split. If the target daemon normalizes
+  that immutable ID, Dory binds the newly loaded dangling image directly and cleans failed-attempt
+  candidates instead of leaking disk space or unnecessarily committing the source container. A
+  bare source-only content ID is rebound under a valid portable Dory reference, while failed
+  start/pause restoration removes only the new partial container so a retry is not name-blocked.
+- Persistent engine disks now have two independent protections in current source: the headless
+  launcher always supplies a private explicit state directory, and both raw-HV and VZ helpers take
+  an exclusive lock before attaching storage. A live two-engine collision was rejected without
+  harming the first VM; five isolated cold-start cycles completed in 10–13 seconds, stopped in 3
+  seconds, leaked no helper, and left the active disk and protected stopped container unchanged.
+  The final exact packaged runtime then rejected a second same-state VM while the first stayed
+  healthy (`~/.dfc-final-evidence/state-lock-collision.txt`). The latest rebuilt signed runtime
+  passed five fresh-home cycles with 7–14 second starts and 1 second stops at
+  `~/.dfc5/20260712T035643Z-68876`.
+- Current source also reads the ext4 superblock's declared filesystem length before attaching an
+  existing Docker data disk. A disk whose sparse logical tail was truncated by macOS migration or a
+  backup tool now fails closed with the actual and required byte lengths; focused valid, truncated,
+  and legacy-clone tests pass. The exact packaged runtime rejected a 4,194,304-byte disk whose ext4
+  superblock required 8,388,608 bytes before VM attachment; evidence is
+  `~/.dory-final-candidate/20260712T030022Z/truncated-disk-gate.txt`.
+- Exact-candidate virtiofs passed the Rancher Desktop bind-ownership reproduction: the guest saw
+  UID/GID 999, another UID-999 container wrote successfully, and host APFS ownership stayed 501:20.
+  Unit coverage includes refreshes, hard links, and host replacement.
+- Current source now maps `/Volumes` into both app and standalone guests at the identical path and
+  adds fail-fast host-FIFO, 10,000-open FD-stability, and restrictive hard-link runtime cases. The
+  gate now requires an operator marker at the dedicated APFS volume root before it may unmount the
+  device, rejects missing-drive shadow writes within ten seconds, remounts, and revalidates bytes
+  and hard links. Publication still requires those cases on a writable physical external APFS
+  drive; no such drive is attached to this Mac today.
+- Machine resource updates now reject values outside the UI's 1–8 CPU / 1–16 GiB contract before
+  stopping or mutating a machine. The focused 23-test MachineManager selection and 30-test app
+  runtime-support suite pass. A new isolated exact-artifact gate cycles 1→8→2 CPUs and
+  1→16→4 GiB while verifying guest resources and persistent disk state; it still needs a signed
+  candidate with its daemon and machine assets running.
+- Required Linux-machine provisioning no longer has a silent-success path. Nonzero and timed-out
+  install/verify stages fail, unsupported recipes are rejected before creation, the app removes a
+  newly created VM when setup fails, and the legacy container-machine path removes an incomplete
+  machine instead of announcing readiness after identity setup failed. The focused Xcode 26.6 run
+  passed all 36 machine-provisioning/client tests, including rollback. The exact-candidate machine
+  gate now also installs `k8s-lab` and independently verifies `kubectl`, covering Lima #5225.
+- The installed app passed a complete amd64 Node/npm BuildKit build/test/runtime smoke. This proves
+  common non-native development workflows, not qemu-heavy SQL/Oracle/AVX workloads.
+- The installed app network contract passed VPN, explicit DNS, registry IPv4, TCP, UDP, and host
+  state preservation. Current source additionally proved TCP publishing on `127.0.0.1` and `[::1]`.
+  The exact packaged standalone runtime uses the same Rust Docker-create dataplane and passed VPN,
+  explicit DNS, registry IPv4, TCP, IPv6 localhost, UDP, and host-state preservation at
+  `~/.dory-exact-candidate/20260712T012352Z/evidence/network-contract/20260712T012615Z-33591`.
+  Exact-candidate external IPv6 and physical LAN/Tailscale source-IP certification remain open.
+- LAN opt-in no longer risks widening an explicit loopback Docker binding after the guest-side
+  compatibility rewrite. The dataplane records a spoof-resistant port-family intent label; live
+  `lsof` evidence showed explicit TCP/UDP only on `127.0.0.1`, while a wildcard bind alone listened
+  on the LAN wildcard.
+- The live stale-bind reproduction passed same-inode shrink/grow/content refresh, atomic
+  replacement, and guest-to-host truncation. The destructive isolated prune contract also passed:
+  protected running state and volume bytes survived while unused containers, images, networks,
+  volumes, and BuildKit cache were removed. Both gates were repeated against the exact packaged
+  runtime (`~/.dory-exact-candidate/20260712T012352Z/home/evidence/bind-file-coherence/20260712T012700Z-34993`
+  and `~/.dory-exact-candidate/20260712T012352Z/home/evidence/prune-safety/20260712T013219Z-42935`).
+- The refreshed bind gate now covers Lima's space-containing mount-path failure and Apple
+  container's intermittent direct single-file mount. A current-source disposable runtime kept a
+  spaced directory bind and a direct file bind coherent through same-inode shrink/grow/content
+  changes. On atomic replacement it matched native Linux exactly: the directory view followed the
+  new pathname while the direct bind remained on its original inode; recreating the direct bind
+  immediately attached the replacement. A write through the direct file truncated the host file,
+  and 20 additional fresh container attachments read the exact final bytes. Shutdown ended in
+  `powerOff`; development evidence is under
+  `~/.dory-new-gate-evidence/20260713T-spaced-direct-bind-current-final`. This previously standalone
+  gate is now part of final qualification, with retained verification of every phase, all host /
+  directory / direct size and digest columns, image and Docker CLI identity, and result integrity.
+- Standalone legacy-data discovery is now resolved from the launcher's explicit `HOME`, not
+  Foundation's cached account home. A fresh isolated runtime proved zero initial containers and
+  volumes before its prune fixtures were loaded. The supervisor also rejects planted non-socket
+  paths and unrelated/recycled PID-file values.
+- The final signed bundle now includes pinned Docker Buildx v0.34.1 and installs Buildx/Compose
+  plugins without replacing regular files or third-party symlinks. Using only the candidate's
+  bundled Docker and Buildx clients, the exact engine rejected an anonymous private-registry pull,
+  accepted login, pulled and ran the image, authenticated a normal `docker build`, kept a random
+  BuildKit secret out of image history, pushed, and survived save/load. Evidence:
+  `~/.dory-exact-candidate/20260712T012352Z/home/evidence/final-bundle-private-registry/20260712T020743Z-61149`.
+- The competitor-derived offline gate and `git diff --check` pass after the latest state-lock,
+  binfmt, image-trust, network-contract, and ownership additions.
+- The split release workflow passes YAML parsing and semantic Actions linting with the repository's
+  self-hosted runner labels declared. Offline release tests reject an invalid source-commit
+  binding, altered duration evidence, shortened/unnotarized completion records, a different workflow
+  run or attempt, any changed candidate artifact, and a Homebrew SHA that differs from the qualified
+  manifest. The long job retains no checkout credential and has no publication permission.
+  Every workflow action is commit-pinned; the release and Intel workflows now initialize temporary
+  paths through `RUNNER_TEMP` inside steps instead of using the invalid job-level `runner.temp`
+  expression that would prevent those hardware jobs from starting.
+- The exact-artifact qualifier now runs a disposable two-engine production migration before its
+  competitor and duration gates. Retained, tamper-checked evidence is required for images, two
+  named volumes, a 64 MiB checksum, metadata/symlink/hard-link preservation, custom IPAM, paused and
+  stopped state, writable layers, fixed-port handoff, and exact source/target baseline restoration.
+  The same qualifier pins Testcontainers 12.0.4 and requires Ryuk, dynamic-port, HTTP-wait, response,
+  and cleanup evidence, plus version-bound Dev Containers, `act`, LocalStack, Tilt Compose,
+  k3s/Skaffold/Tilt Kubernetes, and the full default Supabase stack. Offline tests reject recomputed
+  hashes when migration, socket, loopback, workflow, Kubernetes NodePort-listener, or Supabase
+  guest-socket proof is removed.
+
+## Release blockers
+
+- [x] Finish and converge the deterministic amd64 guest asset, then verify all committed arm64,
+  arm64-GPU, and amd64 fingerprints and compressed artifacts.
+- [ ] Notarize and staple the exact signed 0.3.0/17 arm64 candidate, then validate the final ZIP and
+  appcast artifacts. The signed candidate exists and passes recursive signature and payload checks,
+  but this Mac has neither a `dory-notary` keychain profile nor local `NOTARY_APPLE_ID`,
+  `NOTARY_TEAM_ID`, and `NOTARY_PASSWORD` values. `stapler validate` correctly reports that no
+  notarization ticket is attached. The candidate was therefore not installed over the user's
+  working Dory state.
+- [ ] Build and validate the final DMG on a release host with adequate scratch space. Two local
+  `hdiutil create` attempts failed with `No space left on device`; ZIP, app-update ZIP, lite ZIP,
+  headless tarball, checksums, and the non-public manifest were produced successfully without DMG.
+- [ ] Run the signed-candidate live smoke on a dedicated **physical Apple-silicon** release host
+  with Gatekeeper assessments enabled. This development Mac has Gatekeeper assessment disabled and
+  cannot provide that trust evidence.
+- [ ] Configure repository variable `DORY_EXTERNAL_VOLUME_TEST_ROOT` to a dedicated writable
+  directory on physical external APFS media attached to the release runner. Both direct-download
+  and Sparkle candidates now fail closed unless that path passes real bidirectional bind I/O,
+  restrictive hard links, 64-bit capacity reporting, FIFO fail-fast, 10,000-open FD stability, a 64 MiB checksum, and
+  sleep/wake persistence. The operator must also create
+  `<volume-root>/.dory-release-external-volume` containing exactly
+  `DORY-DEDICATED-RELEASE-APFS-V1`; this is the explicit authorization for the gate to unmount,
+  reject missing-drive/internal-shadow writes, and remount that whole dedicated volume.
+- [ ] Run the exact-candidate cross-container bind advisory-lock gate. Current source and 59 focused
+  FUSE tests implement and prove owner-isolated POSIX ranges and BSD `flock`, `GETLK`, blocking
+  acquisition, interrupt cancellation, partial unlock, flush/direct-release cleanup, and reset.
+  Both notarized app paths and long qualification now require the digest-pinned live gate to prove
+  shared/exclusive conflicts, contended upgrade/retry, disjoint ranges, blocking wakeup, explicit
+  unlock, forced-container crash release, and mode-0000 exclusive-create/unlink through the real
+  guest bind mount.
+- [x] Implement Docker Desktop-compatible SSH-agent forwarding without passing host sockets through
+  virtiofs. The raw-HV and macOS 14 VZ runtimes now bridge only the configured same-user agent over
+  vsock to `/run/host-services/ssh-auth.sock`; host connects reject symlinks/wrong owners and have a
+  two-second deadline. The rebuilt arm64 guest agent/rootfs passed provenance verification, and an
+  isolated raw-HV live run passed one plus eight concurrent clients with only identity hashes
+  retained at `~/.dory-new-gate-evidence/20260713T012556Z-ssh-agent-capped`.
+- [ ] Repeat the SSH-agent gate through both exact notarized app paths and long qualification, and
+  require fresh-boot plus restart proof on the physical macOS 14 VZ runner. Publication now binds
+  that evidence to `DORY_RELEASE_SSH_CLIENT_IMAGE` and rejects missing or mismatched identity/image
+  digests.
+- [x] Re-enable macOS UI automation for the rebuilt DoryUITests runner and pass the new machine
+  resource-boundary flow. The focused regression and the complete eight-test scheme both passed
+  with the Xcode 26.6 toolchain; the retained xcresult above is from the rebuilt runner.
+- [ ] Run the exact signed-app machine resource/provisioning gate, which now executes from the clean
+  physical candidate smoke, requires a real `k8s-lab` install plus independent `kubectl`
+  verification, and hashes the candidate `dorydctl`, kernel, and rootfs. Source validation is
+  green, but no exact signed candidate contains these changes.
+- [ ] Run the exact public v0.2.0/16 → candidate → v0.2.0/16 upgrade/rollback gate on a clean release
+  account and prove stable image, network, container, and volume IDs, writable data, settings, and
+  running/stopped state.
+- [ ] Roadmap after the Apple Silicon release: run physical Intel validation before publishing any
+  Intel or universal artifact. It is not a blocker for the current arm64 release.
+- [ ] Configure the dedicated GitHub release runners. A live API check on 2026-07-13 reports
+  **zero** self-hosted runners. Release jobs require the `release`, `sonoma`, and `lan` label sets
+  in addition to `[self-hosted, macOS, arm64, dory]`. The Apple-silicon release runner also needs at
+  least 30 GiB free and a persistent HOME shared by the qualification and fresh-token publication
+  jobs, continuous AC power, associated Wi-Fi, and narrowly configured passwordless access to
+  `pmset relative wake`/`pmset sleepnow` for the five-cycle physical sleep gate. It must also be
+  connected to the release corporate VPN with the configured split-DNS resolver and internal HTTPS
+  probe reachable from macOS and containers; missing
+  runner-local evidence fails closed.
+- [x] Split exact-candidate qualification from publication in the release workflow. The candidate
+  job now writes a schema-2 manifest bound to the full source commit, stages immutable artifacts,
+  and cannot publish. A separate dedicated-runner job downloads those bits before its token expires,
+  first requires the isolated 16→128 GiB growth/discard/persistence gate, disposable two-engine
+  production migration, pinned Testcontainers/Ryuk compatibility, the full version-bound
+  Dev Containers/`act`/LocalStack/Tilt/Skaffold/k3s/Supabase ecosystem gates, and bounded
+  concurrent-backpressure/restart-churn/port-recovery gate plus the digest-pinned two-container
+  bind advisory-lock gate, then runs the
+  eight-hour endurance and 25-hour dual-path network gates concurrently, and writes an atomic
+  runner-local completion record only after both pass. Publication starts in a later job with fresh
+  credentials, re-downloads and rehashes the candidate, verifies every retained evidence digest,
+  independently parses the growth, competitor, same-connection, managed-machine-to-Docker RTT,
+  cycle, and resource-plateau
+  results plus run/attempt/commit/duration binding, and now also requires a display-neutral
+  `caffeinate -is` assertion with continuous AC-power samples spanning the 25-hour connection.
+  It revalidates notarization and Sparkle, and only
+  then creates the GitHub release. Offline workflow and fail-closed confirmation regressions pass; executing the path
+  still depends on the dedicated release runner and the two duration gates below.
+- [x] Reject development-only XCTest runners/test bundles and nonportable runner-local artifact
+  paths from the public app, Sparkle archive, and schema-2 release manifest.
+- [x] Configure the repository-scoped `HOMEBREW_TAP_DEPLOY_KEY` for `Augani/homebrew-dory`. The
+  verified write-enabled public deploy key is installed on the tap and its private half is stored
+  only as an encrypted Dory Actions secret; the broad personal OAuth token was not copied. Release
+  preflight clones through authenticated SSH and performs a non-mutating dry-run branch push before
+  any build starts.
+- [ ] Configure the four physical-peer secrets (`DORY_LAN_PEER_SSH`, `DORY_LAN_HOST_IPV4`,
+  `DORY_TAILSCALE_PEER_SSH`, `DORY_TAILSCALE_HOST_IPV4`). The digest-pinned
+  `DORY_SOURCE_GATE_IMAGE`, `DORY_RELEASE_ALPINE_IMAGE`,
+  `DORY_RELEASE_NONNATIVE_BUILD_IMAGE`, and `DORY_RELEASE_SSH_CLIENT_IMAGE` repository variables
+  were configured and live-verified on 2026-07-13; every reference contains an exact `@sha256:`
+  digest. Still set `DORY_CORPORATE_DNS_SERVER`,
+  `DORY_CORPORATE_VPN_PROBE_HOST`, and `DORY_CORPORATE_VPN_PROBE_URL`; the URL must use the exact
+  split-DNS hostname over HTTPS, plus `DORY_EXTERNAL_VOLUME_TEST_ROOT` for the marked physical APFS
+  test volume. The live API check confirms the tap deploy key is configured, while the four
+  environment-specific variables and four physical-peer secrets are absent; the six Developer ID,
+  keychain, notarization, and Sparkle secret names are present. GitHub does not expose secret
+  values, so the five-minute release preflight validates presence, image pinning, and an
+  authenticated dry-run tap push before any build starts.
+- [ ] Execute the real Sparkle updater install/relaunch gate on the exact notarized candidate. The
+  release workflow now builds the updater CLI from the `Package.resolved`-pinned Sparkle 2.9.4
+  revision, feeds it the byte-identical signed archive, requires the running previous app to exit
+  and a different candidate PID to relaunch, compares the complete installed app tree, revalidates
+  Gatekeeper, preserves workload/settings state, and rolls back. Its offline/fail-closed tests and
+  pinned-tool build pass locally; exact-candidate execution still requires the clean release user.
+- [x] Pass the exact signed `Dory UI Tests` scheme after the user approved macOS's one-time
+  UI-automation request. All eight tests passed with zero failures or skips, including the full
+  CPU/memory boundary flow; the retained xcresult is bound to the Apple-Silicon host and records
+  the launch-performance measurements. No authentication session was terminated or bypassed.
+- [ ] Execute exact-candidate physical sleep/wake with host Wi-Fi/DNS/route integrity. The direct
+  notarized-candidate workflow now schedules a 30-second hardware wake and performs five real
+  sleeps under the explicit `SLEEP-AND-WAKE-THIS-MAC` token. It binds app/helper hashes and
+  commit/run/attempt, and publication rejects short/no-op sleep, missing wake logs, failed cycles,
+  changed route/DNS/proxy/resolver contracts, an inactive VPN, a missing configured corporate
+  resolver, an unreachable internal HTTPS probe, or mismatched hashed private-network inputs. Each
+  cycle also holds a real isolated Dory machine shell open before sleep, disconnects the client
+  after wake, and must recover fresh exec plus stop/start with its disk marker intact. The verifier
+  binds `dorydctl`, kernel, and rootfs hashes and rejects missing session/reconnect evidence or a
+  wedged machine state. The dedicated runner must allow passwordless
+  `pmset relative wake` and `pmset sleepnow`; this development Mac is never slept by offline tests.
+- [ ] Complete the now-mandatory exact-candidate physical LAN and Tailscale peer gates on both raw
+  HV and macOS 14 VZ for the implemented overlap-safe original-source IPv4 contract (TCP, UDP,
+  loopback isolation, helper/engine restart, unpublish, PF/route/reference/forwarding cleanup). Also decide
+  whether native container IPv6 is a 0.3 requirement; only dual-stack host localhost is proven.
+- [ ] Complete an eight-hour resource/file/API soak on the exact final notarized candidate. The
+  current source no longer registers whole-home or whole-`/Volumes` FSEvents roots: it observes
+  only top-level roots actually resolved by bind traffic. The soak now also fails if host
+  `fseventsd` grows by more than 128 MiB across disjoint median windows or ends above 25% median CPU.
+  older-app run reached 1,077 successful cycles over about 4.6 hours but became invalid when its
+  shell source changed while Bash was still reading it; it is not counted as release evidence. A
+  later exact-candidate attempt reached 445 passes before disk exhaustion made its logs unwritable;
+  it is also excluded. Two further runs were intentionally stopped when migration audits exposed a
+  cross-daemon dangling-image leak and retry-blocking partial-container edge. The rebuilt signed,
+  unnotarized candidate passed a three-cycle Compose-heavy plateau preflight. Its later baseline
+  completed 3,969 passing cycles over exactly 28,800 seconds with a fail-closed reserve, but source
+  changes after that run make it supporting rather than final release evidence.
+- [ ] Complete the opt-in 90,000-second same-connection published-TCP, managed-machine-to-Docker
+  RTT, and managed-machine outbound-TCP gate on the exact final candidate. This is longer than the
+  normal endurance run by design: OrbStack
+  [issue #2468](https://github.com/orbstack/orbstack/issues/2468) reports active connections dropping
+  at exactly 24 hours, while [issue #2587](https://github.com/orbstack/orbstack/issues/2587) reports
+  repeated 200/400 ms service round trips only after uptime. The gate therefore keeps the original
+  TCP tuple while a Dory-shaped managed-machine container samples `host.docker.internal` and an
+  independently resolved external IPv4 TCP endpoint every 30 seconds. This also covers Rancher
+  Desktop #6943's VM-to-host packet drops: publication recomputes local p99/sustained latency plus
+  the outbound failure rate and consecutive-failure run from separate raw TSVs. The new eight-second
+  current-source run passed all eight local and external samples at
+  `~/.dory-new-gate-evidence/20260713T-machine-outbound-short-live` (archive SHA-256
+  `571363d475bcbbd5c2221f8777bd7c4596a6125d980d4f112e32a541c99cbaf6`), but cannot close the
+  duration edge.
+- [x] Remove remote-freshness coupling from cached engine boot. The standalone launcher now accepts
+  the prepared local kernel when the compressed source asset is unavailable, but still fails closed
+  when both are missing. The mandatory exact-candidate gate boots once from bundled compressed
+  kernel/rootfs bytes under dead proxies, hides those source files only in a disposable APFS clone,
+  and boots again from the unchanged prepared cache while recording zero host TCP dependencies.
+  Current-source evidence passed both graceful phases at
+  `~/.dory-new-gate-evidence/20260713T-offline-cached-boot-current` (archive SHA-256
+  `2a87b1316c7b5441cdc2fa677e993ac14b3e8f9dd9ab5e9e9497834aa782cb57`), covering Lima #5188's
+  cached-image/remote-HEAD failure class without claiming final-artifact certification.
+- [x] Make default multi-platform pull/storage semantics publication-bound. The qualifier now starts
+  with the digest-pinned fixture absent, pulls it without `--platform`, requires a Linux arm64 image
+  and default arm64 container, and re-parses the retained `image inspect`, `/images/json`, and
+  `/system/df` records. Image-list and system-df storage bytes must match exactly; Docker's different
+  inspect-size definition must remain within a 16× bound and all layer bytes must be attributable to
+  the one local image. Current-source evidence passed with a 3.245× cross-definition ratio at
+  `~/.dory-new-gate-evidence/20260713T-default-arm64-image-current` (archive SHA-256
+  `53482aa679d45644fc4169b17c9796b307e06af6cda86be7ce4fbcaf5608ae95`), covering Apple container
+  #1537 without importing its all-platform unpack/storage-reporting failure.
+- [x] Add the exact `linux/amd64` Nix 2.34.7 garbage-collection regression without Rosetta. The
+  qualifier explicitly enables Dory's bundled non-native runtime, requires the digest-pinned
+  image to be absent, pulls the amd64 manifest, creates an unreachable Nix store path, runs
+  `nix-collect-garbage --delete-old`, proves that path was deleted, rechecks Docker API liveness,
+  and removes the owned image. Current-source evidence passed at
+  `~/.dory-new-gate-evidence/20260713T-nonnative-nix-gc-current` (archive SHA-256
+  `90a302bc13141272b98801a898f18a6ff915cf25e9535a1dfee13ed6d7d15a5d`), covering OrbStack #2538
+  and the no-Rosetta BuildKit expectation in Apple #1825. Exact notarized replay remains required.
+- [x] Replace the qemu-user amd64 path with provenance-pinned FEX 2607 and cover Docker plus
+  BuildKit's direct runc executor with Dory's fail-closed OCI wrapper. The fresh source-built gate
+  pulled the exact digest-pinned Arch amd64 manifest and passed the unmodified
+  `RUN pacman -Sy --noconfirm fzf`: alpm installed its nested seccomp filter, switched to the
+  sandbox user, installed and ran fzf as x86_64, kept the Docker API live, and removed all owned
+  artifacts. Evidence:
+  `~/.dory-new-gate-evidence/20260713T-fex-production-final-source/20260713T084212Z-19899/manifest.txt`.
+  The qualifier continues to forbid `--disable-sandbox`; final notarized-artifact replay remains
+  mandatory.
+- [ ] Configure a dedicated disposable ECR repository and short-lived CI credentials, then certify
+  authenticated manifest PUT and interrupted large-layer upload recovery on the exact notarized
+  candidate. Local registry auth/push and a fresh Docker Hub manifest pull already pass, but Apple
+  container #1707/#1895 and containerization #790 specifically involve ECR retry semantics and
+  cannot be closed by the local registry. The release remains NO-GO until resumed push, repull/run,
+  credential cleanup, and repository cleanup are retained without exposing secrets.
+- [x] Rebuild the signed candidate with the state-lock, virtiofs ownership, standalone dataplane,
+  explicit legacy-state isolation, prune/bind-coherence gates, binfmt probe, and IPv6-localhost
+  changes plus bundled Buildx; rerun the exact-runtime migration, network, bind, prune, state-lock,
+  ownership, private-registry, app-update-payload, and five-cycle cold-start gates.
+
+## Market-claim guardrails
+
+Do not publish “best in market” or blanket performance/memory superiority claims yet. Existing
+evidence supports strong compatibility and migration claims, but some cold workflows are ties,
+bind-mounted npm remains a measured weakness, and native IPv6, LAN/source-IP,
+and exact-candidate endurance coverage are not complete. Publish only benchmark claims tied to
+reproducible campaign output and named hardware.
+
+## Public-release exit criteria
+
+The decision changes to GO only when every release blocker above has an attached artifact, log, or
+runner URL; the exact signed/notarized bits pass the live and upgrade/rollback gates; the Homebrew
+cask references those same immutable bits; and no P0/P1 failures remain open.

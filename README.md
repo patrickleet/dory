@@ -7,9 +7,12 @@
 <p align="center">
   <b>Docker &amp; Linux containers, native to your Mac.</b><br>
   A free, open-source alternative to Docker Desktop and OrbStack. One self-contained SwiftUI app
-  that ships its own engine, Docker tools, Kubernetes tooling, and one shared VM for a fraction
-  of the memory.
+  that ships its own engine, Docker tools, Kubernetes tooling, and one shared VM for all
+  containers.
 </p>
+
+> **Platform focus:** the production release is for Apple Silicon Macs. Intel support is a later
+> roadmap phase and is not included in current public artifacts or Homebrew installs.
 
 <p align="center">
   <a href="https://github.com/Augani/dory/stargazers"><img src="https://img.shields.io/github/stars/Augani/dory?style=flat&logo=github&color=2E9BF5" alt="GitHub stars"></a>
@@ -32,16 +35,26 @@
   [`scripts/benchmark-compare.sh`](scripts/benchmark-compare.sh) and the public
   [benchmark playbook](BENCHMARKS.md); Dory does not publish a memory multiplier until total
   process-tree measurements against current competitors are repeatable.
-- **Small and silent, permanently.** A native app with ~0% idle CPU. No indexers, no
-  phone-home, no fans. That's a design constraint, not a version note.
+- **Designed to stay quiet at idle.** A native app with no indexers, bundled browser, or
+  phone-home loop. Every release candidate must pass the attributed eight-hour CPU/RSS/FD plateau
+  gate; exact numbers are published only with the matching immutable-candidate evidence.
 - **Free for everyone, forever.** No per-seat license, no "commercial use" tier, no account,
   no sign-in. GPL-3.0, full source right here. (A [sourced comparison](website/public/comparison.md)
   exists if you want one, so judge for yourself.)
-- **Your `docker` CLI just works, even on a clean Mac.** Dory bundles the Docker CLI, Compose
-  plugin, and `kubectl`, serves the Docker API on `~/.dory/dory.sock`, and registers a `dory`
+- **Your `docker` CLI just works, even on a clean Mac.** Dory bundles the Docker CLI, Buildx,
+  Compose, and `kubectl`, serves the Docker API on `~/.dory/dory.sock`, and registers a `dory`
   Docker context. `docker run`, `docker compose`, your existing scripts and tools drive it
   unchanged, with the engine socket promoted over vsock so stdout, stderr, attach/exec, and stdin
   EOF behave like a normal Docker daemon.
+- **One managed data drive.** Images, containers, named volumes, custom networks, machine disks,
+  snapshots, and backups live together at
+  `~/Library/Application Support/Dory/Dory.dorydrive`. Replaceable sockets, logs, kernels, and VM
+  boot state stay in `~/.dory`; deleting or rebuilding that runtime state does not delete workloads.
+  Homebrew uninstall and `--zap` also preserve the data drive, so removing the app is never an
+  implicit request to erase containers or volumes. To move `DORY_DATA_DRIVE` outside Dory's
+  Application Support directory, it must be a `.dorydrive` on mounted local APFS storage under `/Volumes`; privacy-protected Desktop,
+  Documents, Downloads, iCloud, and CloudStorage paths are rejected before the engine starts so a
+  cold launch cannot depend on a transient macOS permission grant.
 - **Native, not Electron.** One Swift/SwiftUI app: menu-bar agent + full dashboard, launch
   animation to launch-at-login, light and dark. No Chromium, no Node, no telemetry.
 
@@ -52,9 +65,11 @@
   restart / delete from the UI or CLI.
 - Images: pull, **build** from a context folder, run, prune, **registry sign-in**, full inspect.
 - Volumes (with a file browser) and networks (subnet / gateway / attached-container inspect).
+- Bind mounts keep native macOS paths for both your home and attached drives under `/Volumes`, so
+  `-v /Volumes/MySSD/project:/app` targets the real external disk instead of guest-only storage.
 - **Compose**: `up` / `down` with `.env` + variable interpolation, `depends_on` ordering, and
   `service_healthy` waiting.
-- Bundled host tools: Docker CLI, Docker Compose v2, and `kubectl` are shipped inside Dory.app;
+- Bundled host tools: Docker CLI, Buildx, Docker Compose v2, and `kubectl` ship inside Dory.app;
   while doryd is running it keeps `~/.dory/bin` and the `dory` Docker context reconciled so clean
   Macs do not need Docker Desktop, Homebrew, or a manual install step.
 
@@ -77,8 +92,9 @@
 - `dory mode` and `dory idle status` expose the Auto-Idle foundation; `dory idle proxy` can run
   the opt-in always-listening socket proxy for headless dogfooding. The proxy wakes a sleeping
   headless engine on Docker API use, forwards the request, and records its idle/wake state.
-- In the app-managed path, Dory can attach to a sleeping `doryd` without waking `dory-hv`, and the
-  idle policy stops an empty engine while keeping Docker and machine state on disk.
+- In the app-managed path, opening Dory is an explicit wake signal: the app asks `doryd` to make
+  Docker usable, while the idle policy can later stop an empty engine without discarding Docker or
+  machine state.
 
 **Kubernetes, one click**
 - k3s inside the shared VM with selectable Kubernetes versions.
@@ -90,9 +106,15 @@
   use-case recipes (Node, Python, Go, Rust, …) that provision the machine ready-to-code,
   plus a composer to hand-pick runtimes, tools, and packages. Machines are real isolated Linux VMs,
   not Docker containers.
+- The full app includes a supported baseline kernel/rootfs pair. Custom machine images use the
+  fail-closed [signed machine-image contract](MACHINE_IMAGE_CONTRACT.md); arbitrary DKMS or
+  kernel replacement inside the immutable Docker engine guest is intentionally unsupported.
 - Every machine has a `name.dory.local` address. The UI shows the copyable terminal command
   (`dory ssh <name>` or `dory machine shell <name>`), and custom addresses can be assigned during
   creation.
+- Running machines show real guest CPU and used/total memory on the two-second UI refresh. The
+  versioned `dorydctl machine stats <name>` JSON contract also reports network RX/TX, block I/O,
+  process count, and uptime; stopped or unreadable machines show `—`, never fabricated zeroes.
 - Your home directory is shared into the engine, so `docker run -v ~/project:/app` just works.
   Host shares intentionally use plain virtio-fs: DAX host-share options are rejected until Dory can
   quiesce guest CPUs across a failed reverse invalidation without risking stale reads or late writes.
@@ -108,19 +130,29 @@
 - **Apple GPU AI bridge**: run Metal-backed services on macOS, such as Ollama, LM Studio, MLX, or
   llama.cpp, and call them from Linux containers at `host.dory.internal` on ports `11434`, `1234`,
   or `18190`.
-- **In-guest GPU compute (experimental)**: an opt-in virtio-gpu **Venus/Vulkan** path — containers
+- **In-guest GPU compute (experimental, Apple silicon)**: an opt-in virtio-gpu **Venus/Vulkan** path — containers
   running Mesa's Venus driver see the Apple GPU through virglrenderer → MoltenVK → Metal
   (`vulkaninfo` enumerates it, compute queues included). Toggle it in Settings; the renderer ships
   inside the app. Not raw GPU passthrough; fences and heavy async workloads are still maturing.
-- **Intel (x86/amd64) images** run on Apple silicon via an opt-in QEMU emulation toggle — on
-  Dory's own engine, no separate VM.
+- **Intel (x86/amd64) images** run on Apple silicon through Dory's bundled FEX runtime — enabled by
+  default for new installs, on the same engine and network, with nested seccomp support for package
+  managers and BuildKit. No separate x86 VM or Rosetta install.
 
 **Zero-friction start**
 - On supported Macs, Dory ships its bundled engine, kernel, networking helper, Docker tools,
   Compose, and Kubernetes tooling. No Docker Desktop, Colima, OrbStack, Homebrew, or Apple
   `container` install is required for the built-in shared-VM path.
-- **Migration** imports your images and containers from Docker Desktop or OrbStack, with a preflight
-  confidence report that lists what transfers, what needs attention, and the estimated image disk.
+- **Migration** imports images, container writable-layer files, named-volume data, custom networks,
+  and full container definitions
+  from Docker Desktop or OrbStack, preserving running/stopped state. Its preflight report lists what
+  transfers, what needs attention, and exact volume/capacity requirements; collisions and
+  nonportable contracts fail closed instead of overwriting unrelated Dory data. Empty, detached,
+  contract-compatible same-name volumes can be adopted after preflight while preserving labels;
+  failed adoption restores the original empty volume metadata. Non-empty or attached conflicts
+  remain blocked. Dory never pauses source workloads implicitly: a running container with writable
+  volume or container-layer changes must be stopped or paused by the user before its data is copied,
+  preventing torn database and filesystem snapshots. Sparse engine disks grow to 128 GiB and use virtio
+  discard at boot/shutdown to return deleted ext4 blocks to macOS before capacity admission.
 - **Managed settings** exposes local, MDM-friendly defaults for engine route, domains, DNS/proxy
   ports, Auto-Idle, file sharing, scoped mounts, credential-store hiding, env allow-list, and
   telemetry mode `none`.
@@ -137,18 +169,16 @@ brew install --cask Augani/dory/dory
 drag Dory to Applications, and open it. First launch guides you through the rest; supported Macs do
 not need a separate Docker install.
 
-### Pick your flavor
+### Apple Silicon downloads
 
-Every release ships native app artifacts, so you install only what you need:
+The production release ships arm64 artifacts only:
 
 | Asset | What it is |
 |---|---|
 | `Dory-x.y.z-arm64.dmg` / `.zip` | **Full app** optimized for Apple silicon — zero prerequisites, works on a clean Mac |
-| `Dory-x.y.z-x86_64.dmg` / `.zip` | **Full app** optimized for Intel Macs — zero prerequisites, works on a clean Mac |
-| `Dory-x.y.z-universal.dmg` / `.zip` | **Full app** for both Apple silicon and Intel |
-| `Dory-x.y.z.dmg` / `.zip` | Compatibility alias for the universal build, used by the Homebrew cask |
+| `Dory-x.y.z.dmg` / `.zip` | Compatibility alias for the arm64 build, used by the Homebrew cask |
 | `Dory-x.y.z-lite.zip` | **App only** (~6 MB) — front an engine you already run (Colima, Docker Desktop, OrbStack, Rancher Desktop, Podman) |
-| `dory-engine-x.y.z-arm64.tar.gz` | **Headless engine runtime**, no GUI — `./dory-engine start`, then `docker context use dory-engine`. Colima-style |
+| `dory-engine-x.y.z-arm64.tar.gz` | **Headless engine runtime**, no GUI — `./dory-engine start`, then `docker context use dory-engine`. Colima-style; FEX/amd64 is on by default and `--no-amd64` is the opt-out. |
 
 ## Engine backends
 
@@ -163,23 +193,33 @@ reinstall, no environment variables:
 
 (`DORY_RUNTIME=shared|docker` remains as a development override.)
 
+### SSH agent forwarding
+
+Dory's built-in engine exposes the familiar guest socket
+`/run/host-services/ssh-auth.sock`. Mount it only into containers that need your host agent:
+
+```sh
+docker run --rm \
+  -v /run/host-services/ssh-auth.sock:/agent.sock \
+  -e SSH_AUTH_SOCK=/agent.sock \
+  your-image ssh-add -L
+```
+
+The socket is a dedicated same-user vsock bridge to the macOS `SSH_AUTH_SOCK`; it is not an
+arbitrary host Unix-socket passthrough and is not mounted into containers automatically. A process
+that can access an SSH agent can request signatures, so grant this mount only to trusted workloads.
+
 ## Requirements
 
-> **Intel engine status:** Dory now builds and routes a universal app with Intel shared-engine
-> tiers. On macOS 15+, the raw `dory-hv` x86 path is implemented and selected when its PVH assets
-> are bundled. Sonoma uses the bundled Virtualization.framework `dory-vmm` tier because the shipped
-> `dory-hv` slices require macOS 15. Full Intel readiness still needs the physical Intel Mac gates
-> in the roadmap before it is considered finished.
+> **Intel roadmap:** Intel implementation work remains in the source tree, but it is deliberately
+> outside the current production contract. Public releases, Sparkle updates, qualification, and the
+> Homebrew cask are Apple-Silicon-only until a later Intel hardware campaign is complete.
 
-- **Runs on macOS 14 (Sonoma) or later**, universal for Intel and Apple silicon. That matches
-  OrbStack's floor, so Dory installs anywhere OrbStack does.
-- **The raw `dory-hv` engine needs macOS 15 (Sequoia) or later** on both Apple silicon and Intel;
-  both shipped slices declare that minimum. It provides Dory's custom low-memory VMM path.
+- **Requires an Apple Silicon Mac running macOS 14 (Sonoma) or later.**
+- **The raw `dory-hv` engine needs macOS 15 (Sequoia) or later.** It provides Dory's custom
+  shared-VM VMM path.
 - **On macOS 14**, a full bundle routes the shared Docker VM through the bundled `dory-vmm`
   Virtualization.framework fallback instead of trying to launch an incompatible `dory-hv`.
-- **Intel Macs** run the same universal app. On macOS 15+, builds with Intel `dory-hv` PVH assets
-  use the raw engine as an Intel beta; Sonoma uses the amd64 `dory-vmm` fallback. Full Intel
-  readiness is still hardware-gated.
 - **On an install without bundled engine assets**, Dory runs as a native app against any
   Docker-compatible engine you install (Colima, Docker Desktop, Rancher Desktop, Podman, or
   OrbStack).
