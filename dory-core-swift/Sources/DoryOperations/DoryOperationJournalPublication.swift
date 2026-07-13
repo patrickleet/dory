@@ -14,11 +14,11 @@ extension DoryOperationJournalStore {
         }
         try prepareRoot(fileManager: fileManager)
         let lock = try acquireMutationLock()
-        try requireNoUnfinishedOperation()
         let destination = operationDirectory(for: plan.id)
         guard !Self.pathEntryExists(destination) else {
             throw DoryOperationJournalError.operationExists(plan.id)
         }
+        try requireNoUnfinishedOperation()
 
         let partial = root + "/." + plan.id.uuidString.lowercased() + "."
             + UUID().uuidString.lowercased() + ".partial"
