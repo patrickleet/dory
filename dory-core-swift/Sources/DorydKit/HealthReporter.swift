@@ -1322,26 +1322,31 @@ public final class HealthReporter: @unchecked Sendable {
                         }
                     }
                     : "unknown"
+                var data = [
+                    "path": drive.root,
+                    "drive_id": manifest.id.uuidString.lowercased(),
+                    "schema_version": String(manifest.schemaVersion),
+                    "created_at": manifest.createdAt,
+                    "available": "true",
+                    "allocated_bytes": String(allocated),
+                    "engine_disk_logical_bytes": String(diskLogical),
+                    "engine_disk_allocated_bytes": String(diskAllocated),
+                    "free_bytes": String(free),
+                    "total_bytes": String(total),
+                    "filesystem": filesystem,
+                    "manifest": drive.manifestPath,
+                ]
+                if let volume = manifest.volume {
+                    data["volume_uuid"] = volume.uuid.uuidString.lowercased()
+                    data["volume_name_at_creation"] = volume.nameAtCreation
+                }
                 return HealthCheck(
                     id: "disk.dory_drive",
                     status: .pass,
                     code: "disk.dory_drive_ok",
                     title: "Dory data drive is ready",
                     detail: "\(drive.root) — \(formatBytes(Int64(allocated))) physically allocated",
-                    data: [
-                        "path": drive.root,
-                        "drive_id": manifest.id.uuidString.lowercased(),
-                        "schema_version": String(manifest.schemaVersion),
-                        "created_at": manifest.createdAt,
-                        "available": "true",
-                        "allocated_bytes": String(allocated),
-                        "engine_disk_logical_bytes": String(diskLogical),
-                        "engine_disk_allocated_bytes": String(diskAllocated),
-                        "free_bytes": String(free),
-                        "total_bytes": String(total),
-                        "filesystem": filesystem,
-                        "manifest": drive.manifestPath,
-                    ]
+                    data: data
                 )
             }
         } catch {

@@ -134,6 +134,7 @@ final class DoryDataDriveTests: XCTestCase {
         XCTAssertEqual(manifest.kind, DoryDataDrive.manifestKind)
         XCTAssertEqual(manifest.schemaVersion, DoryDataDrive.schemaVersion)
         XCTAssertEqual(manifest.product, "Dory")
+        XCTAssertNil(manifest.volume)
         XCTAssertEqual(try drive.readManifest().id, manifest.id)
         let attributes = try FileManager.default.attributesOfItem(atPath: drive.root)
         XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o700)

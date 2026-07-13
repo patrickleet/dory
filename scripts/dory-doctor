@@ -87,6 +87,16 @@ def data_drive_path() -> Path:
     return Path(configured or (HOME / "Library" / "Application Support" / "Dory" / "Dory.dorydrive")).expanduser()
 
 
+def dory_hv_bin() -> Path | None:
+    configured = os.environ.get("DORY_HV_BIN") or os.environ.get("DORYD_HV_HELPER")
+    candidates = [Path(configured)] if configured else []
+    candidates.append(SCRIPT_DIR / "dory-hv")
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def shared_probe_root() -> Path:
     # The default whole-home share deliberately hides ~/.dory because it contains sockets, keys,
     # and VM state. Active probes must live in a visible sibling or Docker cannot resolve their
@@ -1730,6 +1740,33 @@ def data_drive_report() -> dict[str, Any]:
         "created_at": manifest["createdAt"],
         "allocated_bytes": directory_size(path),
     })
+    volume = manifest.get("volume")
+    if volume is not None:
+        try:
+            report["volume_uuid"] = str(uuid.UUID(str(volume.get("uuid"))))
+            report["volume_name_at_creation"] = str(volume["nameAtCreation"])
+        except (AttributeError, KeyError, TypeError, ValueError):
+            report["available"] = False
+            report["error"] = "invalid Dory data drive volume identity"
+            return report
+    helper = dory_hv_bin()
+    if helper is not None:
+        verified = subprocess.run(
+            [str(helper), "data-drive", "id", str(path)],
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+        if verified.returncode != 0 or verified.stdout.strip().lower() != drive_id:
+            report["available"] = False
+            report["error"] = compact(
+                verified.stderr or "Dory data-drive helper reported an identity mismatch"
+            )
+            return report
+    elif volume is not None:
+        report["available"] = False
+        report["error"] = "cannot verify external Dory data-drive volume identity without dory-hv"
+        return report
     try:
         usage = shutil.disk_usage(path)
         report.update({"total_bytes": usage.total, "free_bytes": usage.free})

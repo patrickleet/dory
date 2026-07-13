@@ -261,6 +261,11 @@ grep -F 'gvproxyQEMUSwitchGate' scripts/qualify-release-candidate.sh \
 grep -F '"nativeIPv6Gate": "PASS"' scripts/qualify-release-candidate.sh \
   scripts/verify-release-qualification.sh >/dev/null \
   || fail "release qualification does not record and verify native IPv6"
+grep -F 'scripts/data-drive-volume-identity-gate.sh' scripts/qualify-release-candidate.sh >/dev/null \
+  || fail "release qualification omits APFS data-drive volume identity"
+grep -F 'dataDriveVolumeIdentityGate' scripts/qualify-release-candidate.sh \
+  scripts/verify-release-qualification.sh >/dev/null \
+  || fail "release qualification does not publish APFS data-drive volume identity"
 grep -F -- '--require-external' scripts/qualify-release-candidate.sh >/dev/null \
   || fail "release qualification permits IPv6 proof without a real external route"
 grep -F 'body["EnableIPv6"] as? Bool == true' DoryTests/MigrationTests.swift >/dev/null \

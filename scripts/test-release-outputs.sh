@@ -25,10 +25,11 @@ RESOURCES="$APP/Contents/Resources"
 HELPERS="$APP/Contents/Helpers"
 LAUNCH_DAEMONS="$APP/Contents/Library/LaunchDaemons"
 mkdir -p "$RESOURCES" "$HELPERS" "$LAUNCH_DAEMONS"
-for helper in dory-dataplane-proxy docker-buildx dory-network-helper; do
+for helper in dory-dataplane-proxy docker-buildx dory-network-helper dory-hv; do
   printf '#!/bin/sh\nexit 0\n' > "$HELPERS/$helper"
   chmod 0755 "$HELPERS/$helper"
 done
+DORY_HV_SHA="$(shasum -a 256 "$HELPERS/dory-hv" | awk '{print $1}')"
 cp Config/dev.dory.network-helper.plist \
   "$LAUNCH_DAEMONS/dev.dory.network-helper.plist"
 printf '#!/bin/sh\nprintf "%%s\\n" "gvproxy version v0.8.9-dory1"\n' > "$HELPERS/gvproxy"
@@ -89,6 +90,11 @@ artifacts=(
 for artifact in "${artifacts[@]}"; do
   printf 'fixture:%s\n' "$artifact" > "$TMP/$artifact"
 done
+rm -f "$TMP/dory-engine-$VERSION-arm64.tar.gz"
+mkdir -p "$TMP/runtime-payload/dory-engine-$VERSION-arm64/bin"
+cp "$HELPERS/dory-hv" "$TMP/runtime-payload/dory-engine-$VERSION-arm64/bin/dory-hv"
+tar -czf "$TMP/dory-engine-$VERSION-arm64.tar.gz" \
+  -C "$TMP/runtime-payload" "dory-engine-$VERSION-arm64"
 rm "$TMP/Dory-$VERSION-app-update.zip"
 mkdir -p "$TMP/update-payload"
 cp -R "$APP" "$TMP/update-payload/"
@@ -323,6 +329,18 @@ container_writable_layer_persistence=PASS
 named_volume_persistence=PASS
 custom_network_persistence=PASS
 transient_runtime_replacement=PASS
+EOF
+mkdir -p "$QUALIFICATION_FIXTURE/evidence/data-drive-volume-identity/run"
+cat > "$QUALIFICATION_FIXTURE/evidence/data-drive-volume-identity/run/summary.txt" <<EOF
+status=PASS
+architecture=arm64
+external_volume_identity=PASS
+missing_volume_shadow_prevention=PASS
+same_name_wrong_volume_rejected=PASS
+original_volume_reaccepted=PASS
+drive_id=11111111-1111-4111-8111-111111111111
+volume_uuid=22222222-2222-4222-8222-222222222222
+dory_hv_sha256=$DORY_HV_SHA
 EOF
 cat > "$QUALIFICATION_FIXTURE/evidence/offline-bundled-boot/run/manifest.txt" <<'EOF'
 status=PASS
@@ -651,7 +669,7 @@ competitor_engine_settings_sha="$(
 cat > "$QUALIFICATION_FIXTURE/evidence/competitor-runtime/run/manifest.txt" <<EOF
 docker_bin_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 dory_engine_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-bin_dory_hv_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+bin_dory_hv_sha256=$DORY_HV_SHA
 bin_gvproxy_sha256=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
 bin_dory_dataplane_proxy_sha256=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 share_dory_dory_hv_kernel_arm64_lzfse_sha256=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
@@ -659,7 +677,7 @@ share_dory_dory_engine_rootfs_ext4_lzfse_sha256=11111111111111111111111111111111
 share_dory_dory_agent_linux_arm64_sha256=2222222222222222222222222222222222222222222222222222222222222222
 engine_settings_sha256=$competitor_engine_settings_sha
 EOF
-cat > "$QUALIFICATION_FIXTURE/evidence/standalone-supervisor-recovery/manifest.txt" <<'EOF'
+cat > "$QUALIFICATION_FIXTURE/evidence/standalone-supervisor-recovery/manifest.txt" <<EOF
 status=PASS
 healthy_pidfile_repair=PASS
 dead_dataplane_detected=PASS
@@ -667,7 +685,7 @@ incomplete_runtime_poweroff=PASS
 fresh_helper_pair=PASS
 docker_api_recovery=PASS
 runtime_launcher_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-dory_hv_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+dory_hv_sha256=$DORY_HV_SHA
 dataplane_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 release_qualifying=true
 EOF
@@ -911,6 +929,7 @@ payload = {
     "developmentUnnotarized": False,
     "dataDiskGrowthGate": "PASS",
     "managedDataDriveGate": "PASS",
+    "dataDriveVolumeIdentityGate": "PASS",
     "offlineBundledBootGate": "PASS",
     "defaultPlatformImageGate": "PASS",
     "nonnativeNixGCGate": "PASS",

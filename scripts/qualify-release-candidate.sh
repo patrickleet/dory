@@ -324,6 +324,8 @@ APP="$WORKDIR/extracted-app/Dory.app"
 tar -xzf "$RUNTIME_TAR" -C "$WORKDIR/extracted-runtime"
 RUNTIME_DIR="$WORKDIR/extracted-runtime/dory-engine-$VERSION-arm64"
 RUNTIME="$RUNTIME_DIR/dory-engine"
+[ -x "$RUNTIME_DIR/bin/dory-hv" ] || die "standalone runtime dory-hv is missing"
+CANDIDATE_DORY_HV_SHA="$(shasum -a 256 "$RUNTIME_DIR/bin/dory-hv" | awk '{print $1}')"
 DOCKER="$APP/Contents/Helpers/docker"
 KUBECTL="$APP/Contents/Helpers/kubectl"
 [ -x "$RUNTIME" ] || die "standalone runtime launcher is missing"
@@ -442,6 +444,22 @@ for proof in status fresh_drive_default explicit_drive_status running_drive_mism
   grep -qx "$proof=PASS" "$drive_summary" \
     || die "managed data-drive summary does not prove $proof"
 done
+
+bounded 180 scripts/data-drive-volume-identity-gate.sh \
+  --dory-hv "$RUNTIME_DIR/bin/dory-hv" \
+  --workroot "$WORKDIR/evidence/data-drive-volume-identity" \
+  > "$WORKDIR/evidence/data-drive-volume-identity.log" 2>&1 \
+  || die "data-drive APFS volume-identity gate failed"
+volume_identity_summary="$(find "$WORKDIR/evidence/data-drive-volume-identity" \
+  -name summary.txt -type f -print -quit)"
+[ -s "$volume_identity_summary" ] || die "data-drive volume-identity summary is missing"
+for proof in status external_volume_identity missing_volume_shadow_prevention \
+  same_name_wrong_volume_rejected original_volume_reaccepted; do
+  grep -qx "$proof=PASS" "$volume_identity_summary" \
+    || die "data-drive volume-identity summary does not prove $proof"
+done
+grep -qx "dory_hv_sha256=$CANDIDATE_DORY_HV_SHA" "$volume_identity_summary" \
+  || die "data-drive volume-identity gate used the wrong dory-hv"
 
 bounded 1200 scripts/native-ipv6-gate.sh \
   --dory-hv "$RUNTIME_DIR/bin/dory-hv" \
@@ -1313,6 +1331,7 @@ payload = {
     "developmentUnnotarized": development_unnotarized == "true",
     "dataDiskGrowthGate": "PASS",
     "managedDataDriveGate": "PASS",
+    "dataDriveVolumeIdentityGate": "PASS",
     "offlineBundledBootGate": "PASS",
     "defaultPlatformImageGate": "PASS",
     "nonnativeNixGCGate": "PASS",

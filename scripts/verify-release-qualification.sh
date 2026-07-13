@@ -60,6 +60,12 @@ printf '%s\n' "$PRIMARY_SHA256" | grep -Eq '^[0-9a-f]{64}$' \
 
 UPDATE_ZIP="$BUILD_DIR/Dory-$VERSION-app-update.zip"
 [ -s "$UPDATE_ZIP" ] || die "candidate app-update ZIP is missing"
+RUNTIME_TAR="$BUILD_DIR/dory-engine-$VERSION-arm64.tar.gz"
+[ -s "$RUNTIME_TAR" ] || die "candidate standalone runtime archive is missing"
+DORY_HV_MEMBER="$(tar -tzf "$RUNTIME_TAR" | awk '/\/bin\/dory-hv$/ {count += 1; value=$0} END {
+  if (count == 1) print value; else exit 1
+}')" || die "candidate runtime archive does not contain one dory-hv"
+DORY_HV_SHA256="$(tar -xOzf "$RUNTIME_TAR" "$DORY_HV_MEMBER" | shasum -a 256 | awk '{print $1}')"
 CANDIDATE_GVPROXY_SHA="$(unzip -p "$UPDATE_ZIP" \
   Dory.app/Contents/Helpers/gvproxy | shasum -a 256 | awk '{print $1}')"
 CANDIDATE_GVPROXY_BUILD_SHA="$(unzip -p "$UPDATE_ZIP" \
@@ -114,6 +120,15 @@ for proof in status fresh_drive_default explicit_drive_status running_drive_mism
   grep -qx "$proof=PASS" "$drive_summary" \
     || die "retained managed data-drive evidence does not prove $proof"
 done
+
+volume_identity_summary="$(single_evidence_file data-drive-volume-identity summary.txt)"
+for proof in status external_volume_identity missing_volume_shadow_prevention \
+  same_name_wrong_volume_rejected original_volume_reaccepted; do
+  grep -qx "$proof=PASS" "$volume_identity_summary" \
+    || die "retained data-drive volume-identity evidence does not prove $proof"
+done
+grep -qx "dory_hv_sha256=$DORY_HV_SHA256" "$volume_identity_summary" \
+  || die "retained data-drive volume-identity evidence used the wrong dory-hv"
 
 offline_boot_manifest="$(single_evidence_file offline-bundled-boot manifest.txt)"
 for proof in status fresh_bundled_boot cached_boot_without_bundle_sources \
@@ -538,6 +553,8 @@ for digest_key in docker_bin_sha256 dory_engine_sha256 bin_dory_hv_sha256 \
   grep -Eq "^${digest_key}=[0-9a-f]{64}$" "$competitor_manifest" \
     || die "retained competitor runtime evidence omits $digest_key"
 done
+grep -qx "bin_dory_hv_sha256=$DORY_HV_SHA256" "$competitor_manifest" \
+  || die "retained competitor runtime evidence used the wrong dory-hv"
 competitor_settings="$(single_evidence_file competitor-runtime engine-settings.txt)"
 grep -qx 'amd64_enabled=1' "$competitor_settings" \
   || die "retained competitor runtime restart lost Apple Silicon amd64/FEX mode"
@@ -573,6 +590,8 @@ for digest_name in runtime_launcher_sha256 dory_hv_sha256 dataplane_sha256; do
   grep -Eq "^${digest_name}=[0-9a-f]{64}$" "$supervisor_manifest" \
     || die "retained standalone supervisor evidence omits $digest_name"
 done
+grep -qx "dory_hv_sha256=$DORY_HV_SHA256" "$supervisor_manifest" \
+  || die "retained supervisor recovery evidence used the wrong dory-hv"
 grep -qx 'release_qualifying=true' "$supervisor_manifest" \
   || die "retained standalone supervisor evidence is not release qualifying"
 
@@ -986,6 +1005,8 @@ assert qualification.get("dataDiskGrowthGate") == "PASS", \
     "16→128 GiB growth/sparse-trim/persistence qualification did not pass"
 assert qualification.get("managedDataDriveGate") == "PASS", \
     "managed data-drive persistence/fail-closed qualification did not pass"
+assert qualification.get("dataDriveVolumeIdentityGate") == "PASS", \
+    "data-drive APFS volume-identity qualification did not pass"
 assert qualification.get("offlineBundledBootGate") == "PASS", \
     "bundled/cached offline boot qualification did not pass"
 assert qualification.get("defaultPlatformImageGate") == "PASS", \

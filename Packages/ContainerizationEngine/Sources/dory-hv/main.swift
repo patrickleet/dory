@@ -229,6 +229,7 @@ case "data-drive":
             try drive.prepare()
             print(try drive.readManifest().id.uuidString.lowercased())
         case "id":
+            try drive.validateManifest()
             print(try drive.readManifest().id.uuidString.lowercased())
         default:
             fail("usage: dory-hv data-drive <resolve|prepare|id> <absolute .dorydrive path>")
