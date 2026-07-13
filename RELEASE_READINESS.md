@@ -11,9 +11,14 @@ roadmap phase and is not part of the Apple-Silicon-first release contract. This 
 intentionally separates verified evidence from claims that still need proof.
 
 **Architecture-first correction:** the focused migration fixes below proved individual semantics,
-but they do not yet provide a durable operation journal shared by import, backup/restore, drive
-relocation, and upgrade. The owned Alpine fixture also does not prove the user's full 79-volume,
-14-container OrbStack inventory. The accepted
+but are not yet wired to the durable operation protocol shared by import, backup/restore, drive
+relocation, and upgrade. The shared private journal/state-machine layer now exists: immutable plan
+digests, monotonic legal transitions, a single mutation lease, atomic synced state, an append audit
+log recoverable from the authoritative state snapshot, terminal cancellation, drive-summary
+mirroring, and symlink/hard-link rejection pass 18 focused tests and the complete 296-test Swift
+package. Migration, backup/restore, relocation, and upgrade must now consume that layer; its
+existence alone is not release completion. The owned Alpine fixture also does not prove the user's
+full 79-volume, 14-container OrbStack inventory. The accepted
 [transactional data-operations contract](docs/architecture/transactional-data-operations.md)
 replaces further one-off migration patching with one plan → quiesce → stage → verify → publish →
 validate protocol, exact dependency closure, crash recovery at every transition, read-back volume

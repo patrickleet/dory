@@ -48,6 +48,14 @@ public final class EngineStateDirectoryLock: @unchecked Sendable {
         guard opened >= 0 else {
             throw EngineStateDirectoryLockError.cannotOpen(path: path, errno: errno)
         }
+        var status = stat()
+        guard fstat(opened, &status) == 0,
+              status.st_mode & S_IFMT == S_IFREG,
+              status.st_uid == getuid(),
+              status.st_nlink == 1 else {
+            Darwin.close(opened)
+            throw EngineStateDirectoryLockError.cannotOpen(path: path, errno: EINVAL)
+        }
         guard flock(opened, LOCK_EX | LOCK_NB) == 0 else {
             let lockError = errno
             let owner = Self.ownerDescription(descriptor: opened)
@@ -80,9 +88,12 @@ public final class EngineStateDirectoryLock: @unchecked Sendable {
         var bytes = [UInt8](repeating: 0, count: 512)
         let count = Darwin.read(descriptor, &bytes, bytes.count)
         guard count > 0 else { return "owner unknown" }
-        let text = String(decoding: bytes.prefix(Int(count)), as: UTF8.self)
+        guard let text = String(bytes: bytes.prefix(Int(count)), encoding: .utf8) else {
+            return "owner unknown"
+        }
+        let description = text
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "\n", with: ", ")
-        return text.isEmpty ? "owner unknown" : text
+        return description.isEmpty ? "owner unknown" : description
     }
 }

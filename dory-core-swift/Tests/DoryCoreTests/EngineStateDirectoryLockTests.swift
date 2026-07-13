@@ -61,6 +61,27 @@ final class EngineStateDirectoryLockTests: XCTestCase {
         withExtendedLifetime(first) {}
     }
 
+    func testRejectsHardLinkedLockFileWithoutChangingTheForeignLink() throws {
+        let state = temporaryStateDirectory()
+        let foreign = state + "-foreign"
+        defer {
+            try? FileManager.default.removeItem(atPath: state)
+            try? FileManager.default.removeItem(atPath: foreign)
+        }
+        try FileManager.default.createDirectory(atPath: state, withIntermediateDirectories: true)
+        try Data("foreign\n".utf8).write(to: URL(fileURLWithPath: foreign))
+        try FileManager.default.linkItem(atPath: foreign, toPath: state + "/engine.lock")
+
+        XCTAssertThrowsError(try EngineStateDirectoryLock(stateDirectory: state)) { error in
+            guard case let EngineStateDirectoryLockError.cannotOpen(path, code) = error else {
+                return XCTFail("unexpected state-lock error: \(error)")
+            }
+            XCTAssertEqual(path, state + "/engine.lock")
+            XCTAssertEqual(code, EINVAL)
+        }
+        XCTAssertEqual(try String(contentsOfFile: foreign, encoding: .utf8), "foreign\n")
+    }
+
     private func temporaryStateDirectory() -> String {
         FileManager.default.temporaryDirectory
             .appendingPathComponent("dory-engine-lock-\(UUID().uuidString)", isDirectory: true)
