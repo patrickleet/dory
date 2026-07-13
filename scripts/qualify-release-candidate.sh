@@ -392,7 +392,7 @@ for proof in lan_to_guest guest_to_lan; do
   grep -qx "$proof=PASS" "$qemu_switch_manifest" \
     || die "gvproxy QEMU switch evidence does not prove $proof"
 done
-grep -qx 'gvproxy_sha256=78904d7887361cbff9ec2f6c6789100752de801b340c801cc08a7bf21fa543d6' \
+grep -qx 'gvproxy_sha256=bd9183f5dbe2bd27d7ea57f2f2dd4d5ce26487eeb1fa8c82cd81bad4df50e0c0' \
   "$qemu_switch_manifest" \
   || die "gvproxy QEMU switch gate used the wrong binary"
 grep -qx 'release_qualifying=true' "$qemu_switch_manifest" \

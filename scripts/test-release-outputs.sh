@@ -49,7 +49,18 @@ printf '%s\n' \
   'source_url=https://github.com/containers/gvisor-tap-vsock/archive/refs/tags/v0.8.9.tar.gz' \
   'source_sha256=6cbcb7959a5d90b59253ea6d8bdf0285e2cfbc3b301398704b41e3069293f4fb' \
   'patch_sha256=ca76b2a8a304aa4b3aba835543f325832de83a14163f6b86b37491cc165e2ce3' \
-  'verified_sha256=78904d7887361cbff9ec2f6c6789100752de801b340c801cc08a7bf21fa543d6' \
+  'go_toolchain=go1.26.5' \
+  'go_mod_sha256=75848c190dca5cc7af27ebe017d5a4d59d4a117c97eaa6b8ac0359e58d868eec' \
+  'go_sum_sha256=25b1a52ad3181030b6ccf92af5d69a1a4282f8f2342dad5348b5c954c304c4b3' \
+  'go_proxy=https://proxy.golang.org' \
+  'go_sumdb=sum.golang.org' \
+  'go_arm64=v8.0' \
+  'go_amd64=v1' \
+  'fat_x86_64_segalign=0x1000' \
+  'fat_arm64_segalign=0x4000' \
+  'arm64_sha256=98f142909b2ba839e87bf8c4cf61e9a20f79d5c9ea1158930240d63dcaee380b' \
+  'amd64_sha256=3d2d55b482e7c47033d2f956141b569c0d00861947038173a23e3b08c132c4f0' \
+  'verified_sha256=bd9183f5dbe2bd27d7ea57f2f2dd4d5ce26487eeb1fa8c82cd81bad4df50e0c0' \
   'features=native-ipv6-v1,source-preserving-lan-qemu-v1' \
   'architectures=x86_64 arm64' \
   'source=pinned-source-build' > "$RESOURCES/gvproxy-provenance.txt"
@@ -575,7 +586,7 @@ cat > "$QUALIFICATION_FIXTURE/evidence/native-ipv6/run/manifest.txt" <<'EOF'
 status=PASS
 architecture=arm64
 gvproxy_version=v0.8.9-dory1
-gvproxy_sha256=78904d7887361cbff9ec2f6c6789100752de801b340c801cc08a7bf21fa543d6
+gvproxy_sha256=bd9183f5dbe2bd27d7ea57f2f2dd4d5ce26487eeb1fa8c82cd81bad4df50e0c0
 fresh_boot=PASS
 restart=PASS
 docker_bridge_ipv6=PASS
@@ -590,7 +601,7 @@ EOF
 cat > "$QUALIFICATION_FIXTURE/evidence/gvproxy-qemu-switch/manifest.txt" <<'EOF'
 status=PASS
 transport=qemu-unix-stream
-gvproxy_sha256=78904d7887361cbff9ec2f6c6789100752de801b340c801cc08a7bf21fa543d6
+gvproxy_sha256=bd9183f5dbe2bd27d7ea57f2f2dd4d5ce26487eeb1fa8c82cd81bad4df50e0c0
 lan_to_guest=PASS
 guest_to_lan=PASS
 release_qualifying=true

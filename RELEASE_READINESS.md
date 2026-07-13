@@ -638,6 +638,17 @@ re-sign that artifact, then repeat the exact-candidate gates before replacing th
   about 11 GiB allocated to 1.1 GiB. Minimal retained evidence is at
   `~/.dory-new-gate-evidence/20260713T-deterministic-fex-final` (72 KiB). This certifies current
   source/runtime architecture, not the still-required notarized public artifact.
+- [x] Make the dual-stack gvproxy derivative reproducible instead of letting the build host choose
+  a floating Go compiler. The exact-candidate build exposed that `GOTOOLCHAIN=auto` had moved the
+  binary hash while the source archive, Dory patch, and tests remained unchanged. The builder now
+  requires checksum-database-verified Go 1.26.5, exact `go.mod`/`go.sum` hashes, a read-only module
+  graph, fixed arm64/amd64 architecture levels and fat-header alignments, empty user Go
+  flags/experiments, and the public Go proxy/sumdb. Three rebuilds produced byte-identical universal hash
+  `bd9183f5dbe2bd27d7ea57f2f2dd4d5ce26487eeb1fa8c82cd81bad4df50e0c0`; the first two used
+  independent empty toolchain/module/compiler caches, and the full DNS, switch, virtual-network,
+  forwarder, and gvproxy tests passed. Release provenance and validation bind the toolchain,
+  module files, both thin-slice hashes, and universal hash. Exact notarized-artifact replay remains
+  mandatory.
 - [ ] Configure a dedicated disposable ECR repository and short-lived CI credentials, then certify
   authenticated manifest PUT and interrupted large-layer upload recovery on the exact notarized
   candidate. Local registry auth/push and a fresh Docker Hub manifest pull already pass, but Apple

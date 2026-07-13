@@ -6,7 +6,7 @@
 # DORY_GVPROXY_VERSION and DORY_GVPROXY_SHA256; setting only one is rejected.
 
 DORY_GVPROXY_DEFAULT_VERSION="v0.8.9-dory1"
-DORY_GVPROXY_DEFAULT_SHA256="78904d7887361cbff9ec2f6c6789100752de801b340c801cc08a7bf21fa543d6"
+DORY_GVPROXY_DEFAULT_SHA256="bd9183f5dbe2bd27d7ea57f2f2dd4d5ce26487eeb1fa8c82cd81bad4df50e0c0"
 
 dory_gvproxy_validate_overrides() {
   local version_override="${DORY_GVPROXY_VERSION:-}"

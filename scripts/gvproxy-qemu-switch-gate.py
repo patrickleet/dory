@@ -16,7 +16,7 @@ import tempfile
 import time
 
 
-PINNED_SHA256 = "78904d7887361cbff9ec2f6c6789100752de801b340c801cc08a7bf21fa543d6"
+PINNED_SHA256 = "bd9183f5dbe2bd27d7ea57f2f2dd4d5ce26487eeb1fa8c82cd81bad4df50e0c0"
 PINNED_VERSION = "gvproxy version v0.8.9-dory1"
 GUEST_MAC = bytes.fromhex("5a94efe40cee")
 BRIDGE_MAC = bytes.fromhex("5a94efd01201")

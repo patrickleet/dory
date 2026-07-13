@@ -69,8 +69,23 @@ dory_gvproxy_validate_overrides || fail "default pinned metadata was rejected"
 
 [ "$DORY_GVPROXY_DEFAULT_VERSION" = "v0.8.9-dory1" ] || fail "default version pin regressed"
 [ "$DORY_GVPROXY_DEFAULT_SHA256" = \
-  "78904d7887361cbff9ec2f6c6789100752de801b340c801cc08a7bf21fa543d6" ] \
+  "bd9183f5dbe2bd27d7ea57f2f2dd4d5ce26487eeb1fa8c82cd81bad4df50e0c0" ] \
   || fail "default checksum pin regressed"
+for reproducible_input in \
+  'GO_TOOLCHAIN="go1.26.5"' \
+  'GO_MOD_SHA256="75848c190dca5cc7af27ebe017d5a4d59d4a117c97eaa6b8ac0359e58d868eec"' \
+  'GO_SUM_SHA256="25b1a52ad3181030b6ccf92af5d69a1a4282f8f2342dad5348b5c954c304c4b3"' \
+  'export GOTOOLCHAIN="$GO_TOOLCHAIN"' \
+  'go test -mod=readonly' \
+  'go build -mod=readonly' \
+  '-segalign x86_64 0x1000 -segalign arm64 0x4000'; do
+  grep -Fq "$reproducible_input" "$SCRIPT_DIR/build-gvproxy.sh" \
+    || fail "gvproxy rebuild omits reproducible input: $reproducible_input"
+done
+if grep -Eq '^[[:space:]]*(export[[:space:]]+)?GOTOOLCHAIN=.*auto|[[:space:]]-mod=mod([[:space:]]|$)' \
+    "$SCRIPT_DIR/build-gvproxy.sh"; then
+  fail "gvproxy rebuild still permits a floating toolchain or mutable module graph"
+fi
 
 for script in "$REPO_ROOT/scripts/build.sh" "$REPO_ROOT/scripts/bundle-engine.sh"; do
   grep -q 'source .*gvproxy-payload.sh' "$script" || fail "$(basename "$script") does not load verifier"

@@ -470,7 +470,7 @@ grep -qx 'architecture=arm64' "$native_ipv6_manifest" \
   || die "retained native IPv6 evidence is not from Apple Silicon"
 grep -qx 'gvproxy_version=v0.8.9-dory1' "$native_ipv6_manifest" \
   || die "retained native IPv6 evidence used the wrong gvproxy derivative"
-grep -qx 'gvproxy_sha256=78904d7887361cbff9ec2f6c6789100752de801b340c801cc08a7bf21fa543d6' \
+grep -qx 'gvproxy_sha256=bd9183f5dbe2bd27d7ea57f2f2dd4d5ce26487eeb1fa8c82cd81bad4df50e0c0' \
   "$native_ipv6_manifest" \
   || die "retained native IPv6 evidence used the wrong gvproxy binary"
 grep -qx 'release_qualifying=true' "$native_ipv6_manifest" \
@@ -483,7 +483,7 @@ for proof in lan_to_guest guest_to_lan; do
 done
 grep -qx 'transport=qemu-unix-stream' "$qemu_switch_manifest" \
   || die "retained LAN switch evidence used the wrong transport"
-grep -qx 'gvproxy_sha256=78904d7887361cbff9ec2f6c6789100752de801b340c801cc08a7bf21fa543d6' \
+grep -qx 'gvproxy_sha256=bd9183f5dbe2bd27d7ea57f2f2dd4d5ce26487eeb1fa8c82cd81bad4df50e0c0' \
   "$qemu_switch_manifest" \
   || die "retained LAN switch evidence used the wrong gvproxy binary"
 grep -qx 'release_qualifying=true' "$qemu_switch_manifest" \

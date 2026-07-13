@@ -8,6 +8,11 @@ DORY_VERSION="v0.8.9-dory1"
 SOURCE_SHA256="6cbcb7959a5d90b59253ea6d8bdf0285e2cfbc3b301398704b41e3069293f4fb"
 PATCH="$ROOT/patches/gvproxy-native-ipv6.patch"
 PATCH_SHA256="ca76b2a8a304aa4b3aba835543f325832de83a14163f6b86b37491cc165e2ce3"
+GO_TOOLCHAIN="go1.26.5"
+GO_MOD_SHA256="75848c190dca5cc7af27ebe017d5a4d59d4a117c97eaa6b8ac0359e58d868eec"
+GO_SUM_SHA256="25b1a52ad3181030b6ccf92af5d69a1a4282f8f2342dad5348b5c954c304c4b3"
+GO_PROXY="https://proxy.golang.org"
+GO_SUMDB="sum.golang.org"
 OUTPUT=""
 PROVENANCE=""
 RUN_TESTS=1
@@ -55,19 +60,59 @@ actual_source_sha="$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')"
 tar -xzf "$ARCHIVE" -C "$SOURCE" --strip-components=1
 patch --batch --forward -p1 -d "$SOURCE" < "$PATCH"
 
-export GOTOOLCHAIN="${GOTOOLCHAIN:-auto}"
+actual_go_mod_sha="$(shasum -a 256 "$SOURCE/go.mod" | awk '{print $1}')"
+actual_go_sum_sha="$(shasum -a 256 "$SOURCE/go.sum" | awk '{print $1}')"
+[ "$actual_go_mod_sha" = "$GO_MOD_SHA256" ] || {
+  echo "build-gvproxy: go.mod digest mismatch (expected $GO_MOD_SHA256, got $actual_go_mod_sha)" >&2
+  exit 1
+}
+[ "$actual_go_sum_sha" = "$GO_SUM_SHA256" ] || {
+  echo "build-gvproxy: go.sum digest mismatch (expected $GO_SUM_SHA256, got $actual_go_sum_sha)" >&2
+  exit 1
+}
+
+# A fixed binary digest requires a fixed compiler. GOTOOLCHAIN=auto changes output whenever Go's
+# supported patch releases advance, so ignore the build host's Go environment and select one exact,
+# checksum-database-verified toolchain. The module graph is immutable under -mod=readonly.
+export GOENV=off
+export GOTOOLCHAIN="$GO_TOOLCHAIN"
+export GOFLAGS=""
+export GOEXPERIMENT=""
+export GOWORK=off
+export GOPROXY="$GO_PROXY"
+export GOSUMDB="$GO_SUMDB"
+export CGO_ENABLED=0
+export GOAMD64=v1
+export GOARM64=v8.0
+export TZ=UTC
+export LC_ALL=C
+export LANG=C
+actual_go_toolchain="$(go env GOVERSION)"
+[ "$actual_go_toolchain" = "$GO_TOOLCHAIN" ] || {
+  echo "build-gvproxy: expected $GO_TOOLCHAIN, selected $actual_go_toolchain" >&2
+  exit 1
+}
+(cd "$SOURCE" && go mod verify)
 if [ "$RUN_TESTS" = 1 ]; then
-  (cd "$SOURCE" && go test -mod=mod ./pkg/services/dns ./pkg/tap ./pkg/virtualnetwork ./pkg/services/forwarder ./cmd/gvproxy)
+  (cd "$SOURCE" && go test -mod=readonly ./pkg/services/dns ./pkg/tap ./pkg/virtualnetwork ./pkg/services/forwarder ./cmd/gvproxy)
 fi
 
 ldflags="-s -w -buildid= -X github.com/containers/gvisor-tap-vsock/pkg/types.gitVersion=$DORY_VERSION"
 for arch in arm64 amd64; do
   (cd "$SOURCE" && \
-    CGO_ENABLED=0 GOOS=darwin GOARCH="$arch" go build -mod=mod -trimpath -buildvcs=false \
+    GOOS=darwin GOARCH="$arch" go build -mod=readonly -trimpath -buildvcs=false \
       -ldflags "$ldflags" -o "$TMP/gvproxy-$arch" ./cmd/gvproxy)
+  slice_toolchain="$(go version -m "$TMP/gvproxy-$arch" | sed -n '1s/.*: //p')"
+  [ "$slice_toolchain" = "$GO_TOOLCHAIN" ] || {
+    echo "build-gvproxy: $arch slice used unexpected toolchain ${slice_toolchain:-unknown}" >&2
+    exit 1
+  }
 done
+arm64_sha="$(shasum -a 256 "$TMP/gvproxy-arm64" | awk '{print $1}')"
+amd64_sha="$(shasum -a 256 "$TMP/gvproxy-amd64" | awk '{print $1}')"
 mkdir -p "$(dirname "$OUTPUT")"
-"$LIPO" -create "$TMP/gvproxy-arm64" "$TMP/gvproxy-amd64" -output "$OUTPUT"
+"$LIPO" -create "$TMP/gvproxy-arm64" "$TMP/gvproxy-amd64" \
+  -segalign x86_64 0x1000 -segalign arm64 0x4000 -output "$OUTPUT"
 chmod 0755 "$OUTPUT"
 
 actual_version="$("$OUTPUT" -version 2>&1 | tr -d '\r' | sed -n '1p')"
@@ -92,6 +137,17 @@ if [ -n "$PROVENANCE" ]; then
     echo "source_url=https://github.com/containers/gvisor-tap-vsock/archive/refs/tags/${UPSTREAM_VERSION}.tar.gz"
     echo "source_sha256=$SOURCE_SHA256"
     echo "patch_sha256=$PATCH_SHA256"
+    echo "go_toolchain=$GO_TOOLCHAIN"
+    echo "go_mod_sha256=$GO_MOD_SHA256"
+    echo "go_sum_sha256=$GO_SUM_SHA256"
+    echo "go_proxy=$GO_PROXY"
+    echo "go_sumdb=$GO_SUMDB"
+    echo "go_arm64=v8.0"
+    echo "go_amd64=v1"
+    echo "fat_x86_64_segalign=0x1000"
+    echo "fat_arm64_segalign=0x4000"
+    echo "arm64_sha256=$arm64_sha"
+    echo "amd64_sha256=$amd64_sha"
     echo "verified_sha256=$output_sha"
     echo "features=native-ipv6-v1,source-preserving-lan-qemu-v1"
     echo "architectures=$actual_arches"
