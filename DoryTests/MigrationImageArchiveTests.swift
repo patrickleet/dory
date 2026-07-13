@@ -1,0 +1,244 @@
+import Foundation
+import Testing
+@testable import Dory
+
+struct MigrationImageArchiveTests {
+    @Test func fingerprintsAnUntaggedImageAcrossArbitraryChunkBoundaries() throws {
+        let fixture = MigrationImageArchiveTestSupport.fixture()
+
+        let fingerprint = try MigrationImageArchiveTestSupport.fingerprint(fixture.archive)
+
+        #expect(fingerprint.semanticIdentity == "sha256:\(fixture.configDigest)")
+        #expect(fingerprint.configSha256 == fixture.configDigest)
+        #expect(fingerprint.layers.map(\.position) == [0, 1])
+        #expect(fingerprint.layers.map(\.sha256) == fixture.layerDigests)
+        #expect(fingerprint.archiveBytes == UInt64(fixture.archive.count))
+        #expect(fingerprint.archiveEntryCount == 4)
+        #expect(fingerprint.archiveSha256 == MigrationImageArchiveTestSupport.sha256(fixture.archive))
+        #expect(fingerprint.archiveContractSha256.count == 64)
+    }
+
+    @Test func acceptsContentAddressedLayoutAndEmptyStreamChunks() throws {
+        let fixture = MigrationImageArchiveTestSupport.contentAddressedFixture()
+        var reader = MigrationImageArchiveReader()
+
+        try reader.feed(Data())
+        try reader.feed(fixture.archive)
+        try reader.feed(Data())
+        let fingerprint = try reader.finish()
+
+        #expect(fingerprint.semanticIdentity == "sha256:\(fixture.configDigest)")
+        #expect(fingerprint.configArchivePath.hasPrefix("blobs/sha256/"))
+        #expect(fingerprint.layers.map(\.sha256) == fixture.layerDigests)
+        #expect(fingerprint.archiveSha256 == MigrationImageArchiveTestSupport.sha256(fixture.archive))
+    }
+
+    @Test func acceptsPAXPathsAndPositiveBase256Sizes() throws {
+        let fixture = MigrationImageArchiveTestSupport.fixture(
+            base256LayerSize: true,
+            paxLayerPath: true
+        )
+
+        let fingerprint = try MigrationImageArchiveTestSupport.fingerprint(fixture.archive)
+
+        #expect(fingerprint.layers.first?.archivePath.utf8.count ?? 0 > 100)
+        #expect(fingerprint.layers.first?.sha256 == fixture.layerDigests.first)
+    }
+
+    @Test func distinguishesExactArchiveBytesFromSemanticContent() throws {
+        let fixture = MigrationImageArchiveTestSupport.contentAddressedFixture()
+        let changedEntries = fixture.entries.map { entry in
+            entry.path == "oci-layout"
+                ? MigrationImageTarTestEntry(
+                    path: entry.path,
+                    payload: MigrationImageArchiveTestSupport.json(["imageLayoutVersion": "1.0.1"])
+                )
+                : entry
+        }
+
+        let original = try MigrationImageArchiveTestSupport.fingerprint(fixture.archive)
+        let changed = try MigrationImageArchiveTestSupport.fingerprint(
+            MigrationImageArchiveTestSupport.archive(changedEntries)
+        )
+
+        #expect(original.semanticIdentity == changed.semanticIdentity)
+        #expect(original.archiveContractSha256 == changed.archiveContractSha256)
+        #expect(original.archiveSha256 != changed.archiveSha256)
+    }
+
+    @Test func rejectsTagsMissingFilesAndMismatchedConfigIdentity() throws {
+        let invalid = [
+            MigrationImageArchiveTestSupport.fixture(repoTags: ["user/app:v1"]).archive,
+            MigrationImageArchiveTestSupport.fixture(missingReferencedLayer: true).archive,
+            MigrationImageArchiveTestSupport.fixture(mismatchedConfigPath: true).archive
+        ]
+
+        for archive in invalid {
+            #expect(throws: MigrationImageArchiveError.self) {
+                try MigrationImageArchiveTestSupport.fingerprint(archive)
+            }
+        }
+    }
+
+    @Test func rejectsTraversalDuplicatesLinksAndBrokenChecksums() throws {
+        let fixture = MigrationImageArchiveTestSupport.fixture()
+        let malicious = MigrationImageTarTestEntry(path: "../escape", payload: Data("x".utf8))
+        let duplicate = fixture.entries + [fixture.entries[0]]
+        let symbolicLink = MigrationImageTarTestEntry(
+            path: "link",
+            type: UInt8(ascii: "2")
+        )
+        var badChecksum = fixture.archive
+        badChecksum[0] ^= 0xff
+        let invalid = [
+            MigrationImageArchiveTestSupport.archive([malicious] + fixture.entries),
+            MigrationImageArchiveTestSupport.archive(duplicate),
+            MigrationImageArchiveTestSupport.archive([symbolicLink] + fixture.entries),
+            badChecksum
+        ]
+
+        for archive in invalid {
+            #expect(throws: MigrationImageArchiveError.self) {
+                try MigrationImageArchiveTestSupport.fingerprint(archive)
+            }
+        }
+    }
+
+    @Test func rejectsTruncationNonzeroPaddingAndTrailingData() throws {
+        let fixture = MigrationImageArchiveTestSupport.fixture()
+        var nonzeroPadding = fixture.archive
+        let firstPayloadEnd = MigrationImageTarHeaderDecoder.blockBytes
+            + fixture.entries[0].payload.count
+        nonzeroPadding[firstPayloadEnd] = 1
+        let noTerminator = MigrationImageArchiveTestSupport.archive(
+            fixture.entries,
+            terminator: false
+        )
+        var trailingData = fixture.archive
+        trailingData.append(1)
+
+        for archive in [nonzeroPadding, noTerminator, trailingData] {
+            #expect(throws: MigrationImageArchiveError.self) {
+                try MigrationImageArchiveTestSupport.fingerprint(archive)
+            }
+        }
+    }
+
+    @Test func rejectsDuplicateManifestsAndIncompleteTerminators() throws {
+        let fixture = MigrationImageArchiveTestSupport.fixture()
+        let manifest = try #require(fixture.entries.last)
+        var singleZero = MigrationImageArchiveTestSupport.archive(
+            fixture.entries,
+            terminator: false
+        )
+        singleZero.append(Data(repeating: 0, count: MigrationImageTarHeaderDecoder.blockBytes))
+        let invalid = [
+            MigrationImageArchiveTestSupport.archive(fixture.entries + [manifest]),
+            singleZero
+        ]
+
+        for archive in invalid {
+            #expect(throws: MigrationImageArchiveError.self) {
+                try MigrationImageArchiveTestSupport.fingerprint(archive)
+            }
+        }
+    }
+
+    @Test func rejectsMalformedNumericAndExtensionHeaders() throws {
+        let fixture = MigrationImageArchiveTestSupport.fixture()
+        let unsafePAX = MigrationImageTarTestEntry(
+            path: "PaxHeaders/path",
+            type: UInt8(ascii: "x"),
+            payload: MigrationImageArchiveTestSupport.pax(key: "path", value: "../escape")
+        )
+        let sparsePAX = MigrationImageTarTestEntry(
+            path: "PaxHeaders/sparse",
+            type: UInt8(ascii: "x"),
+            payload: MigrationImageArchiveTestSupport.pax(key: "GNU.sparse.map", value: "0,1")
+        )
+        let placeholder = MigrationImageTarTestEntry(path: "placeholder")
+        let negative = [UInt8(0xc0)] + [UInt8](repeating: 0, count: 11)
+        let overflow = [UInt8(0xbf)] + [UInt8](repeating: 0xff, count: 11)
+        var malformedOctal = [UInt8](repeating: UInt8(ascii: "0"), count: 12)
+        malformedOctal[10] = UInt8(ascii: "8")
+        let invalid = [
+            MigrationImageArchiveTestSupport.archive([unsafePAX, placeholder] + fixture.entries),
+            MigrationImageArchiveTestSupport.archive([sparsePAX, placeholder] + fixture.entries),
+            MigrationImageArchiveTestSupport.archiveWithRawSizeField(negative),
+            MigrationImageArchiveTestSupport.archiveWithRawSizeField(overflow),
+            MigrationImageArchiveTestSupport.archiveWithRawSizeField(malformedOctal)
+        ]
+
+        for archive in invalid {
+            #expect(throws: MigrationImageArchiveError.self) {
+                try MigrationImageArchiveTestSupport.fingerprint(archive)
+            }
+        }
+    }
+
+    @Test func rejectsMultipleRecordsDuplicateLayersAndInvalidConfigs() throws {
+        let fixture = MigrationImageArchiveTestSupport.fixture()
+        let config = fixture.entries[0].path
+        let layers = [fixture.entries[1].path, fixture.entries[2].path]
+        let validRecord: [String: Any] = [
+            "Config": config,
+            "RepoTags": NSNull(),
+            "Layers": layers
+        ]
+        let duplicateLayerRecord: [String: Any] = [
+            "Config": config,
+            "RepoTags": NSNull(),
+            "Layers": [layers[0], layers[0]]
+        ]
+        let invalid = [
+            MigrationImageArchiveTestSupport.replacingManifest(
+                in: fixture,
+                payload: MigrationImageArchiveTestSupport.json([validRecord, validRecord])
+            ),
+            MigrationImageArchiveTestSupport.replacingManifest(
+                in: fixture,
+                payload: MigrationImageArchiveTestSupport.json([duplicateLayerRecord])
+            ),
+            MigrationImageArchiveTestSupport.invalidConfigArchive(architecture: "amd64"),
+            MigrationImageArchiveTestSupport.invalidConfigArchive(operatingSystem: "windows"),
+            MigrationImageArchiveTestSupport.invalidConfigArchive(
+                diffIDs: ["sha256:" + String(repeating: "0", count: 64)]
+            )
+        ]
+
+        for archive in invalid {
+            #expect(throws: MigrationImageArchiveError.self) {
+                try MigrationImageArchiveTestSupport.fingerprint(archive)
+            }
+        }
+    }
+
+    @Test func fingerprintsAsyncStreamsAcrossChunks() async throws {
+        let fixture = MigrationImageArchiveTestSupport.fixture()
+        let stream = AsyncThrowingStream<Data, Error> { continuation in
+            continuation.yield(fixture.archive.prefix(700))
+            continuation.yield(fixture.archive.dropFirst(700))
+            continuation.finish()
+        }
+
+        let fingerprint = try await MigrationImageArchiveReader.fingerprint(stream)
+
+        #expect(fingerprint.configSha256 == fixture.configDigest)
+    }
+
+    @Test func propagatesAsyncStreamFailures() async {
+        let fixture = MigrationImageArchiveTestSupport.fixture()
+        let stream = AsyncThrowingStream<Data, Error> { continuation in
+            continuation.yield(fixture.archive.prefix(700))
+            continuation.finish(throwing: MigrationImageArchiveStreamError.injected)
+        }
+
+        await #expect(throws: MigrationImageArchiveStreamError.injected) {
+            try await MigrationImageArchiveReader.fingerprint(stream)
+        }
+    }
+}
+
+private enum MigrationImageArchiveStreamError: Error {
+    case injected
+}
