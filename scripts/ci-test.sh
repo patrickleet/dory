@@ -30,6 +30,11 @@ if ! bash scripts/test-release-outputs.sh; then
   exit 1
 fi
 
+if ! bash scripts/test-make-dmg.sh; then
+  echo "ci-test: disk-image packaging tests failed" >&2
+  exit 1
+fi
+
 if ! bash scripts/test-release-upgrade-rollback-smoke.sh; then
   echo "ci-test: release upgrade/rollback safety tests failed" >&2
   exit 1
