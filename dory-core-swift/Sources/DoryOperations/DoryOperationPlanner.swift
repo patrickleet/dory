@@ -88,6 +88,35 @@ public enum DoryOperationPlanner {
         return result
     }
 
+    public static func inventoryBaselines(
+        inventory: [DoryOperationInventoryObject],
+        plan: DoryOperationCompletenessPlan
+    ) throws -> DoryOperationInventoryBaselines {
+        try validate(plan)
+        let inventoryByKey = try validatedInventory(inventory)
+        let selectedKeys = Set(plan.selectedObjectKeys)
+        let fullInventory = inventoryByKey.values
+            .sorted { $0.key < $1.key }
+            .map(canonicalInventoryObject)
+        let unselectedInventory = inventoryByKey.values
+            .filter { !selectedKeys.contains($0.key) }
+            .sorted { $0.key < $1.key }
+            .map(canonicalInventoryObject)
+        let sourceInventory = try DoryOperationJournalStore.encoded(fullInventory, pretty: false)
+        let unselectedSourceInventory = try DoryOperationJournalStore.encoded(unselectedInventory, pretty: false)
+        guard DoryOperationJournalStore.digest(sourceInventory) == plan.sourceInventoryDigest,
+              DoryOperationJournalStore.digest(unselectedSourceInventory)
+                == plan.unselectedSourceInventoryDigest else {
+            throw DoryOperationPlannerError.invalidPlan(
+                "source inventory does not match the completeness plan"
+            )
+        }
+        return DoryOperationInventoryBaselines(
+            sourceInventory: sourceInventory,
+            unselectedSourceInventory: unselectedSourceInventory
+        )
+    }
+
     static func validate(_ plan: DoryOperationCompletenessPlan) throws {
         guard plan.schemaVersion == DoryOperationCompletenessPlan.schemaVersion else {
             throw DoryOperationPlannerError.invalidPlan("unsupported schema version")

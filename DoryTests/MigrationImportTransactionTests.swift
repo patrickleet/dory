@@ -19,13 +19,24 @@ struct MigrationImportTransactionTests: StrictInventoryTestCase {
 
         #expect(session.state.phase == .staging)
         #expect(session.state.status == .running)
-        #expect(session.state.revision == 2)
+        #expect(session.state.revision == 3)
         #expect(try session.lease.readCompletenessPlan() == prepared.operation.completenessPlan)
         #expect(try session.lease.events().map(\.stepID) == [
             "operation.created",
+            "preflight.baselines-published",
             "preflight.revalidate",
             "staging.begin"
         ])
+        let baselines = prepared.operation.baselineManifests
+        let plan = prepared.operation.completenessPlan
+        #expect(try session.lease.readManifest(digest: plan.sourceInventoryDigest)
+            == baselines.sourceInventory)
+        #expect(try session.lease.readManifest(digest: plan.unselectedSourceInventoryDigest)
+            == baselines.unselectedSourceInventory)
+        #expect(try session.lease.readManifest(digest: plan.context.targetInventoryDigest)
+            == baselines.targetInventory)
+        #expect(try session.lease.readManifest(digest: plan.context.unownedTargetInventoryDigest)
+            == baselines.unownedTargetInventory)
         #expect(fixture.target.snapshotValue.containers.isEmpty)
         #expect(fixture.target.snapshotValue.images.isEmpty)
         #expect(fixture.target.snapshotValue.volumes.isEmpty)
@@ -83,7 +94,7 @@ struct MigrationImportTransactionTests: StrictInventoryTestCase {
 
         let record = try store.read(prepared.identity.id)
         #expect(record.state.status == .failed)
-        #expect(record.state.revision == 2)
+        #expect(record.state.revision == 3)
     }
 }
 

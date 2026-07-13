@@ -199,13 +199,20 @@ extension MigrationOperationPlanBuilder {
     }
 
     static func digest<T: Encodable>(_ value: T) throws -> String {
+        sha256(try canonicalData(value))
+    }
+
+    static func canonicalData<T: Encodable>(_ value: T) throws -> Data {
         do {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
-            let data = try encoder.encode(value)
-            return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            return try encoder.encode(value)
         } catch {
             throw MigrationOperationPlanError.encoding(String(describing: error))
         }
+    }
+
+    nonisolated static func sha256(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 }

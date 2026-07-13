@@ -50,6 +50,7 @@ nonisolated struct PreparedMigrationOperation: Sendable {
     let completenessPlan: DoryOperationCompletenessPlan
     let journalPlan: DoryOperationPlan
     let specifications: [DoryOperationSpecification]
+    let baselineManifests: MigrationOperationBaselineManifests
 
     nonisolated func begin(in store: DoryOperationJournalStore) throws -> DoryOperationLease {
         try store.begin(
@@ -170,29 +171,23 @@ enum MigrationOperationPlanBuilder {
         _ input: MigrationOperationPlanningInput,
         assembly: MigrationPlanAssembly
     ) throws -> PreparedMigrationOperation {
-        let targetInventoryDigest = try digest(MigrationTargetInventory(
+        let targetInventoryData = try canonicalData(MigrationTargetInventory(
             snapshot: input.target.snapshot,
             containerSpecifications: input.target.containerSpecifications,
             networkInspections: input.target.networkInspections
         ))
-        let context = DoryOperationPlanningContext(
-            targetInventoryDigest: targetInventoryDigest,
-            unownedTargetInventoryDigest: targetInventoryDigest,
-            capabilitiesDigest: try digest(MigrationCapabilitySnapshot(
-                sourceEngineVersion: input.source.snapshot.engineVersion,
-                targetEngineVersion: input.target.snapshot.engineVersion,
-                contract: input.capabilities
-            )),
-            capacityDigest: try digest(input.capacity),
-            quiescenceDigest: try digest(MigrationQuiescenceContract(
-                containers: input.source.snapshot.containers
-            ))
-        )
+        let targetInventoryDigest = sha256(targetInventoryData)
+        let context = try planningContext(input, targetInventoryDigest: targetInventoryDigest)
         let completenessPlan = try DoryOperationPlanner.plan(
             inventory: assembly.inventory,
             intents: assembly.intents,
             userSelection: assembly.inventory.map(\.key),
             context: context
+        )
+        let baselines = try baselineManifests(
+            assembly: assembly,
+            completenessPlan: completenessPlan,
+            targetInventoryData: targetInventoryData
         )
         let journalPlan = try DoryOperationPlan(
             id: input.identity.id,
@@ -213,7 +208,44 @@ enum MigrationOperationPlanBuilder {
         return PreparedMigrationOperation(
             completenessPlan: completenessPlan,
             journalPlan: journalPlan,
-            specifications: assembly.specifications.values.sorted { $0.digest < $1.digest }
+            specifications: assembly.specifications.values.sorted { $0.digest < $1.digest },
+            baselineManifests: baselines
+        )
+    }
+
+    private static func planningContext(
+        _ input: MigrationOperationPlanningInput,
+        targetInventoryDigest: String
+    ) throws -> DoryOperationPlanningContext {
+        DoryOperationPlanningContext(
+            targetInventoryDigest: targetInventoryDigest,
+            unownedTargetInventoryDigest: targetInventoryDigest,
+            capabilitiesDigest: try digest(MigrationCapabilitySnapshot(
+                sourceEngineVersion: input.source.snapshot.engineVersion,
+                targetEngineVersion: input.target.snapshot.engineVersion,
+                contract: input.capabilities
+            )),
+            capacityDigest: try digest(input.capacity),
+            quiescenceDigest: try digest(MigrationQuiescenceContract(
+                containers: input.source.snapshot.containers
+            ))
+        )
+    }
+
+    private static func baselineManifests(
+        assembly: MigrationPlanAssembly,
+        completenessPlan: DoryOperationCompletenessPlan,
+        targetInventoryData: Data
+    ) throws -> MigrationOperationBaselineManifests {
+        let source = try DoryOperationPlanner.inventoryBaselines(
+            inventory: assembly.inventory,
+            plan: completenessPlan
+        )
+        return MigrationOperationBaselineManifests(
+            sourceInventory: source.sourceInventory,
+            unselectedSourceInventory: source.unselectedSourceInventory,
+            targetInventory: targetInventoryData,
+            unownedTargetInventory: targetInventoryData
         )
     }
 

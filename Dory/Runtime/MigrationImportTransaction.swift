@@ -44,13 +44,21 @@ nonisolated enum MigrationImportTransaction {
         environment: MigrationImportTransactionEnvironment
     ) async throws -> MigrationImportStagingSession {
         let lease = try prepared.operation.begin(in: environment.journalStore)
-        var state = try lease.transition(
-            to: .quiescing,
-            status: .running,
-            expectedRevision: 0,
-            stepID: "preflight.revalidate"
-        )
+        var state = try lease.read().state
         do {
+            try publishBaselines(prepared, lease: lease)
+            state = try lease.transition(
+                to: .planned,
+                status: .running,
+                expectedRevision: state.revision,
+                stepID: "preflight.baselines-published"
+            )
+            state = try lease.transition(
+                to: .quiescing,
+                status: .running,
+                expectedRevision: state.revision,
+                stepID: "preflight.revalidate"
+            )
             try await revalidate(prepared, environment: environment)
             try Task.checkCancellation()
             state = try lease.transition(
@@ -76,6 +84,25 @@ nonisolated enum MigrationImportTransaction {
 }
 
 private extension MigrationImportTransaction {
+    nonisolated static func publishBaselines(
+        _ prepared: PreparedMigrationExecution,
+        lease: DoryOperationLease
+    ) throws {
+        let manifests = prepared.operation.baselineManifests
+        let plan = prepared.operation.completenessPlan
+        let publications = [
+            (manifests.sourceInventory, plan.sourceInventoryDigest),
+            (manifests.unselectedSourceInventory, plan.unselectedSourceInventoryDigest),
+            (manifests.targetInventory, plan.context.targetInventoryDigest),
+            (manifests.unownedTargetInventory, plan.context.unownedTargetInventoryDigest)
+        ]
+        for (data, expectedDigest) in publications {
+            guard try lease.publishManifest(data) == expectedDigest else {
+                throw MigrationImportTransactionError.planDrift
+            }
+        }
+    }
+
     static func revalidate(
         _ prepared: PreparedMigrationExecution,
         environment: MigrationImportTransactionEnvironment
@@ -146,6 +173,7 @@ private extension PreparedMigrationExecution {
             && operation.completenessPlan == other.operation.completenessPlan
             && operation.journalPlan == other.operation.journalPlan
             && operation.specifications == other.operation.specifications
+            && operation.baselineManifests == other.operation.baselineManifests
             && sourceAuthority == other.sourceAuthority
             && targetAuthority == other.targetAuthority
             && capacity == other.capacity

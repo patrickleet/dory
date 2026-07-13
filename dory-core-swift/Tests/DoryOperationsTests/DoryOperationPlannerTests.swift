@@ -57,6 +57,34 @@ final class DoryOperationPlannerTests: XCTestCase {
         )
     }
 
+    func testInventoryBaselinesExposeTheExactCanonicalPlannerBytes() throws {
+        let inventory = OperationPlanningFixtures.inventory()
+        let plan = try DoryOperationPlanner.plan(
+            inventory: inventory,
+            intents: OperationPlanningFixtures.intents(),
+            userSelection: [OperationPlanningFixtures.api],
+            context: OperationPlanningFixtures.context
+        )
+
+        let first = try DoryOperationPlanner.inventoryBaselines(inventory: inventory, plan: plan)
+        let reordered = try DoryOperationPlanner.inventoryBaselines(
+            inventory: inventory.reversed(),
+            plan: plan
+        )
+
+        XCTAssertEqual(first, reordered)
+        XCTAssertEqual(first.sourceInventory.last, UInt8(ascii: "\n"))
+        XCTAssertEqual(first.unselectedSourceInventory.last, UInt8(ascii: "\n"))
+        XCTAssertEqual(
+            DoryOperationJournalStore.digest(first.sourceInventory),
+            plan.sourceInventoryDigest
+        )
+        XCTAssertEqual(
+            DoryOperationJournalStore.digest(first.unselectedSourceInventory),
+            plan.unselectedSourceInventoryDigest
+        )
+    }
+
     func testMissingDependencyAndCycleBlockPlanning() {
         let missing = OperationPlanningFixtures.key(.volume, "missing")
         let container = DoryOperationInventoryObject(

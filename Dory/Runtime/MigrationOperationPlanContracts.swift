@@ -98,6 +98,13 @@ struct MigrationPlanAssembly {
     }
 }
 
+nonisolated struct MigrationOperationBaselineManifests: Sendable, Equatable {
+    let sourceInventory: Data
+    let unselectedSourceInventory: Data
+    let targetInventory: Data
+    let unownedTargetInventory: Data
+}
+
 struct MigrationImageIndex {
     let byID: [String: DoryOperationObjectKey]
     let byReference: [String: DoryOperationObjectKey]

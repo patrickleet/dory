@@ -205,6 +205,14 @@ public struct DoryOperationPlanBinding: Sendable, Equatable {
     public let successCriteriaDigest: String
 }
 
+/// The exact canonical source-inventory bytes bound by a completeness plan.
+/// Persist these manifests when an operation begins so recovery can compare
+/// current state with the original full and unselected source baselines.
+public struct DoryOperationInventoryBaselines: Sendable, Equatable {
+    public let sourceInventory: Data
+    public let unselectedSourceInventory: Data
+}
+
 public extension DoryOperationPlan {
     init(
         id: UUID = UUID(),
