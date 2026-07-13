@@ -74,7 +74,7 @@ struct MigrationOperationOwnership: Sendable, Equatable {
         labels["dev.dory.object.kind"] = kind.rawValue
         labels["dev.dory.original.identity"] = sourceID
         labels["dev.dory.target.identity"] = targetID
-        labels["dev.dory.operation.state"] = "published"
+        labels["dev.dory.operation.state"] = kind == .container ? "published" : "staging"
         return labels
     }
 }

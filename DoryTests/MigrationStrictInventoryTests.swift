@@ -26,16 +26,23 @@ struct MigrationStrictInventoryTests: StrictInventoryTestCase {
             in: prepared,
             as: MigrationVolumeContract.self
         )
+        let network = try specification(
+            kind: .network,
+            in: prepared,
+            as: MigrationNetworkContract.self
+        )
         let container = try specification(
             kind: .container,
             in: prepared,
             as: ContainerSpec.self
         )
-        for labels in [volume.labels, container.labels] {
+        for labels in [volume.labels, network.labels, container.labels] {
             #expect(labels["dev.dory.operation.id"] == fixture.identity.id.uuidString.lowercased())
             #expect(labels["dev.dory.source.authority"] == prepared.ownership.sourceAuthorityHash)
-            #expect(labels["dev.dory.operation.state"] == "published")
         }
+        #expect(volume.labels["dev.dory.operation.state"] == "staging")
+        #expect(network.labels["dev.dory.operation.state"] == "staging")
+        #expect(container.labels["dev.dory.operation.state"] == "published")
         #expect(container.mounts.first?.source == "db-data")
         #expect(container.networkEndpointSettings["backend"]?.EndpointID == nil)
         #expect(container.networkEndpointSettings["backend"]?.IPAddress == nil)
