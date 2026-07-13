@@ -16,22 +16,27 @@ struct MigrationImportAssetStagerTests: StrictInventoryTestCase {
 
         #expect(state.phase == .staging)
         #expect(state.status == .running)
-        #expect(state.revision == 6)
+        #expect(state.revision == 7)
         let staged = try context.session.lease.readStagedObjects()
-        #expect(staged.map(\.source.kind) == [.image, .network, .volume])
+        #expect(staged.map(\.source.kind) == [.image, .network, .volume, .writableLayer])
         #expect(staged.allSatisfy { $0.disposition == .createdOperationOwned })
-        #expect(context.fixture.target.snapshotValue.images.count == 1)
+        #expect(context.fixture.target.snapshotValue.images.count == 2)
         let volume = try #require(context.fixture.target.snapshotValue.volumes.first)
         #expect(volume.name == "db-data")
         #expect(volume.labels["dev.dory.operation.state"] == "staging")
         let network = try #require(context.fixture.target.snapshotValue.networks.first)
         #expect(network.name == "backend")
         #expect(network.labels["dev.dory.operation.state"] == "staging")
-        #expect(try context.session.lease.events().map(\.stepID).suffix(3) == [
+        #expect(try context.session.lease.events().map(\.stepID).suffix(4) == [
             "staging.image-verified",
             "staging.network-verified",
-            "staging.volume-verified"
+            "staging.volume-verified",
+            "staging.writable-layer-verified"
         ])
+        #expect(context.fixture.source.commitRequests.count == 1)
+        #expect(context.fixture.source.commitRequests[0].pause == false)
+        #expect(context.fixture.source.snapshotValue.images.count == 1)
+        #expect(context.fixture.source.removedImages.count == 1)
 
         let volumeEvidence = try #require(staged.first { $0.source.kind == .volume })
         let manifestData = try context.session.lease.readManifest(
@@ -50,6 +55,7 @@ struct MigrationImportAssetStagerTests: StrictInventoryTestCase {
             == context.transfers.targetVolumeManifest)
 
         try verifyNetworkEvidence(staged, context: context)
+        try verifyWritableLayerEvidence(staged, context: context)
     }
 
     @Test func laterAssetFailureRollsBackEveryCreatedTargetAndFailsTerminally() async throws {
@@ -233,6 +239,46 @@ struct MigrationImportAssetStagerTests: StrictInventoryTestCase {
         #expect(record.state.status == .needsRecovery)
         #expect(record.state.lastEvent.recoveryAction == "rollback.retry")
     }
+
+    @Test func sourceWritableLayerDriftRollsBackPreviouslyStagedAssets() async throws {
+        let context = try await makeContext(name: "writable-layer-drift")
+        defer { context.cleanup() }
+        context.fixture.source.writableSizes["container-id"] = 2_048
+
+        await #expect(throws: MigrationImportAssetStagingError.self) {
+            _ = try await MigrationImportAssetStager.stage(
+                session: context.session,
+                environment: context.environment
+            )
+        }
+
+        #expect(context.fixture.source.commitRequests.isEmpty)
+        #expect(context.fixture.target.snapshotValue.images.isEmpty)
+        #expect(context.fixture.target.snapshotValue.volumes.isEmpty)
+        #expect(context.fixture.target.snapshotValue.networks.isEmpty)
+        #expect(try context.session.lease.read().state.status == .failed)
+    }
+
+    @Test func incompleteSourceSnapshotCleanupEntersNeedsRecovery() async throws {
+        let context = try await makeContext(name: "writable-layer-recovery")
+        defer { context.cleanup() }
+        context.fixture.source.failImageRemoval = true
+
+        await #expect(throws: MigrationImportAssetStagingError.self) {
+            _ = try await MigrationImportAssetStager.stage(
+                session: context.session,
+                environment: context.environment
+            )
+        }
+
+        #expect(context.fixture.source.snapshotValue.images.count == 2)
+        #expect(context.fixture.target.snapshotValue.images.isEmpty)
+        #expect(context.fixture.target.snapshotValue.volumes.isEmpty)
+        #expect(context.fixture.target.snapshotValue.networks.isEmpty)
+        let record = try context.session.lease.read()
+        #expect(record.state.status == .needsRecovery)
+        #expect(record.state.lastEvent.recoveryAction == "rollback.retry")
+    }
 }
 
 @MainActor
@@ -274,7 +320,8 @@ private extension MigrationImportAssetStagerTests {
             environment: MigrationImportAssetStagingEnvironment(
                 source: fixture.source,
                 target: fixture.target,
-                transfers: transfers
+                transfers: transfers,
+                sharedHome: "/Users/test"
             ),
             transfers: transfers,
             home: home
@@ -303,5 +350,26 @@ private extension MigrationImportAssetStagerTests {
         )
         #expect(inspected["Driver"] as? String == "bridge")
         #expect((inspected["IPAM"] as? [String: Any])?["Driver"] as? String == "default")
+    }
+
+    func verifyWritableLayerEvidence(
+        _ staged: [DoryOperationStagedObject],
+        context: Context
+    ) throws {
+        let evidence = try #require(staged.first { $0.source.kind == .writableLayer })
+        let manifestData = try context.session.lease.readManifest(
+            digest: evidence.verificationManifestDigest
+        )
+        let manifest = try JSONDecoder().decode(
+            MigrationLayerVerificationManifest.self,
+            from: manifestData
+        )
+        #expect(manifest.operationID == context.fixture.identity.id)
+        #expect(manifest.sourceContainerID == "container-id")
+        #expect(manifest.logicalBytes == 1_024)
+        #expect(manifest.committedSourceImageID == manifest.loadedTargetImageID)
+        _ = try context.session.lease.readManifest(
+            digest: manifest.imageVerificationManifestDigest
+        )
     }
 }

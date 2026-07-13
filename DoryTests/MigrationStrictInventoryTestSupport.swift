@@ -277,6 +277,7 @@ final class StrictMigrationRuntime: ContainerRuntime {
     var networkInspections: [String: [String: Any]] = [:]
     var createdVolumes: [MigrationVolumeContract] = []
     var createdNetworkRequests: [Data] = []
+    var commitRequests: [StrictCommitRequest] = []
     var removedVolumes: [String] = []
     var removedNetworks: [String] = []
     var removedImages: [String] = []
@@ -368,6 +369,9 @@ final class StrictMigrationRuntime: ContainerRuntime {
         let normalized = MigrationOperationPlanBuilder.normalizedImageID(id)
         snapshotValue.images.removeAll {
             MigrationOperationPlanBuilder.normalizedImageID($0.imageID) == normalized
+                || MigrationOperationPlanBuilder.imageReferences($0).contains(
+                    MigrationOperationPlanBuilder.canonicalImageReference(id)
+                )
         }
     }
 

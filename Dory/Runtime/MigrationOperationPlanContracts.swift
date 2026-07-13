@@ -129,7 +129,7 @@ struct MigrationAuthorityContract: Codable {
     let engineVersion: String
     let inventoryDigest: String
 }
-struct MigrationWritableLayerContract: Codable {
+struct MigrationWritableLayerContract: Codable, Sendable, Equatable {
     let containerID: String
     let logicalBytes: Int64
 }

@@ -71,6 +71,7 @@ enum MigrationImportAssetStager {
 
 enum MigrationCreatedAsset {
     case image(id: String)
+    case sourceImage(reference: String, expectedLabels: [String: String])
     case volume(name: String, expectedLabels: [String: String])
     case network(name: String, expectedLabels: [String: String])
 }
@@ -109,7 +110,9 @@ struct MigrationImportAssetStagingExecution {
                 try await stageVolume(object)
             case .network:
                 try await stageNetwork(object)
-            case .writableLayer, .container:
+            case .writableLayer:
+                try await stageWritableLayer(object)
+            case .container:
                 continue
             }
         }
@@ -271,6 +274,8 @@ struct MigrationImportAssetStagingExecution {
             switch asset {
             case let .image(id):
                 await rollbackImage(id, failures: &failures)
+            case let .sourceImage(reference, expectedLabels):
+                await rollbackSourceImage(reference, expectedLabels: expectedLabels, failures: &failures)
             case let .volume(name, expectedLabels):
                 await rollbackVolume(name, expectedLabels: expectedLabels, failures: &failures)
             case let .network(name, expectedLabels):

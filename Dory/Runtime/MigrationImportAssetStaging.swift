@@ -7,6 +7,7 @@ enum MigrationImportAssetStagingError: Error, Sendable, Equatable, CustomStringC
     case invalidSpecification(DoryOperationObjectKey)
     case targetDrift(DoryOperationObjectKey)
     case targetRequest(String)
+    case cleanup([String])
     case operationAndRollback(operation: String, rollback: [String])
     case operationAndJournal(operation: String, journal: String)
 
@@ -20,6 +21,8 @@ enum MigrationImportAssetStagingError: Error, Sendable, Equatable, CustomStringC
             return "migration target changed before staging \(key)"
         case let .targetRequest(detail):
             return "migration target request failed: \(detail)"
+        case let .cleanup(details):
+            return "migration staging cleanup failed: \(details.joined(separator: "; "))"
         case let .operationAndRollback(operation, rollback):
             return "asset staging failed (\(operation)); rollback also failed: "
                 + rollback.joined(separator: "; ")
@@ -71,6 +74,7 @@ struct MigrationImportAssetStagingEnvironment: Sendable {
     let source: any ContainerRuntime
     let target: any ContainerRuntime
     let transfers: any MigrationImportAssetTransfers
+    let sharedHome: String
 }
 
 struct MigrationVolumeVerificationManifest: Codable, Sendable, Equatable {
@@ -134,6 +138,36 @@ struct MigrationNetworkVerificationManifest: Codable, Sendable, Equatable {
         specificationDigest = object.specificationDigest
         self.inspectedContractDigest = inspectedContractDigest
         self.targetFingerprint = targetFingerprint
+    }
+}
+
+struct MigrationLayerVerificationManifest: Codable, Sendable, Equatable {
+    static let schemaVersion = 1
+
+    let schemaVersion: Int
+    let operationID: UUID
+    let sourceContainerID: String
+    let logicalBytes: Int64
+    let committedSourceImageID: String
+    let loadedTargetImageID: String
+    let imageVerificationManifestDigest: String
+    let targetFingerprint: String
+
+    init(
+        operationID: UUID,
+        specification: MigrationWritableLayerContract,
+        committedSourceImageID: String,
+        receipt: MigrationImageTransferReceipt,
+        imageVerificationManifestDigest: String
+    ) {
+        schemaVersion = Self.schemaVersion
+        self.operationID = operationID
+        sourceContainerID = specification.containerID
+        logicalBytes = specification.logicalBytes
+        self.committedSourceImageID = committedSourceImageID
+        loadedTargetImageID = receipt.loadedTargetImageID
+        self.imageVerificationManifestDigest = imageVerificationManifestDigest
+        targetFingerprint = receipt.verifiedTarget.archiveContractSha256
     }
 }
 
