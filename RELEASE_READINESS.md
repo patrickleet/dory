@@ -217,6 +217,15 @@ re-sign that artifact, then repeat the exact-candidate gates before replacing th
   because that image predated the required ext4 inspection/growth tools. The rebuilt pinned arm64
   guest image passes its provenance verifier and contains `dumpe2fs`, `resize2fs`, and `e2fsck`;
   only the current-asset rerun is counted.
+- Selected-drive authority now lives outside replaceable `~/.dory` state and contains the drive
+  UUID, external APFS volume UUID, canonical path, and a macOS bookmark. Seven adversarial store
+  tests cover runtime-state deletion, missing and mismatched drives, relocation, corrupt records,
+  symlinks, hard links, and recovery binding. A real two-image APFS gate renamed the selected
+  volume, recovered the new path through the bookmark, rejected an impostor volume with the same
+  visible name, and reaccepted the original by UUID. The live Docker gate then repeated the full
+  image/container/layer/volume/network cycle, removed all runtime state, restarted without an
+  explicit drive argument, and recovered the unchanged selection and workload bytes. These are
+  current-source proofs; the same gates remain mandatory for the exact notarized artifact.
 - Rust formatting, clippy with warnings denied, and workspace tests passed.
 - Release-output, Sparkle key/signature, quarantine, cleanup, compatibility, readiness, benchmark
   safety, and offline upgrade/rollback regression tests passed.

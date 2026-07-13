@@ -14,9 +14,13 @@ _ = signal(SIGPIPE, SIG_IGN)
 let env = ProcessInfo.processInfo.environment
 let dorydEnvironment = DorydEnvironment(values: env)
 do {
-    let drive = try dorydEnvironment.dataDriveConfiguration()
-    try drive.prepare()
-    FileHandle.standardError.write(Data("doryd: data drive ready at \(drive.root)\n".utf8))
+    let requestedDrive = try dorydEnvironment.dataDriveConfiguration()
+    let selectionStore = try DoryDataDriveSelectionStore(home: dorydEnvironment.home)
+    let drive = try selectionStore.prepareSelection(requestedRoot: requestedDrive.root)
+    let driveID = try drive.readManifest().id.uuidString.lowercased()
+    FileHandle.standardError.write(
+        Data("doryd: data drive \(driveID) ready at \(drive.root)\n".utf8)
+    )
 } catch {
     FileHandle.standardError.write(Data("doryd: data drive unavailable: \(error)\n".utf8))
     exit(1)

@@ -329,12 +329,15 @@ container_writable_layer_persistence=PASS
 named_volume_persistence=PASS
 custom_network_persistence=PASS
 transient_runtime_replacement=PASS
+durable_selection_survives_runtime_reset=PASS
 EOF
 mkdir -p "$QUALIFICATION_FIXTURE/evidence/data-drive-volume-identity/run"
 cat > "$QUALIFICATION_FIXTURE/evidence/data-drive-volume-identity/run/summary.txt" <<EOF
 status=PASS
 architecture=arm64
 external_volume_identity=PASS
+durable_selection_outside_runtime_state=PASS
+bookmark_volume_rename_recovery=PASS
 missing_volume_shadow_prevention=PASS
 same_name_wrong_volume_rejected=PASS
 original_volume_reaccepted=PASS

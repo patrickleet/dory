@@ -260,9 +260,13 @@ public struct DorydEnvironment: Sendable {
     }
 
     public func dataDriveConfiguration() throws -> DoryDataDrive {
-        try DoryDataDrive(
+        let explicit = string("DORYD_DATA_DRIVE") ?? string("DORY_DATA_DRIVE")
+        let selected = explicit == nil
+            ? try DoryDataDriveSelectionStore(home: home).selectedPath()
+            : nil
+        return try DoryDataDrive(
             home: home,
-            overrideRoot: string("DORYD_DATA_DRIVE") ?? string("DORY_DATA_DRIVE")
+            overrideRoot: explicit ?? selected
         )
     }
 

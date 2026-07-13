@@ -75,6 +75,14 @@ The manifest is written atomically, fsynced, private to the user, and validated 
 attaches storage. A populated directory without a valid Dory manifest is never adopted. A second
 engine cannot attach the same drive, even through a different path alias.
 
+The selected-drive authority is a separate private, atomically published control record at
+`~/Library/Application Support/Dory/data-drive-selection.json`. It stores the drive UUID, external
+APFS volume UUID, last canonical path, and a minimal macOS bookmark. It deliberately does not live
+under `~/.dory`: replacing every runtime socket, PID, log, kernel, and rootfs cache cannot make Dory
+forget an external drive and initialize an empty default. A resolved bookmark is accepted only
+after the drive and volume UUIDs match; a missing drive or same-name replacement volume fails
+closed without creating a mount-point shadow.
+
 The Docker filesystem is a bounded sparse file, not an 8 TiB promise. The launch default is a
 128 GiB logical ceiling with explicit user-controlled growth/cap changes. Guest discard maps to
 APFS hole punching, and graceful shutdown runs sync, unmount, and trim before the VM exits. UI and
@@ -147,6 +155,8 @@ drives:
   populated bundles, and unwritable roots fail before VM attachment and create no shadow/partial;
 - app, daemon, standalone, raw-HV, and VZ paths select the same drive and reject a concurrent second
   owner even through an alias;
+- erasing all `~/.dory` state preserves selected-drive authority, an APFS volume rename is recovered
+  through its bookmark, and a different volume mounted under the old name is rejected by UUID;
 - images, containers, writable layers, volumes, networks, BuildKit, Kubernetes, and machines survive
   replacement of all runtime cache state plus app update/rollback;
 - 16 GiB legacy disks grow sparsely to the configured ceiling, ext4 grows in the guest, trim returns

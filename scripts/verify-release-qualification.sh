@@ -116,13 +116,14 @@ for proof in status fresh_drive_default explicit_drive_status running_drive_mism
   alias_concurrent_attach_rejected manifest_uuid_identity image_persistence \
   stopped_missing_selected_drive_rejected \
   container_writable_layer_persistence named_volume_persistence custom_network_persistence \
-  transient_runtime_replacement; do
+  transient_runtime_replacement durable_selection_survives_runtime_reset; do
   grep -qx "$proof=PASS" "$drive_summary" \
     || die "retained managed data-drive evidence does not prove $proof"
 done
 
 volume_identity_summary="$(single_evidence_file data-drive-volume-identity summary.txt)"
-for proof in status external_volume_identity missing_volume_shadow_prevention \
+for proof in status external_volume_identity durable_selection_outside_runtime_state \
+  bookmark_volume_rename_recovery missing_volume_shadow_prevention \
   same_name_wrong_volume_rejected original_volume_reaccepted; do
   grep -qx "$proof=PASS" "$volume_identity_summary" \
     || die "retained data-drive volume-identity evidence does not prove $proof"

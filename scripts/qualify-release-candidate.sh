@@ -440,7 +440,7 @@ for proof in status fresh_drive_default explicit_drive_status running_drive_mism
   alias_concurrent_attach_rejected manifest_uuid_identity image_persistence \
   stopped_missing_selected_drive_rejected \
   container_writable_layer_persistence named_volume_persistence custom_network_persistence \
-  transient_runtime_replacement; do
+  transient_runtime_replacement durable_selection_survives_runtime_reset; do
   grep -qx "$proof=PASS" "$drive_summary" \
     || die "managed data-drive summary does not prove $proof"
 done
@@ -453,7 +453,8 @@ bounded 180 scripts/data-drive-volume-identity-gate.sh \
 volume_identity_summary="$(find "$WORKDIR/evidence/data-drive-volume-identity" \
   -name summary.txt -type f -print -quit)"
 [ -s "$volume_identity_summary" ] || die "data-drive volume-identity summary is missing"
-for proof in status external_volume_identity missing_volume_shadow_prevention \
+for proof in status external_volume_identity durable_selection_outside_runtime_state \
+  bookmark_volume_rename_recovery missing_volume_shadow_prevention \
   same_name_wrong_volume_rejected original_volume_reaccepted; do
   grep -qx "$proof=PASS" "$volume_identity_summary" \
     || die "data-drive volume-identity summary does not prove $proof"

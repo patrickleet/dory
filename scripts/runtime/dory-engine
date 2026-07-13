@@ -235,8 +235,11 @@ cmd_start() {
   validate_owned_socket_path "$SOCK"
   validate_owned_socket_path "$BACKEND_SOCK"
   local mem_mb=2048 cpus=4 amd64_enabled=0 gpu_mode=none lan_visible=0
-  local orphaned_gvproxy key value data_drive_explicit=0 extra=()
+  local orphaned_gvproxy key value selected_drive data_drive_explicit=0 extra=()
   local pid="" dataplane="" runtime_running=0
+  # An environment-selected drive is just as explicit as the CLI flag. A durable remembered
+  # selection may supply the default only when neither interface requested a path for this start.
+  [ -z "${DORY_DATA_DRIVE:-}" ] || data_drive_explicit=1
   if [ "$(uname -m)" != "x86_64" ]; then
     # Apple Silicon releases advertise the bundled FEX path as ready on first launch. Persisted or
     # explicit settings may opt out, but a plain start must never strand existing dory-runc
@@ -284,6 +287,11 @@ cmd_start() {
   [ "$gpu_mode" = none ] || extra+=(--gpu "$gpu_mode")
   [ "$lan_visible" -eq 0 ] || extra+=(--direct-ip --publish-host 0.0.0.0)
 
+  if [ "$data_drive_explicit" -eq 0 ]; then
+    selected_drive="$("$BIN/dory-hv" data-drive selected-path 2>/dev/null || true)"
+    [ -z "$selected_drive" ] || DATA_DRIVE="$selected_drive"
+  fi
+
   # Recover incomplete prior ownership before depending on the replacement helper. This keeps a
   # damaged or interrupted upgrade from stranding the old VM/gvproxy processes indefinitely.
   if pid="$(engine_pid)" && dataplane="$(dataplane_pid)" && socket_ready; then
@@ -323,7 +331,7 @@ cmd_start() {
       running_dory_hv_uses_drive "$pid" "$recorded_drive" \
         || die "running engine data drive does not match recorded drive $recorded_drive; stop it before recovery"
     fi
-    drive_id="$("$BIN/dory-hv" data-drive id "$recorded_drive")" \
+    drive_id="$("$BIN/dory-hv" data-drive bind-existing "$recorded_drive")" \
       || die "running engine data-drive identity is unreadable"
     [ -z "$recorded_drive_id" ] || [ "$recorded_drive_id" = "$drive_id" ] \
       || die "running engine data-drive UUID does not match recorded identity"
@@ -337,15 +345,11 @@ cmd_start() {
     return 0
   fi
 
-  if [ -n "$recorded_drive_id" ] && [ "$recorded_drive" = "$DATA_DRIVE" ]; then
-    drive_id="$("$BIN/dory-hv" data-drive id "$DATA_DRIVE")" \
-      || die "selected data drive is missing or its identity is unreadable; refusing to create a replacement"
-    [ "$recorded_drive_id" = "$drive_id" ] \
-      || die "selected data-drive UUID does not match recorded identity"
-  else
-    drive_id="$("$BIN/dory-hv" data-drive prepare "$DATA_DRIVE")" \
-      || die "cannot prepare data drive $DATA_DRIVE"
-  fi
+  drive_id="$("$BIN/dory-hv" data-drive select "$DATA_DRIVE")" \
+    || die "cannot select data drive $DATA_DRIVE"
+  [ -z "$recorded_drive_id" ] || [ -z "$recorded_drive" ] \
+    || [ "$recorded_drive" != "$DATA_DRIVE" ] || [ "$recorded_drive_id" = "$drive_id" ] \
+    || die "selected data-drive UUID does not match recorded runtime identity"
 
   mkdir -p "$STATE/vm" "$STATE/bin"
   if [ ! -f "$KERNEL" ] || [ "$KERNEL_ASSET" -nt "$KERNEL" ]; then

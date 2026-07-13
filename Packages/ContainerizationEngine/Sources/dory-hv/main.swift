@@ -212,27 +212,52 @@ guard let command = arguments.first else {
 
 switch command {
 case "data-drive":
-    guard arguments.count == 3 else {
-        fail("usage: dory-hv data-drive <resolve|prepare|id> <absolute .dorydrive path>")
+    guard arguments.count >= 2 else {
+        fail("usage: dory-hv data-drive <resolve|prepare|id|selected-path|select|bind-existing> [path]")
     }
     let operation = arguments[1]
-    let requestedPath = arguments[2]
     do {
-        let drive = try DoryDataDrive(
-            home: DoryDataDrive.processHome(),
-            overrideRoot: requestedPath
-        )
+        let home = DoryDataDrive.processHome()
         switch operation {
+        case "selected-path":
+            guard arguments.count == 2 else {
+                fail("usage: dory-hv data-drive selected-path")
+            }
+            guard let path = try DoryDataDriveSelectionStore(home: home).selectedPath() else {
+                exit(3)
+            }
+            print(path)
+        case "select", "bind-existing":
+            guard arguments.count == 3 else {
+                fail("usage: dory-hv data-drive \(operation) <absolute .dorydrive path>")
+            }
+            let store = try DoryDataDriveSelectionStore(home: home)
+            let drive = operation == "select"
+                ? try store.prepareSelection(requestedRoot: arguments[2])
+                : try store.bindExistingSelection(requestedRoot: arguments[2])
+            print(try drive.readManifest().id.uuidString.lowercased())
         case "resolve":
+            guard arguments.count == 3 else {
+                fail("usage: dory-hv data-drive resolve <absolute .dorydrive path>")
+            }
+            let drive = try DoryDataDrive(home: home, overrideRoot: arguments[2])
             print(drive.root)
         case "prepare":
+            guard arguments.count == 3 else {
+                fail("usage: dory-hv data-drive prepare <absolute .dorydrive path>")
+            }
+            let drive = try DoryDataDrive(home: home, overrideRoot: arguments[2])
             try drive.prepare()
             print(try drive.readManifest().id.uuidString.lowercased())
         case "id":
+            guard arguments.count == 3 else {
+                fail("usage: dory-hv data-drive id <absolute .dorydrive path>")
+            }
+            let drive = try DoryDataDrive(home: home, overrideRoot: arguments[2])
             try drive.validateManifest()
             print(try drive.readManifest().id.uuidString.lowercased())
         default:
-            fail("usage: dory-hv data-drive <resolve|prepare|id> <absolute .dorydrive path>")
+            fail("usage: dory-hv data-drive <resolve|prepare|id|selected-path|select|bind-existing> [path]")
         }
     } catch {
         fail("data-drive \(operation) failed: \(error)")

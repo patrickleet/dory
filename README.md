@@ -50,10 +50,14 @@
   snapshots, and backups live together at
   `~/Library/Application Support/Dory/Dory.dorydrive`. Replaceable sockets, logs, kernels, and VM
   boot state stay in `~/.dory`; deleting or rebuilding that runtime state does not delete workloads.
+  Dory remembers the selected drive outside that cache and binds external drives to their APFS
+  volume UUID, so a renamed volume is rediscovered while a missing or same-name replacement volume
+  fails closed instead of producing a fresh empty Docker store.
   Homebrew uninstall and `--zap` also preserve the data drive, so removing the app is never an
   implicit request to erase containers or volumes. To move `DORY_DATA_DRIVE` outside Dory's
-  Application Support directory, it must be a `.dorydrive` on mounted local APFS storage under `/Volumes`; privacy-protected Desktop,
-  Documents, Downloads, iCloud, and CloudStorage paths are rejected before the engine starts so a
+  Application Support directory, it must be a `.dorydrive` on mounted local APFS storage under
+  `/Volumes`; privacy-protected Desktop, Documents, Downloads, iCloud, and CloudStorage paths are
+  rejected before the engine starts so a
   cold launch cannot depend on a transient macOS permission grant.
 - **Native, not Electron.** One Swift/SwiftUI app: menu-bar agent + full dashboard, launch
   animation to launch-at-login, light and dark. No Chromium, no Node, no telemetry.

@@ -1,4 +1,5 @@
 @testable import DorydKit
+import DoryCore
 import XCTest
 
 final class DorydConfigurationTests: XCTestCase {
@@ -578,6 +579,33 @@ final class DorydConfigurationTests: XCTestCase {
         let hv = try XCTUnwrap(env.dockerTierConfiguration()?.hvProcess)
         XCTAssertArgumentPair(hv.arguments, "--data-drive", drive)
         XCTAssertFalse(hv.arguments.contains("--legacy-data-disk"))
+        XCTAssertEqual(env.machineManagerConfiguration()?.stateDirectory, drive + "/machines")
+    }
+
+    func testRememberedDataDriveRoutesDockerAndMachinePersistenceWithoutEnvironmentOverride() throws {
+        let directory = "/tmp/doryd-selected-drive-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let helper = try executableFixture(at: directory + "/dory-hv")
+        let vmm = try executableFixture(at: directory + "/dory-vmm")
+        let gvproxy = try executableFixture(at: directory + "/gvproxy")
+        let kernel = directory + "/kernel"
+        FileManager.default.createFile(atPath: kernel, contents: Data())
+        let home = directory + "/home"
+        try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
+        let drive = home + "/Library/Application Support/Dory/Selected.dorydrive"
+        let store = try DoryDataDriveSelectionStore(home: home)
+        _ = try store.prepareSelection(requestedRoot: drive)
+        let env = DorydEnvironment(values: [
+            "DORYD_HOME": home,
+            "DORYD_HV_HELPER": helper,
+            "DORYD_VMM_HELPER": vmm,
+            "DORYD_HV_KERNEL": kernel,
+            "DORYD_GVPROXY": gvproxy,
+        ], cwd: directory, hostPlatform: supportedRawHVPlatform())
+
+        let hv = try XCTUnwrap(env.dockerTierConfiguration()?.hvProcess)
+        XCTAssertArgumentPair(hv.arguments, "--data-drive", drive)
         XCTAssertEqual(env.machineManagerConfiguration()?.stateDirectory, drive + "/machines")
     }
 

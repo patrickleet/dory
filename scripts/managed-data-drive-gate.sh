@@ -44,10 +44,14 @@ done
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 RUN_ROOT="$WORKROOT/$RUN_ID"
 EVIDENCE="$RUN_ROOT/evidence"
-RUNTIME_HOME="${DORY_MANAGED_DRIVE_RUNTIME_HOME:-${TMPDIR:-/tmp}/dory-md-$PPID-$$}"
+RUNTIME_HOME="${DORY_MANAGED_DRIVE_RUNTIME_HOME:-${TMPDIR:-/tmp}}"
+if [ -z "${DORY_MANAGED_DRIVE_RUNTIME_HOME:-}" ]; then
+  RUNTIME_HOME="${RUNTIME_HOME%/}/dory-md-$PPID-$$"
+fi
 STATE="$RUNTIME_HOME/.dory"
 FIRST_STATE="$RUNTIME_HOME/.dory-first-runtime"
 DRIVE="$RUNTIME_HOME/Library/Application Support/Dory/Dory.dorydrive"
+SELECTION_RECORD="$RUNTIME_HOME/Library/Application Support/Dory/data-drive-selection.json"
 SOCKET="$STATE/engine.sock"
 ENGINE_PIDFILE="$STATE/engine-cli.pid"
 DATAPLANE_PIDFILE="$STATE/dataplane-cli.pid"
@@ -96,6 +100,10 @@ for directory in engine kubernetes machines snapshots exports operations; do
 done
 [ -s "$STATE/data-drive.id" ] \
   || { echo "managed data-drive gate: drive UUID ownership record missing" >&2; exit 1; }
+[ -s "$SELECTION_RECORD" ] \
+  || { echo "managed data-drive gate: durable selected-drive record missing" >&2; exit 1; }
+selection_hash_before="$(shasum -a 256 "$SELECTION_RECORD" | awk '{print $1}')"
+cp "$SELECTION_RECORD" "$EVIDENCE/selection-before-runtime-reset.json"
 [ ! -e "$DRIVE/engine/docker-data.ext4.migrated-from-legacy" ] \
   || { echo "managed data-drive gate: fresh launch silently adopted legacy data" >&2; exit 1; }
 HOME="$RUNTIME_HOME" "$RUNTIME/dory-engine" status >"$EVIDENCE/first-status.log"
@@ -203,9 +211,16 @@ export DOCKER_HOST="unix://$SOCKET"
 HOME="$RUNTIME_HOME" "$RUNTIME/dory-engine" stop >"$EVIDENCE/first-stop.log" 2>&1
 cp "$STATE/engine.log" "$EVIDENCE/first-engine.log"
 mv "$STATE" "$FIRST_STATE"
+[ -s "$SELECTION_RECORD" ] \
+  || { echo "managed data-drive gate: replacing runtime state removed the drive selection" >&2; exit 1; }
 
-HOME="$RUNTIME_HOME" "$RUNTIME/dory-engine" start --data-drive "$DRIVE" \
+HOME="$RUNTIME_HOME" "$RUNTIME/dory-engine" start \
   >"$EVIDENCE/restart-with-fresh-runtime.log" 2>&1
+[ "$(shasum -a 256 "$SELECTION_RECORD" | awk '{print $1}')" = "$selection_hash_before" ] \
+  || { echo "managed data-drive gate: runtime reset changed stable selected-drive authority" >&2; exit 1; }
+HOME="$RUNTIME_HOME" "$RUNTIME/dory-engine" status >"$EVIDENCE/status-after-runtime-reset.log"
+grep -F "data drive: $DRIVE" "$EVIDENCE/status-after-runtime-reset.log" >/dev/null \
+  || { echo "managed data-drive gate: fresh runtime did not recover its durable drive" >&2; exit 1; }
 export DOCKER_HOST="unix://$STATE/engine.sock"
 "$DOCKER" image inspect "$IMAGE" >"$EVIDENCE/image-after.json"
 "$DOCKER" container inspect "$NAME" >"$EVIDENCE/container-after.json"
@@ -269,6 +284,7 @@ PY
   printf 'named_volume_persistence=PASS\n'
   printf 'custom_network_persistence=PASS\n'
   printf 'transient_runtime_replacement=PASS\n'
+  printf 'durable_selection_survives_runtime_reset=PASS\n'
   stat -f 'drive_logical_bytes=%z' "$DRIVE/engine/docker-data.ext4"
   printf 'drive_allocated_bytes=%s\n' "$(( $(stat -f '%b' "$DRIVE/engine/docker-data.ext4") * 512 ))"
 } >"$EVIDENCE/summary.txt"
