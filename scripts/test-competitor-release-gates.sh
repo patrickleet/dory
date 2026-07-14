@@ -159,6 +159,41 @@ for default_platform_contract in default_pull_without_platform single_platform_l
 done
 grep -F '# Intentionally no --platform here.' scripts/default-platform-image-gate.sh >/dev/null \
   || fail "default platform image gate no longer documents the unqualified pull"
+for private_registry_contract in registry_fixture_arm64 unauthenticated_pull_rejected authenticated_login \
+  authenticated_pull_run buildkit_registry_auth buildkit_secret_nonleak registry_push \
+  image_inspect_history image_save_load_identity image_tag_remove filtered_image_prune \
+  owned_cleanup isolated_credential_cleanup; do
+  grep -F "$private_registry_contract" scripts/private-registry-auth-gate.sh \
+    scripts/qualify-release-candidate.sh scripts/verify-release-qualification.sh >/dev/null \
+    || fail "private-registry qualification omits $private_registry_contract"
+done
+grep -F 'registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373' \
+  scripts/private-registry-auth-gate.sh scripts/qualify-release-candidate.sh >/dev/null \
+  || fail "private-registry qualification lost its digest-pinned registry fixture"
+grep -F 'scripts/private-registry-auth-gate.sh' scripts/qualify-release-candidate.sh >/dev/null \
+  || fail "exact candidate qualification does not run private-registry auth"
+grep -F 'privateRegistryAuthGate' scripts/qualify-release-candidate.sh \
+  scripts/verify-release-qualification.sh >/dev/null \
+  || fail "private-registry qualification is not bound to publication evidence"
+grep -F 'docker_cli_sha256=$CANDIDATE_DOCKER_SHA' \
+  scripts/verify-release-qualification.sh >/dev/null \
+  && grep -F 'buildx_cli_sha256=$CANDIDATE_BUILDX_SHA' \
+    scripts/verify-release-qualification.sh >/dev/null \
+  || fail "private-registry evidence is not bound to exact candidate clients"
+for prune_contract in empty_engine_precondition unfiltered_system_prune \
+  unfiltered_container_prune unfiltered_image_prune unfiltered_network_prune \
+  unfiltered_volume_prune unfiltered_builder_prune active_container_survived \
+  active_image_survived active_volume_survived active_network_survived \
+  active_volume_bytes_preserved unused_container_removed unused_image_removed \
+  unused_volume_removed unused_network_removed build_cache_removed owned_cleanup; do
+  grep -F "$prune_contract" scripts/prune-safety-gate.sh \
+    scripts/qualify-release-candidate.sh scripts/verify-release-qualification.sh >/dev/null \
+    || fail "exact prune-safety qualification omits $prune_contract"
+done
+grep -F 'scripts/prune-safety-gate.sh' scripts/qualify-release-candidate.sh >/dev/null \
+  && grep -F 'pruneSafetyGate' scripts/qualify-release-candidate.sh \
+    scripts/verify-release-qualification.sh >/dev/null \
+  || fail "prune-safety qualification is not bound to exact publication evidence"
 grep -F 'apple/container/issues/1537' COMPETITOR_ISSUE_COVERAGE.md >/dev/null \
   || fail "competitor coverage omits Apple's multi-platform storage regression"
 for nix_gc_contract in fresh_pull unreachable_store_path_created \

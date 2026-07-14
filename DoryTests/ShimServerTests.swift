@@ -352,6 +352,50 @@ struct ShimServerTests {
     }
 
     @MainActor
+    @Test func dockerBackedImageMetadataPreservesExactRequests() async throws {
+        let path = shortSocketPath("dory-image-proxy")
+        let capture = BufferedImageProxyCapture()
+        let shim = DockerShim(runtime: BufferedImageProxyRuntime(capture: capture))
+        let server = ShimHTTPServer(socketPath: path) { request in await shim.handle(request) }
+        try server.start()
+        defer { server.stop() }
+        let client = UnixSocketHTTP(path: path)
+        let targets = [
+            "/v1.47/images/json?all=1&shared-size=1&digests=1",
+            "/v1.47/images/example%2Fapp:dev/json",
+            "/v1.47/images/example%2Fapp:dev/history",
+            "/v1.47/images/example%2Fapp:dev/tag?repo=copy%2Fapp&tag=qa",
+            "/v1.47/images/example%2Fapp:dev?force=0&noprune=1",
+            "/v1.47/images/prune?filters=%7B%22label%22%3A%5B%22owned%3Dyes%22%5D%7D",
+            "/v1.47/system/df?type=image",
+            "/v1.47/images/search?term=alpine&limit=7",
+        ]
+        let methods = ["GET", "GET", "GET", "POST", "DELETE", "POST", "GET", "GET"]
+        for (method, target) in zip(methods, targets) {
+            let response = try await client.send(HTTPRequest(method: method, path: target))
+            #expect(response.statusCode == 202)
+            #expect(response.body == Data("proxied".utf8))
+        }
+        let authBody = Data(#"{"username":"dory","password":"secret"}"#.utf8)
+        let auth = try await client.send(HTTPRequest(
+            method: "POST",
+            path: "/v1.47/auth",
+            headers: [
+                (name: "Content-Type", value: "application/json"),
+                (name: "X-Registry-Auth", value: "opaque-auth"),
+            ],
+            body: authBody
+        ))
+        #expect(auth.statusCode == 202)
+
+        let requests = capture.requests
+        #expect(requests.map(\.path) == targets + ["/v1.47/auth"])
+        #expect(requests.map(\.method) == methods + ["POST"])
+        #expect(requests.last?.registryAuth == "opaque-auth")
+        #expect(requests.last?.body == authBody)
+    }
+
+    @MainActor
     @Test func rawProxyOwnsConnectionAndPreservesLargeRequest() async throws {
         let path = shortSocketPath("dory-raw-proxy")
         let capture = RawProxyCapture(expectedBodyBytes: 200_000)
@@ -560,6 +604,73 @@ private struct ImageFilterRuntime: ContainerRuntime {
     func env(containerID: String) async throws -> [EnvVar] { [] }
     func create(_ spec: ContainerSpec) async throws -> String { "created" }
     func exec(containerID: String, command: [String]) async throws -> ExecResult { ExecResult(exitCode: 0, output: "") }
+}
+
+private struct BufferedImageProxyRequest: Sendable {
+    let method: String
+    let path: String
+    let registryAuth: String?
+    let body: Data
+}
+
+private final class BufferedImageProxyCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var captured: [BufferedImageProxyRequest] = []
+
+    var requests: [BufferedImageProxyRequest] {
+        lock.lock()
+        defer { lock.unlock() }
+        return captured
+    }
+
+    func record(
+        method: String,
+        path: String,
+        headers: [(name: String, value: String)],
+        body: Data
+    ) {
+        lock.lock()
+        captured.append(BufferedImageProxyRequest(
+            method: method,
+            path: path,
+            registryAuth: headers.first { $0.name == "x-registry-auth" }?.value,
+            body: body
+        ))
+        lock.unlock()
+    }
+}
+
+private struct BufferedImageProxyRuntime: ContainerRuntime {
+    let kind: RuntimeKind = .sharedVM
+    let capture: BufferedImageProxyCapture
+    var supportsRawProxy: Bool { true }
+
+    func snapshot() async throws -> RuntimeSnapshot { RuntimeSnapshot() }
+    func start(containerID: String) async throws {}
+    func stop(containerID: String) async throws {}
+    func restart(containerID: String) async throws {}
+    func remove(containerID: String) async throws {}
+    func logs(containerID: String) async throws -> [LogLine] { [] }
+    func env(containerID: String) async throws -> [EnvVar] { [] }
+    func create(_ spec: ContainerSpec) async throws -> String { spec.name }
+    func exec(containerID: String, command: [String]) async throws -> ExecResult {
+        ExecResult(exitCode: 0, output: "")
+    }
+
+    func proxyRequest(
+        method: String,
+        path: String,
+        headers: [(name: String, value: String)],
+        body: Data
+    ) async -> HTTPResponse? {
+        capture.record(method: method, path: path, headers: headers, body: body)
+        return HTTPResponse(
+            statusCode: 202,
+            reason: "Accepted",
+            headers: ["content-type": "application/octet-stream"],
+            body: Data("proxied".utf8)
+        )
+    }
 }
 
 private final class RawProxyCapture: @unchecked Sendable {

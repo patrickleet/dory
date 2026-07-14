@@ -12,6 +12,7 @@ QUALIFICATION_ROOT="${DORY_RELEASE_QUALIFICATION_ROOT:-$HOME/.dory-release-quali
 LONG_DURATION=90000
 ENDURANCE_DURATION=28800
 IMAGE="${DORY_RELEASE_QUALIFICATION_IMAGE:-}"
+REGISTRY_IMAGE="${DORY_RELEASE_REGISTRY_IMAGE:-registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373}"
 LOCK_IMAGE="${DORY_SOURCE_GATE_IMAGE:-}"
 SSH_CLIENT_IMAGE="${DORY_RELEASE_SSH_CLIENT_IMAGE:-}"
 NONNATIVE_NIX_IMAGE="${DORY_RELEASE_NONNATIVE_NIX_IMAGE:-nixos/nix@sha256:898e3874bc80a8fbd7df6001b6c83d6e0c904a942e3a4cdf8a89881458333cac}"
@@ -49,6 +50,7 @@ Options:
   --long-duration SECONDS   Same-connection duration (default: $LONG_DURATION)
   --endurance-duration SEC  Resource/Compose duration (default: $ENDURANCE_DURATION)
   --image REF                Digest-pinned Alpine-compatible fixture image
+  --registry-image REF       Digest-pinned Distribution registry fixture
   --lock-image REF           Digest-pinned Python image for cross-container bind locks
   --ssh-client-image REF     Digest-pinned image containing sh and ssh-add
   --nonnative-nix-image REF  Digest-pinned linux/amd64 Nix 2.34.7 image
@@ -90,6 +92,7 @@ while [ "$#" -gt 0 ]; do
     --long-duration) need_value "$1" "$#"; LONG_DURATION="$2"; shift 2 ;;
     --endurance-duration) need_value "$1" "$#"; ENDURANCE_DURATION="$2"; shift 2 ;;
     --image) need_value "$1" "$#"; IMAGE="$2"; shift 2 ;;
+    --registry-image) need_value "$1" "$#"; REGISTRY_IMAGE="$2"; shift 2 ;;
     --lock-image) need_value "$1" "$#"; LOCK_IMAGE="$2"; shift 2 ;;
     --ssh-client-image) need_value "$1" "$#"; SSH_CLIENT_IMAGE="$2"; shift 2 ;;
     --nonnative-nix-image) need_value "$1" "$#"; NONNATIVE_NIX_IMAGE="$2"; shift 2 ;;
@@ -156,6 +159,8 @@ positive_integer endurance-duration "$ENDURANCE_DURATION"
 positive_integer min-free-gb "$MIN_FREE_GB"
 printf '%s\n' "$IMAGE" | grep -Eq '^.+@sha256:[0-9a-f]{64}$' \
   || die "--image (or DORY_RELEASE_QUALIFICATION_IMAGE) must be digest-pinned"
+printf '%s\n' "$REGISTRY_IMAGE" | grep -Eq '^.+@sha256:[0-9a-f]{64}$' \
+  || die "--registry-image must be digest-pinned"
 printf '%s\n' "$LOCK_IMAGE" | grep -Eq '@sha256:[0-9a-f]{64}$' \
   || die "--lock-image (or DORY_SOURCE_GATE_IMAGE) must be digest-pinned"
 printf '%s\n' "$SSH_CLIENT_IMAGE" | grep -Eq '^.+@sha256:[0-9a-f]{64}$' \
@@ -203,7 +208,8 @@ fi
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-for command in caffeinate codesign curl ditto node npm pmset python3 shasum spctl tar xcodebuild xcrun; do
+for command in caffeinate codesign curl ditto htpasswd node npm openssl pmset python3 shasum \
+  spctl tar xcodebuild xcrun; do
   command -v "$command" >/dev/null || die "missing required command: $command"
 done
 
@@ -755,6 +761,72 @@ grep -qx 'expected_platform=linux/arm64' "$default_platform_manifest" \
   || die "default image pull did not qualify Apple Silicon"
 grep -qx 'registry=docker.io' "$default_platform_manifest" \
   || die "default image pull did not qualify Docker Hub manifest access"
+
+bounded 1200 scripts/prune-safety-gate.sh \
+  --socket "$SOCKET" \
+  --docker "$DOCKER" \
+  --base-image "$IMAGE" \
+  --source-commit "$SOURCE_COMMIT" \
+  --workroot "$WORKDIR/evidence/prune-safety" \
+  --confirm ISOLATED-ENGINE-PRUNE \
+  > "$WORKDIR/evidence/prune-safety.log" 2>&1 \
+  || die "isolated Docker prune-safety gate failed"
+prune_manifest="$(find "$WORKDIR/evidence/prune-safety" -name manifest.txt \
+  -type f -print -quit)"
+[ -s "$prune_manifest" ] || die "prune-safety evidence manifest is missing"
+for proof in status empty_engine_precondition unfiltered_system_prune \
+  unfiltered_container_prune unfiltered_image_prune unfiltered_network_prune \
+  unfiltered_volume_prune unfiltered_builder_prune active_container_survived \
+  active_image_survived active_volume_survived active_network_survived \
+  active_volume_bytes_preserved unused_container_removed unused_image_removed \
+  unused_volume_removed unused_network_removed build_cache_removed owned_cleanup; do
+  grep -qx "$proof=PASS" "$prune_manifest" \
+    || die "prune-safety evidence does not prove $proof"
+done
+prune_docker_sha="$(shasum -a 256 "$DOCKER" | awk '{print $1}')"
+grep -Fx "source_commit=$SOURCE_COMMIT" "$prune_manifest" >/dev/null \
+  && grep -Fx "base_image=$IMAGE" "$prune_manifest" >/dev/null \
+  && grep -qx "docker_cli_sha256=$prune_docker_sha" "$prune_manifest" \
+  || die "prune-safety evidence used the wrong source, image, or Docker CLI"
+# An all-unused image prune may remove the fixture tag after the protected resources are cleaned.
+# Restore that exact digest before the remaining image and registry qualification.
+bounded 600 env DOCKER_HOST="unix://$SOCKET" "$DOCKER" pull --platform linux/arm64 "$IMAGE" \
+  > "$WORKDIR/evidence/post-prune-base-pull.log" 2>&1 \
+  || die "could not restore the digest-pinned base image after prune qualification"
+
+bounded 1200 scripts/private-registry-auth-gate.sh \
+  --socket "$SOCKET" \
+  --docker "$DOCKER" \
+  --buildx "$APP/Contents/Helpers/docker-buildx" \
+  --base-image "$IMAGE" \
+  --registry-image "$REGISTRY_IMAGE" \
+  --source-commit "$SOURCE_COMMIT" \
+  --workroot "$WORKDIR/evidence/private-registry-auth" \
+  > "$WORKDIR/evidence/private-registry-auth.log" 2>&1 \
+  || die "private-registry authentication and image-lifecycle gate failed"
+private_registry_manifest="$(find "$WORKDIR/evidence/private-registry-auth" \
+  -name manifest.txt -type f -print -quit)"
+[ -s "$private_registry_manifest" ] || die "private-registry evidence manifest is missing"
+for proof in status registry_fixture_arm64 unauthenticated_pull_rejected authenticated_login \
+  authenticated_pull_run buildkit_registry_auth buildkit_secret_nonleak registry_push \
+  image_inspect_history image_save_load_identity image_tag_remove filtered_image_prune \
+  owned_cleanup isolated_credential_cleanup; do
+  grep -qx "$proof=PASS" "$private_registry_manifest" \
+    || die "private-registry evidence does not prove $proof"
+done
+grep -Fx "source_commit=$SOURCE_COMMIT" "$private_registry_manifest" >/dev/null \
+  && grep -Fx "base_image=$IMAGE" "$private_registry_manifest" >/dev/null \
+  && grep -Fx "registry_image=$REGISTRY_IMAGE" "$private_registry_manifest" >/dev/null \
+  || die "private-registry evidence used the wrong source or image fixtures"
+private_registry_docker_sha="$(shasum -a 256 "$DOCKER" | awk '{print $1}')"
+private_registry_buildx_sha="$(shasum -a 256 \
+  "$APP/Contents/Helpers/docker-buildx" | awk '{print $1}')"
+grep -qx "docker_cli_sha256=$private_registry_docker_sha" "$private_registry_manifest" \
+  && grep -qx "buildx_cli_sha256=$private_registry_buildx_sha" \
+    "$private_registry_manifest" \
+  || die "private-registry evidence used the wrong candidate Docker or Buildx client"
+[ -z "$(DOCKER_HOST="unix://$SOCKET" "$DOCKER" ps -aq)" ] \
+  || die "private-registry gate left containers on the isolated engine"
 
 bounded 900 scripts/nonnative-nix-gc-gate.sh \
   --socket "$SOCKET" \
@@ -1340,7 +1412,7 @@ python3 - \
   "$DEVCONTAINERS_VERSION" "$ACT_VERSION" "$LOCALSTACK_IMAGE" "$TILT_VERSION" \
   "$SUPABASE_VERSION" "$K3S_IMAGE" "$K8S_WORKLOAD_IMAGE" "$SKAFFOLD_VERSION" \
   "$LOCK_IMAGE" "$bind_lock_docker_sha256" "$guest_agent_expected_sha256" \
-  "$IMAGE" "$SSH_CLIENT_IMAGE" "$completed_epoch" <<'PY'
+  "$IMAGE" "$REGISTRY_IMAGE" "$SSH_CLIENT_IMAGE" "$completed_epoch" <<'PY'
 import json
 import sys
 
@@ -1350,7 +1422,7 @@ import sys
     endurance_duration, long_duration, testcontainers_version, devcontainers_version,
     act_version, localstack_image, tilt_version, supabase_version, k3s_image,
     k8s_workload_image, skaffold_version, bind_lock_image, bind_lock_docker_sha256,
-    guest_agent_sha256, fixture_image, ssh_client_image, completed_epoch,
+    guest_agent_sha256, fixture_image, registry_image, ssh_client_image, completed_epoch,
 ) = sys.argv[1:]
 payload = {
     "schemaVersion": 1,
@@ -1362,6 +1434,9 @@ payload = {
     "dataDriveVolumeIdentityGate": "PASS",
     "offlineBundledBootGate": "PASS",
     "defaultPlatformImageGate": "PASS",
+    "pruneSafetyGate": "PASS",
+    "privateRegistryAuthGate": "PASS",
+    "privateRegistryImage": registry_image,
     "nonnativeNixGCGate": "PASS",
     "nonnativeArchPacmanGate": "PASS",
     "nonnativeMmdebstrapGate": "PASS",

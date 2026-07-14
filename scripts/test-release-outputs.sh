@@ -61,7 +61,7 @@ MACOS="$APP/Contents/MacOS"
 mkdir -p "$RESOURCES" "$HELPERS" "$LAUNCH_DAEMONS" "$MACOS"
 printf '#!/bin/sh\nexit 0\n' > "$MACOS/Dory"
 chmod 0755 "$MACOS/Dory"
-for helper in dory-dataplane-proxy docker-buildx dory-network-helper dory-hv; do
+for helper in docker dory-dataplane-proxy docker-buildx dory-network-helper dory-hv; do
   printf '#!/bin/sh\nexit 0\n' > "$HELPERS/$helper"
   chmod 0755 "$HELPERS/$helper"
 done
@@ -415,6 +415,8 @@ mkdir -p \
   "$QUALIFICATION_FIXTURE/evidence/managed-data-drive/run" \
   "$QUALIFICATION_FIXTURE/evidence/offline-bundled-boot/run" \
   "$QUALIFICATION_FIXTURE/evidence/default-platform-image/run" \
+  "$QUALIFICATION_FIXTURE/evidence/prune-safety/run" \
+  "$QUALIFICATION_FIXTURE/evidence/private-registry-auth/run" \
   "$QUALIFICATION_FIXTURE/evidence/nonnative-nix-gc/run" \
   "$QUALIFICATION_FIXTURE/evidence/nonnative-arch-pacman/run" \
   "$QUALIFICATION_FIXTURE/evidence/nonnative-mmdebstrap/run" \
@@ -556,6 +558,75 @@ digest = "sha256:" + "b" * 64
 }), encoding="utf-8")
 (root / "default-run-uname.txt").write_text("aarch64\n", encoding="utf-8")
 PY
+fixture_docker_sha="$(unzip -p "$TMP/Dory-$VERSION-app-update.zip" \
+  Dory.app/Contents/Helpers/docker | shasum -a 256 | awk '{print $1}')"
+fixture_buildx_sha="$(unzip -p "$TMP/Dory-$VERSION-app-update.zip" \
+  Dory.app/Contents/Helpers/docker-buildx | shasum -a 256 | awk '{print $1}')"
+cat > "$QUALIFICATION_FIXTURE/evidence/prune-safety/run/system-df-after.json" <<'EOF'
+{"BuildCache":[]}
+EOF
+for output in system-prune container-prune image-prune network-prune volume-prune builder-prune; do
+  printf 'fixture prune output\n' \
+    > "$QUALIFICATION_FIXTURE/evidence/prune-safety/run/$output.txt"
+done
+cat > "$QUALIFICATION_FIXTURE/evidence/prune-safety/run/manifest.txt" <<EOF
+source_commit=0123456789abcdef0123456789abcdef01234567
+base_image=alpine:3.22@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+docker_cli_sha256=$fixture_docker_sha
+empty_engine_precondition=PASS
+unfiltered_system_prune=PASS
+unfiltered_container_prune=PASS
+unfiltered_image_prune=PASS
+unfiltered_network_prune=PASS
+unfiltered_volume_prune=PASS
+unfiltered_builder_prune=PASS
+active_container_survived=PASS
+active_image_survived=PASS
+active_volume_survived=PASS
+active_network_survived=PASS
+active_volume_bytes_preserved=PASS
+unused_container_removed=PASS
+unused_image_removed=PASS
+unused_volume_removed=PASS
+unused_network_removed=PASS
+build_cache_removed=PASS
+owned_cleanup=PASS
+status=PASS
+EOF
+private_registry_run="$QUALIFICATION_FIXTURE/evidence/private-registry-auth/run"
+mkdir -p "$private_registry_run/archive-source"
+printf '[]\n' > "$private_registry_run/archive-source/manifest.json"
+tar -C "$private_registry_run/archive-source" -cf "$private_registry_run/built-image.tar" manifest.json
+rm -rf "$private_registry_run/archive-source"
+printf 'manifest.json\n' > "$private_registry_run/built-image-tar-list.txt"
+cat > "$private_registry_run/registry-image-inspect.json" <<'EOF'
+[{"Id":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","Os":"linux","Architecture":"arm64","RepoDigests":["registry@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373"]}]
+EOF
+private_archive_sha="$(shasum -a 256 "$private_registry_run/built-image.tar" | awk '{print $1}')"
+cat > "$private_registry_run/manifest.txt" <<EOF
+source_commit=0123456789abcdef0123456789abcdef01234567
+base_image=alpine:3.22@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+registry_image=registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+docker_cli_sha256=$fixture_docker_sha
+buildx_cli_sha256=$fixture_buildx_sha
+archive_sha256=$private_archive_sha
+image_id_before=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+image_id_after=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+registry_fixture_arm64=PASS
+unauthenticated_pull_rejected=PASS
+authenticated_login=PASS
+authenticated_pull_run=PASS
+buildkit_registry_auth=PASS
+buildkit_secret_nonleak=PASS
+registry_push=PASS
+image_inspect_history=PASS
+image_save_load_identity=PASS
+image_tag_remove=PASS
+filtered_image_prune=PASS
+owned_cleanup=PASS
+isolated_credential_cleanup=PASS
+status=PASS
+EOF
 cat > "$QUALIFICATION_FIXTURE/evidence/nonnative-nix-gc/run/manifest.txt" <<'EOF'
 status=PASS
 image=nixos/nix@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -813,7 +884,7 @@ EOF
     image-save-stdout image-hardlink-missing-parent buildkit-large-dockerfile \
     buildkit-relative-temp-context dockerignore-layered-unignore \
     buildkit-concurrent-sessions container-resolver-contract container-dns-search \
-    cleanup-restart-persistence; do
+    cleanup-restart-persistence container-api-lifecycle; do
     printf '%s\tPASS\tok\n' "$test"
   done
 } > "$QUALIFICATION_FIXTURE/evidence/competitor-runtime/run/results.tsv"
@@ -1093,6 +1164,9 @@ payload = {
     "dataDriveVolumeIdentityGate": "PASS",
     "offlineBundledBootGate": "PASS",
     "defaultPlatformImageGate": "PASS",
+    "pruneSafetyGate": "PASS",
+    "privateRegistryAuthGate": "PASS",
+    "privateRegistryImage": "registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373",
     "nonnativeNixGCGate": "PASS",
     "nonnativeArchPacmanGate": "PASS",
     "nonnativeMmdebstrapGate": "PASS",

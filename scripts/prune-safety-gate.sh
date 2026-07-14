@@ -5,7 +5,8 @@ umask 077
 
 SOCKET="${DORY_SOCK:-$HOME/.dory/dory.sock}"
 DOCKER="${DORY_DOCKER_BIN:-$(command -v docker 2>/dev/null || true)}"
-BASE_IMAGE="${DORY_PRUNE_BASE_IMAGE:-alpine:latest}"
+BASE_IMAGE="${DORY_PRUNE_BASE_IMAGE:-}"
+SOURCE_COMMIT="${DORY_PRUNE_SOURCE_COMMIT:-}"
 WORKROOT="${DORY_PRUNE_WORKROOT:-$HOME/.dory-prune-safety}"
 CONFIRM=""
 
@@ -16,7 +17,8 @@ Usage: scripts/prune-safety-gate.sh --confirm ISOLATED-ENGINE-PRUNE [options]
 Options:
   --socket PATH      Dedicated Dory Docker socket
   --docker PATH      Docker CLI
-  --base-image REF   Already-local base image (default: alpine:latest)
+  --base-image REF   Digest-pinned, already-local base image
+  --source-commit SHA Exact 40-character source commit
   --workroot PATH    Evidence root (default: ~/.dory-prune-safety)
   -h, --help
 
@@ -33,6 +35,7 @@ while [ "$#" -gt 0 ]; do
     --socket) need_value "$1" "$#"; SOCKET="$2"; shift 2 ;;
     --docker) need_value "$1" "$#"; DOCKER="$2"; shift 2 ;;
     --base-image) need_value "$1" "$#"; BASE_IMAGE="$2"; shift 2 ;;
+    --source-commit) need_value "$1" "$#"; SOURCE_COMMIT="$2"; shift 2 ;;
     --workroot) need_value "$1" "$#"; WORKROOT="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option $1" ;;
@@ -42,6 +45,10 @@ done
 [ "$CONFIRM" = "ISOLATED-ENGINE-PRUNE" ] \
   || die "destructive prune requires --confirm ISOLATED-ENGINE-PRUNE"
 [ -x "$DOCKER" ] || die "Docker CLI is unavailable"
+printf '%s\n' "$BASE_IMAGE" | grep -Eq '^.+@sha256:[0-9a-f]{64}$' \
+  || die "--base-image must be digest-pinned"
+printf '%s\n' "$SOURCE_COMMIT" | grep -Eq '^[0-9a-f]{40}$' \
+  || die "--source-commit must be a full lowercase Git SHA"
 case "$SOCKET" in /*) ;; *) die "socket must be absolute" ;; esac
 case "$WORKROOT" in /*) ;; *) die "workroot must be absolute" ;; esac
 [ -S "$SOCKET" ] || die "socket is unavailable: $SOCKET"
@@ -69,12 +76,16 @@ VICTIM_NETWORK="dory-prune-victim-$SLUG"
 LABEL="dev.dory.prune-safety=$RUN_ID"
 
 cleanup() {
+  set +e
   docker_e rm -f "$PROTECTED_CONTAINER" "$VICTIM_CONTAINER" >/dev/null 2>&1 || true
   docker_e network rm "$PROTECTED_NETWORK" "$VICTIM_NETWORK" >/dev/null 2>&1 || true
   docker_e volume rm -f "$PROTECTED_VOLUME" "$VICTIM_VOLUME" >/dev/null 2>&1 || true
   docker_e image rm -f "$PROTECTED_IMAGE" "$VICTIM_IMAGE" >/dev/null 2>&1 || true
+  set -e
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 printf 'FROM %s\nLABEL %s\nRUN printf protected-image >/image-marker\n' "$BASE_IMAGE" "$LABEL" \
   | docker_e build -q -t "$PROTECTED_IMAGE" - > "$RUN_DIR/protected-build.id"
@@ -118,6 +129,45 @@ if cache:
     raise SystemExit(f"builder cache survived prune: {len(cache)} records")
 PY
 
+cat > "$RUN_DIR/manifest.txt.partial" <<EOF
+source_commit=$SOURCE_COMMIT
+base_image=$BASE_IMAGE
+docker_cli_sha256=$(shasum -a 256 "$DOCKER" | awk '{print $1}')
+empty_engine_precondition=PASS
+unfiltered_system_prune=PASS
+unfiltered_container_prune=PASS
+unfiltered_image_prune=PASS
+unfiltered_network_prune=PASS
+unfiltered_volume_prune=PASS
+unfiltered_builder_prune=PASS
+active_container_survived=PASS
+active_image_survived=PASS
+active_volume_survived=PASS
+active_network_survived=PASS
+active_volume_bytes_preserved=PASS
+unused_container_removed=PASS
+unused_image_removed=PASS
+unused_volume_removed=PASS
+unused_network_removed=PASS
+build_cache_removed=PASS
+EOF
+
 cleanup
+[ -z "$(docker_e ps -aq --filter "label=$LABEL")" ] \
+  || die "prune gate cleanup left run-owned containers"
+[ -z "$(docker_e volume ls -q --filter "label=$LABEL")" ] \
+  || die "prune gate cleanup left run-owned volumes"
+[ -z "$(docker_e network ls -q --filter "label=$LABEL")" ] \
+  || die "prune gate cleanup left run-owned networks"
+if docker_e image inspect "$PROTECTED_IMAGE" >/dev/null 2>&1 \
+    || docker_e image inspect "$VICTIM_IMAGE" >/dev/null 2>&1; then
+  die "prune gate cleanup left run-owned image tags"
+fi
+cat >> "$RUN_DIR/manifest.txt.partial" <<EOF
+owned_cleanup=PASS
+status=PASS
+EOF
+mv "$RUN_DIR/manifest.txt.partial" "$RUN_DIR/manifest.txt"
 trap - EXIT INT TERM
+cat "$RUN_DIR/manifest.txt"
 printf 'prune safety gate PASS; evidence: %s\n' "$RUN_DIR"

@@ -70,6 +70,8 @@ CANDIDATE_GVPROXY_SHA="$(unzip -p "$UPDATE_ZIP" \
   Dory.app/Contents/Helpers/gvproxy | shasum -a 256 | awk '{print $1}')"
 CANDIDATE_BUILDX_SHA="$(unzip -p "$UPDATE_ZIP" \
   Dory.app/Contents/Helpers/docker-buildx | shasum -a 256 | awk '{print $1}')"
+CANDIDATE_DOCKER_SHA="$(unzip -p "$UPDATE_ZIP" \
+  Dory.app/Contents/Helpers/docker | shasum -a 256 | awk '{print $1}')"
 CANDIDATE_GVPROXY_BUILD_SHA="$(unzip -p "$UPDATE_ZIP" \
   Dory.app/Contents/Resources/gvproxy-provenance.txt | awk -F= '
     $1 == "verified_sha256" { count += 1; value = $2 }
@@ -217,6 +219,94 @@ assert int(properties.get("image_list_size_bytes", -1)) == list_size
 assert int(properties.get("system_df_size_bytes", -1)) == df_size
 assert int(properties.get("system_df_layers_size_bytes", -1)) == layers_size
 assert int(properties.get("inspect_to_storage_ratio_milli", -1)) == ratio
+PY
+
+prune_manifest="$(single_evidence_file prune-safety manifest.txt)"
+prune_system_df="$(single_evidence_file prune-safety system-df-after.json)"
+for proof in status empty_engine_precondition unfiltered_system_prune \
+  unfiltered_container_prune unfiltered_image_prune unfiltered_network_prune \
+  unfiltered_volume_prune unfiltered_builder_prune active_container_survived \
+  active_image_survived active_volume_survived active_network_survived \
+  active_volume_bytes_preserved unused_container_removed unused_image_removed \
+  unused_volume_removed unused_network_removed build_cache_removed owned_cleanup; do
+  grep -qx "$proof=PASS" "$prune_manifest" \
+    || die "retained prune-safety evidence does not prove $proof"
+done
+grep -Fx "source_commit=$SOURCE_COMMIT" "$prune_manifest" >/dev/null \
+  || die "retained prune-safety evidence belongs to another source commit"
+prune_base_image="$(sed -n 's/^base_image=//p' "$prune_manifest")"
+printf '%s\n' "$prune_base_image" | grep -Eq '^.+@sha256:[0-9a-f]{64}$' \
+  || die "retained prune-safety fixture is not digest-pinned"
+grep -qx "docker_cli_sha256=$CANDIDATE_DOCKER_SHA" "$prune_manifest" \
+  || die "retained prune-safety evidence used a different Docker client"
+for output in system-prune.txt container-prune.txt image-prune.txt network-prune.txt \
+  volume-prune.txt builder-prune.txt; do
+  single_evidence_file prune-safety "$output" >/dev/null
+done
+python3 - "$prune_system_df" <<'PY'
+import json
+import pathlib
+import sys
+
+report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert not (report.get("BuildCache") or []), "retained prune evidence contains build cache"
+PY
+
+private_registry_manifest="$(single_evidence_file private-registry-auth manifest.txt)"
+private_registry_archive="$(single_evidence_file private-registry-auth built-image.tar)"
+private_registry_archive_list="$(single_evidence_file \
+  private-registry-auth built-image-tar-list.txt)"
+private_registry_inspect="$(single_evidence_file \
+  private-registry-auth registry-image-inspect.json)"
+for proof in status registry_fixture_arm64 unauthenticated_pull_rejected authenticated_login \
+  authenticated_pull_run buildkit_registry_auth buildkit_secret_nonleak registry_push \
+  image_inspect_history image_save_load_identity image_tag_remove filtered_image_prune \
+  owned_cleanup isolated_credential_cleanup; do
+  grep -qx "$proof=PASS" "$private_registry_manifest" \
+    || die "retained private-registry evidence does not prove $proof"
+done
+grep -Fx "source_commit=$SOURCE_COMMIT" "$private_registry_manifest" >/dev/null \
+  || die "retained private-registry evidence belongs to another source commit"
+private_registry_base_image="$(sed -n 's/^base_image=//p' "$private_registry_manifest")"
+private_registry_image="$(sed -n 's/^registry_image=//p' "$private_registry_manifest")"
+printf '%s\n' "$private_registry_base_image" | grep -Eq '^.+@sha256:[0-9a-f]{64}$' \
+  && printf '%s\n' "$private_registry_image" | grep -Eq '^.+@sha256:[0-9a-f]{64}$' \
+  || die "retained private-registry image fixtures are not digest-pinned"
+[ "$prune_base_image" = "$private_registry_base_image" ] \
+  || die "prune and private-registry gates used different base images"
+grep -qx "docker_cli_sha256=$CANDIDATE_DOCKER_SHA" "$private_registry_manifest" \
+  && grep -qx "buildx_cli_sha256=$CANDIDATE_BUILDX_SHA" "$private_registry_manifest" \
+  || die "retained private-registry evidence used different candidate clients"
+private_registry_archive_sha="$(shasum -a 256 "$private_registry_archive" | awk '{print $1}')"
+grep -qx "archive_sha256=$private_registry_archive_sha" "$private_registry_manifest" \
+  || die "retained private-registry image archive digest is wrong"
+grep -qx 'manifest.json' "$private_registry_archive_list" \
+  || die "retained private-registry image archive has no manifest.json"
+tar -tf "$private_registry_archive" | cmp -s - "$private_registry_archive_list" \
+  || die "retained private-registry archive listing differs from the archive"
+private_registry_id_before="$(sed -n 's/^image_id_before=//p' "$private_registry_manifest")"
+private_registry_id_after="$(sed -n 's/^image_id_after=//p' "$private_registry_manifest")"
+printf '%s\n' "$private_registry_id_before" | grep -Eq '^sha256:[0-9a-f]{64}$' \
+  && [ "$private_registry_id_before" = "$private_registry_id_after" ] \
+  || die "retained private-registry save/load image identity differs"
+if find "$(dirname "$(dirname "$private_registry_manifest")")" -type d \
+    \( -name docker-config -o -name unauth-config -o -name auth \) -print -quit \
+    | grep -q .; then
+  die "retained private-registry evidence still contains credential directories"
+fi
+python3 - "$private_registry_inspect" "$private_registry_image" <<'PY'
+import json
+import pathlib
+import sys
+
+payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert isinstance(payload, list) and len(payload) == 1, "registry image inspect is not singular"
+image = payload[0]
+assert image.get("Os") == "linux" and image.get("Architecture") == "arm64", \
+    "registry fixture is not linux/arm64"
+digest = sys.argv[2].rsplit("@", 1)[1]
+assert any(value.endswith("@" + digest) for value in image.get("RepoDigests") or []), \
+    "registry fixture inspect does not contain the qualified digest"
 PY
 
 nonnative_nix_manifest="$(single_evidence_file nonnative-nix-gc manifest.txt)"
@@ -996,7 +1086,8 @@ python3 - "$COMPLETE" "$BUILD_DIR" "$VERSION" "$BUILD" "$SOURCE_COMMIT" \
   "$devcontainers_version" "$act_version" "$localstack_image" "$tilt_version" \
   "$supabase_version" "$k3s_image" "$kubernetes_workload_image" \
   "$skaffold_version" "$bind_lock_image" "$bind_lock_docker_sha256" \
-  "$guest_agent_sha256" "$ssh_agent_image" <<'PY'
+  "$guest_agent_sha256" "$ssh_agent_image" "$private_registry_base_image" \
+  "$private_registry_image" <<'PY'
 import hashlib
 import json
 import os
@@ -1007,7 +1098,8 @@ import sys
     primary_sha, testcontainers_version, devcontainers_version, act_version,
     localstack_image, tilt_version, supabase_version, k3s_image,
     kubernetes_workload_image, skaffold_version, bind_lock_image, bind_lock_docker_sha256,
-    guest_agent_sha256, ssh_agent_image,
+    guest_agent_sha256, ssh_agent_image, private_registry_base_image,
+    private_registry_image,
 ) = sys.argv[1:]
 
 def digest(path):
@@ -1033,6 +1125,12 @@ assert qualification.get("offlineBundledBootGate") == "PASS", \
     "bundled/cached offline boot qualification did not pass"
 assert qualification.get("defaultPlatformImageGate") == "PASS", \
     "default arm64 image selection/storage qualification did not pass"
+assert qualification.get("pruneSafetyGate") == "PASS", \
+    "active-versus-unused Docker prune qualification did not pass"
+assert qualification.get("privateRegistryAuthGate") == "PASS", \
+    "private-registry authentication/image lifecycle qualification did not pass"
+assert qualification.get("privateRegistryImage") == private_registry_image, \
+    "private-registry fixture differs from the completion record"
 assert qualification.get("nonnativeNixGCGate") == "PASS", \
     "linux/amd64 Nix garbage-collection qualification did not pass"
 assert qualification.get("nonnativeArchPacmanGate") == "PASS", \
@@ -1078,6 +1176,8 @@ assert qualification.get("sshAgentImage") == ssh_agent_image, \
 fixture_image = qualification.get("fixtureImage", "")
 assert __import__("re").fullmatch(r".+@sha256:[0-9a-f]{64}", fixture_image), \
     "qualification fixture image is not digest-pinned"
+assert fixture_image == private_registry_base_image, \
+    "private-registry base image differs from the qualification fixture"
 assert qualification.get("testcontainersGate") == "PASS", \
     "Testcontainers/Ryuk qualification did not pass"
 assert qualification.get("testcontainersVersion") == testcontainers_version, \

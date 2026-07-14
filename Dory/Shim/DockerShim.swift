@@ -95,6 +95,25 @@ struct DockerShim: Sendable {
             )
         }
 
+        // Docker-backed fallback runtimes already own the complete image metadata contract.
+        // Proxy bounded responses directly so filters, prune scope, delete flags, auth payloads,
+        // status codes, and storage accounting cannot be weakened by the translated test model.
+        if runtime.supportsRawProxy, Self.isBufferedDockerImageRequest(method: method, path: path) {
+            guard let response = await runtime.proxyRequest(
+                method: method,
+                path: request.target,
+                headers: Self.proxyRequestHeaders(request),
+                body: request.body
+            ) else {
+                return errorResponse(502, "docker engine unavailable")
+            }
+            return ShimResponse(
+                status: response.statusCode,
+                headers: Self.proxyHeaders(response),
+                body: response.body
+            )
+        }
+
         switch (method, path) {
         case ("GET", "/_ping"), ("HEAD", "/_ping"):
             return ShimResponse(status: 200, headers: [
@@ -164,6 +183,17 @@ struct DockerShim: Sendable {
         if path == "/networks" { return method == "GET" }
         if path == "/networks/create" || path == "/networks/prune" { return method == "POST" }
         return path.hasPrefix("/networks/") && (method == "GET" || method == "POST" || method == "DELETE")
+    }
+
+    private static func isBufferedDockerImageRequest(method: String, path: String) -> Bool {
+        if method == "POST", path == "/auth" || path == "/images/prune" { return true }
+        if method == "GET", path == "/images/json" || path == "/images/search" || path == "/system/df" {
+            return true
+        }
+        guard path.hasPrefix("/images/") else { return false }
+        if method == "DELETE" { return true }
+        if method == "GET", path.hasSuffix("/json") || path.hasSuffix("/history") { return true }
+        return method == "POST" && path.hasSuffix("/tag")
     }
 
     private func routeParameterized(_ request: ParsedRequest, method: String, path: String) async -> ShimResponse {

@@ -112,8 +112,19 @@ of scope so each fix remains reviewable.
   bounds, keep-alive reuse, and preflight failure. The exact-candidate competitor gate now requires a
   bounded create/start/pause/unpause/interactive-exec/logs/stats/restart/stop/kill/attach/wait/remove
   campaign in addition to named-signal, healthcheck, churn, and backpressure proofs.
-- [ ] Images: pull/load/save/import/export/tag/inspect/history/remove/prune, multi-platform defaults,
+- [x] Images: pull/load/save/import/export/tag/inspect/history/remove/prune, multi-platform defaults,
   archive integrity, registry auth, interrupted upload, and default-storage accounting are sound.
+  Shipping doryd forwards native dockerd image APIs without translation; the Docker-backed fallback
+  now also proxies bounded image metadata/auth/prune/storage requests with their exact target,
+  headers, body, status, and flags. Focused Xcode coverage passes all 12 shim server tests. Two
+  disposable live Dory runs pass the strengthened private-registry and destructive-prune gates:
+  digest-pinned registry pull, rejected anonymous access, login, authenticated pull/run, BuildKit
+  auth and secret non-leakage, push, inspect/history, save/load identity, tag/remove, filtered prune,
+  active-resource survival, unused-resource removal, cache removal, and owned credential/object
+  cleanup. Exact release qualification and publication now require and semantically re-verify those
+  manifests with source, fixture, Docker, Buildx, and archive hashes. Existing mandatory gates add
+  unqualified arm64 multi-platform selection and storage reconciliation, strict stdout save-tar EOF,
+  missing-parent hard-link import/export, and real ECR interrupted-upload resume/repeated PUT/repull.
 - [ ] Volumes: create/copy/inspect/list/remove/prune, labels/options, ownership, restart persistence,
   collision handling, and in-use safety are sound.
 - [ ] Networks: bridge/DNS/search/aliases/IPAM/options/fixed ports/connect/disconnect/remove/prune and

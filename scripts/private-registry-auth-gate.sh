@@ -1,14 +1,14 @@
 #!/bin/bash
-# Authenticated private-registry release gate: 401 without credentials, login, pull/push,
-# BuildKit registry auth + secret handling, and save/load. All Docker objects are run-scoped.
+# Qualify authenticated registry and image lifecycle behavior on an isolated Dory engine.
 set -euo pipefail
 umask 077
 
 SOCKET="${DORY_REGISTRY_AUTH_SOCKET:-$HOME/.dory/dory.sock}"
 DOCKER="${DORY_DOCKER_BIN:-$(command -v docker 2>/dev/null || true)}"
 BUILDX="${DORY_BUILDX_BIN:-}"
-BASE_IMAGE="${DORY_REGISTRY_AUTH_BASE_IMAGE:-alpine:latest}"
-REGISTRY_IMAGE="${DORY_REGISTRY_AUTH_IMAGE:-registry:2}"
+BASE_IMAGE="${DORY_REGISTRY_AUTH_BASE_IMAGE:-}"
+REGISTRY_IMAGE="${DORY_REGISTRY_AUTH_IMAGE:-registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373}"
+SOURCE_COMMIT="${DORY_REGISTRY_AUTH_SOURCE_COMMIT:-}"
 PORT="${DORY_REGISTRY_AUTH_PORT:-$((55000 + $$ % 400))}"
 WORKROOT="${DORY_REGISTRY_AUTH_WORKROOT:-$HOME/.dory-private-registry-auth}"
 
@@ -16,18 +16,21 @@ usage() {
   cat <<EOF
 Usage: scripts/private-registry-auth-gate.sh [options]
 
+Required:
+  --base-image REF       Digest-pinned, already-local build fixture
+  --source-commit SHA    Exact 40-character source commit
+
 Options:
   --socket PATH          Dedicated Dory Docker socket
   --docker PATH          Docker CLI
   --buildx PATH          Docker Buildx plugin (default: adjacent to Docker or user plugin)
-  --base-image REF       Already-local build image (default: $BASE_IMAGE)
-  --registry-image REF   Already-local registry image (default: $REGISTRY_IMAGE)
+  --registry-image REF   Digest-pinned registry fixture (default: $REGISTRY_IMAGE)
   --port PORT            Guest-loopback registry port (default: $PORT)
   --workroot PATH        Shared evidence directory (default: $WORKROOT)
   -h, --help
 
-The workroot must be visible through Dory's host share. The gate never prunes and never removes
-pre-existing images; it deletes only its unique containers, volume, and tags.
+The gate pulls only its digest-pinned registry fixture. It removes only run-owned containers,
+volume, tags, derived image, and isolated credentials. The base and registry images are retained.
 EOF
 }
 
@@ -40,6 +43,7 @@ while [ "$#" -gt 0 ]; do
     --buildx) need_value "$1" "$#"; BUILDX="$2"; shift 2 ;;
     --base-image) need_value "$1" "$#"; BASE_IMAGE="$2"; shift 2 ;;
     --registry-image) need_value "$1" "$#"; REGISTRY_IMAGE="$2"; shift 2 ;;
+    --source-commit) need_value "$1" "$#"; SOURCE_COMMIT="$2"; shift 2 ;;
     --port) need_value "$1" "$#"; PORT="$2"; shift 2 ;;
     --workroot) need_value "$1" "$#"; WORKROOT="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -50,8 +54,17 @@ done
 case "$SOCKET:$WORKROOT" in /*:/*) ;; *) die "socket and workroot must be absolute" ;; esac
 case "$PORT" in ''|*[!0-9]*) die "port must be an integer" ;; esac
 [ "$PORT" -ge 1024 ] && [ "$PORT" -le 65535 ] || die "port must be between 1024 and 65535"
+printf '%s\n' "$BASE_IMAGE" | grep -Eq '^.+@sha256:[0-9a-f]{64}$' \
+  || die "--base-image must be digest-pinned"
+printf '%s\n' "$REGISTRY_IMAGE" | grep -Eq '^.+@sha256:[0-9a-f]{64}$' \
+  || die "--registry-image must be digest-pinned"
+printf '%s\n' "$SOURCE_COMMIT" | grep -Eq '^[0-9a-f]{40}$' \
+  || die "--source-commit must be a full lowercase Git SHA"
 [ -x "$DOCKER" ] || die "Docker CLI is unavailable"
 command -v htpasswd >/dev/null || die "htpasswd is required for the disposable bcrypt credential"
+command -v openssl >/dev/null || die "openssl is required"
+command -v shasum >/dev/null || die "shasum is required"
+command -v tar >/dev/null || die "tar is required"
 [ -S "$SOCKET" ] || die "socket is unavailable: $SOCKET"
 
 if [ -z "$BUILDX" ]; then
@@ -67,7 +80,6 @@ WORKDIR="$WORKROOT/$RUN_ID"
 CONFIG="$WORKDIR/docker-config"
 UNAUTH_CONFIG="$WORKDIR/unauth-config"
 AUTH="$WORKDIR/auth"
-RESULTS="$WORKDIR/results.tsv"
 NAME="dory-private-registry-$RUN_ID"
 VOLUME="dory-private-registry-data-$RUN_ID"
 SOURCE_REF="localhost:$PORT/dory-auth-probe:source"
@@ -75,35 +87,69 @@ BUILT_REF="localhost:$PORT/dory-auth-probe:built"
 LOADED_REF="dory-auth-probe:$RUN_ID"
 USER_NAME=doryprobe
 PASSWORD="$(openssl rand -hex 16)"
+OWNED_CLEANUP=FAIL
+ISOLATED_CREDENTIAL_CLEANUP=FAIL
 mkdir -p "$CONFIG/cli-plugins" "$UNAUTH_CONFIG" "$AUTH"
 ln -s "$BUILDX" "$CONFIG/cli-plugins/docker-buildx"
-printf 'status\ttest\tdetail\n' > "$RESULTS"
 
 docker_e() { DOCKER_CONFIG="$CONFIG" DOCKER_HOST="unix://$SOCKET" "$DOCKER" "$@"; }
+wait_registry_ready() {
+  local phase="$1" running
+  for _ in $(seq 1 100); do
+    running="$(docker_e inspect --format '{{.State.Running}}' "$NAME" 2>/dev/null || true)"
+    [ "$running" = true ] || die "$phase registry exited before binding guest port $PORT"
+    if docker_e logs "$NAME" 2>&1 | grep -Fq "listening on 127.0.0.1:$PORT"; then
+      return
+    fi
+    sleep 0.1
+  done
+  die "$phase registry did not bind guest port $PORT within 10 seconds"
+}
 cleanup() {
+  local images_absent=1
   set +e
   docker_e logs "$NAME" >> "$WORKDIR/registry.log" 2>&1
+  docker_e logout "localhost:$PORT" >/dev/null 2>&1
   docker_e rm -f "$NAME" >/dev/null 2>&1
   docker_e volume rm -f "$VOLUME" >/dev/null 2>&1
   for reference in "$SOURCE_REF" "$BUILT_REF" "$LOADED_REF"; do
     docker_e image rm -f "$reference" >/dev/null 2>&1
   done
-  rm -f "$WORKDIR/secret.txt" "$AUTH/htpasswd" "$CONFIG/config.json"
+  for reference in "$SOURCE_REF" "$BUILT_REF" "$LOADED_REF"; do
+    if docker_e image inspect "$reference" >/dev/null 2>&1; then images_absent=0; fi
+  done
+  if ! docker_e inspect "$NAME" >/dev/null 2>&1 \
+      && ! docker_e volume inspect "$VOLUME" >/dev/null 2>&1 \
+      && [ "$images_absent" -eq 1 ]; then
+    OWNED_CLEANUP=PASS
+  fi
+  rm -rf "$CONFIG" "$UNAUTH_CONFIG" "$AUTH" "$WORKDIR/secret.txt"
+  if [ ! -e "$CONFIG" ] && [ ! -e "$UNAUTH_CONFIG" ] && [ ! -e "$AUTH" ] \
+      && [ ! -e "$WORKDIR/secret.txt" ]; then
+    ISOLATED_CREDENTIAL_CLEANUP=PASS
+  fi
+  set -e
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-docker_e version >/dev/null || die "Docker API is unreachable"
-docker_e image inspect "$BASE_IMAGE" >/dev/null 2>&1 || die "missing local image: $BASE_IMAGE"
-docker_e image inspect "$REGISTRY_IMAGE" >/dev/null 2>&1 || die "missing local image: $REGISTRY_IMAGE"
+docker_e version > "$WORKDIR/docker-version.txt" || die "Docker API is unreachable"
+DOCKER_SHA256="$(shasum -a 256 "$DOCKER" | awk '{print $1}')"
+BUILDX_SHA256="$(shasum -a 256 "$BUILDX" | awk '{print $1}')"
+docker_e buildx version > "$WORKDIR/buildx-version.txt"
+docker_e image inspect "$BASE_IMAGE" > "$WORKDIR/base-image-inspect.json" 2>&1 \
+  || die "missing local image: $BASE_IMAGE"
+docker_e pull --platform linux/arm64 "$REGISTRY_IMAGE" > "$WORKDIR/registry-image-pull.out"
+docker_e image inspect "$REGISTRY_IMAGE" > "$WORKDIR/registry-image-inspect.json"
+[ "$(docker_e image inspect --format '{{.Os}}/{{.Architecture}}' "$REGISTRY_IMAGE")" = \
+    linux/arm64 ] || die "registry fixture did not resolve to linux/arm64"
 docker_e volume create --label "dev.dory.private-registry=$RUN_ID" "$VOLUME" >/dev/null
 
-# Seed the registry before enabling auth. This makes the first request after the authenticated
-# restart a meaningful pull of an existing manifest, not a misleading unknown-tag failure.
+# Seed one private tag before restarting the same run-owned registry with authentication.
 docker_e run -d --name "$NAME" --network host -v "$VOLUME:/var/lib/registry" \
   -e "REGISTRY_HTTP_ADDR=127.0.0.1:$PORT" "$REGISTRY_IMAGE" >/dev/null
-sleep 2
-[ "$(docker_e inspect --format '{{.State.Running}}' "$NAME")" = true ] \
-  || die "seed registry did not bind guest port $PORT"
+wait_registry_ready seed
 docker_e tag "$BASE_IMAGE" "$SOURCE_REF"
 docker_e push "$SOURCE_REF" > "$WORKDIR/seed-push.out"
 docker_e image rm "$SOURCE_REF" >/dev/null
@@ -115,46 +161,96 @@ docker_e run -d --name "$NAME" --network host \
   -e "REGISTRY_HTTP_ADDR=127.0.0.1:$PORT" \
   -e REGISTRY_AUTH=htpasswd -e 'REGISTRY_AUTH_HTPASSWD_REALM=Dory candidate gate' \
   -e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd "$REGISTRY_IMAGE" >/dev/null
-sleep 2
-[ "$(docker_e inspect --format '{{.State.Running}}' "$NAME")" = true ] \
-  || die "authenticated registry did not bind guest port $PORT"
+wait_registry_ready authenticated
 
 if DOCKER_CONFIG="$UNAUTH_CONFIG" DOCKER_HOST="unix://$SOCKET" "$DOCKER" pull "$SOURCE_REF" \
     > "$WORKDIR/unauth.out" 2>&1; then
   die "unauthenticated pull unexpectedly succeeded"
 fi
-printf 'PASS\tunauthenticated pull rejected\tregistry required credentials\n' >> "$RESULTS"
-printf '%s' "$PASSWORD" | docker_e login "localhost:$PORT" --username "$USER_NAME" --password-stdin >/dev/null
-printf 'PASS\tauthenticated login\tDocker auth API accepted credentials\n' >> "$RESULTS"
+printf '%s' "$PASSWORD" | docker_e login "localhost:$PORT" \
+  --username "$USER_NAME" --password-stdin > "$WORKDIR/login.out"
 docker_e pull "$SOURCE_REF" > "$WORKDIR/pull-source.out"
 docker_e run --rm "$SOURCE_REF" true
-printf 'PASS\tauthenticated pull\tprivate image ran\n' >> "$RESULTS"
 
 SECRET_VALUE="$(openssl rand -hex 24)"
 SECRET_SHA="$(printf '%s' "$SECRET_VALUE" | shasum -a 256 | awk '{print $1}')"
 printf '%s' "$SECRET_VALUE" > "$WORKDIR/secret.txt"
 {
   printf 'FROM %s\n' "$SOURCE_REF"
+  printf 'LABEL dev.dory.private-registry=%s\n' "$RUN_ID"
   printf 'RUN --mount=type=secret,id=probe test "$(sha256sum /run/secrets/probe | awk '\''{print $1}'\'')" = %s\n' "$SECRET_SHA"
   printf 'RUN test ! -e /run/secrets/probe\n'
 } > "$WORKDIR/Dockerfile"
-docker_e buildx version > "$WORKDIR/buildx-version.txt"
 DOCKER_BUILDKIT=1 docker_e build --pull --secret "id=probe,src=$WORKDIR/secret.txt" \
   -t "$BUILT_REF" "$WORKDIR" > "$WORKDIR/build.out"
 docker_e push "$BUILT_REF" > "$WORKDIR/push-built.out"
-if docker_e history --no-trunc "$BUILT_REF" | grep -Fq "$SECRET_VALUE"; then
+docker_e image inspect "$BUILT_REF" > "$WORKDIR/built-image-inspect.json"
+docker_e history --no-trunc "$BUILT_REF" > "$WORKDIR/built-image-history.txt"
+if grep -Fq "$SECRET_VALUE" "$WORKDIR/built-image-history.txt"; then
   die "BuildKit secret leaked into image history"
 fi
-printf 'PASS\tBuildKit auth and secret\tauthenticated FROM/push succeeded; secret absent from history\n' >> "$RESULTS"
 
+IMAGE_ID_BEFORE="$(docker_e image inspect --format '{{.Id}}' "$BUILT_REF")"
 docker_e save -o "$WORKDIR/built-image.tar" "$BUILT_REF"
-docker_e image rm "$BUILT_REF" >/dev/null
+ARCHIVE_SHA256="$(shasum -a 256 "$WORKDIR/built-image.tar" | awk '{print $1}')"
+tar -tf "$WORKDIR/built-image.tar" > "$WORKDIR/built-image-tar-list.txt"
+grep -qx 'manifest.json' "$WORKDIR/built-image-tar-list.txt" \
+  || die "saved image archive has no manifest.json"
+docker_e image rm "$BUILT_REF" > "$WORKDIR/remove-before-load.out"
+if docker_e image inspect "$BUILT_REF" >/dev/null 2>&1; then
+  die "removed image tag remained inspectable"
+fi
 docker_e load -i "$WORKDIR/built-image.tar" > "$WORKDIR/load.out"
+IMAGE_ID_AFTER="$(docker_e image inspect --format '{{.Id}}' "$BUILT_REF")"
+[ "$IMAGE_ID_AFTER" = "$IMAGE_ID_BEFORE" ] || die "save/load changed the image identity"
 docker_e tag "$BUILT_REF" "$LOADED_REF"
+docker_e image inspect "$LOADED_REF" > "$WORKDIR/loaded-image-inspect.json"
+docker_e history --no-trunc "$LOADED_REF" > "$WORKDIR/loaded-image-history.txt"
+if grep -Fq "$SECRET_VALUE" "$WORKDIR/loaded-image-history.txt"; then
+  die "BuildKit secret appeared after image load"
+fi
 docker_e run --rm "$LOADED_REF" true
-printf 'PASS\tsave and load\tprivate-derived image survived archive round-trip\n' >> "$RESULTS"
+
+# Make only the uniquely labeled derived image dangling, then prove filtered prune removes it.
+docker_e image rm "$LOADED_REF" >/dev/null
+docker_e image rm "$BUILT_REF" >/dev/null
+docker_e image prune --force --filter "label=dev.dory.private-registry=$RUN_ID" \
+  > "$WORKDIR/image-prune.out"
+if docker_e image inspect "$IMAGE_ID_BEFORE" >/dev/null 2>&1; then
+  die "filtered image prune retained the run-owned derived image"
+fi
+
+cat > "$WORKDIR/manifest.txt.partial" <<EOF
+source_commit=$SOURCE_COMMIT
+base_image=$BASE_IMAGE
+registry_image=$REGISTRY_IMAGE
+docker_cli_sha256=$DOCKER_SHA256
+buildx_cli_sha256=$BUILDX_SHA256
+archive_sha256=$ARCHIVE_SHA256
+image_id_before=$IMAGE_ID_BEFORE
+image_id_after=$IMAGE_ID_AFTER
+registry_fixture_arm64=PASS
+unauthenticated_pull_rejected=PASS
+authenticated_login=PASS
+authenticated_pull_run=PASS
+buildkit_registry_auth=PASS
+buildkit_secret_nonleak=PASS
+registry_push=PASS
+image_inspect_history=PASS
+image_save_load_identity=PASS
+image_tag_remove=PASS
+filtered_image_prune=PASS
+EOF
 
 cleanup
+[ "$OWNED_CLEANUP" = PASS ] || die "run-owned Docker object cleanup failed"
+[ "$ISOLATED_CREDENTIAL_CLEANUP" = PASS ] || die "isolated credential cleanup failed"
+cat >> "$WORKDIR/manifest.txt.partial" <<EOF
+owned_cleanup=PASS
+isolated_credential_cleanup=PASS
+status=PASS
+EOF
+mv "$WORKDIR/manifest.txt.partial" "$WORKDIR/manifest.txt"
 trap - EXIT INT TERM
-cat "$RESULTS"
+cat "$WORKDIR/manifest.txt"
 echo "private registry auth gate PASS; evidence: $WORKDIR"
