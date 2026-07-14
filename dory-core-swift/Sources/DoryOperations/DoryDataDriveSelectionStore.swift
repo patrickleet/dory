@@ -4,6 +4,7 @@ import Foundation
 public enum DoryDataDriveSelectionError: Error, Sendable, Equatable, CustomStringConvertible {
     case invalidRecord(String)
     case uninitializedDrive(String)
+    case unselectedExistingDrive(String)
     case selectedDriveUnavailable(path: String, id: UUID)
     case selectedDriveMismatch(expected: UUID, actual: UUID?, path: String)
     case filesystem(String)
@@ -14,6 +15,9 @@ public enum DoryDataDriveSelectionError: Error, Sendable, Equatable, CustomStrin
             return "Dory selected-drive record is invalid: \(path)"
         case let .uninitializedDrive(path):
             return "cannot bind uninitialized Dory data drive at \(path)"
+        case let .unselectedExistingDrive(path):
+            return "Dory data drive at \(path) has no selection record; refusing to adopt it "
+                + "automatically (confirm it with `dory data use \"\(path)\"`)"
         case let .selectedDriveUnavailable(path, id):
             return "selected Dory data drive \(id.uuidString.lowercased()) is unavailable at \(path); "
                 + "refusing to create a replacement"
@@ -125,14 +129,39 @@ public struct DoryDataDriveSelectionStore: Sendable, Equatable {
         let drive = try DoryDataDrive(home: home, overrideRoot: selectedRoot)
 
         guard let existing else {
-            try drive.prepare(fileManager: fileManager)
-            try writeSelection(for: drive, fileManager: fileManager)
-            return drive
+            switch try drive.inspect(fileManager: fileManager) {
+            case .absent:
+                try drive.prepare(fileManager: fileManager)
+                try writeSelection(for: drive, fileManager: fileManager)
+                return drive
+            case .ready:
+                throw DoryDataDriveSelectionError.unselectedExistingDrive(drive.root)
+            }
         }
         return try verify(
             drive,
             against: existing,
             recordResolvedPath: true,
+            repairLayout: true,
+            fileManager: fileManager
+        )
+    }
+
+    /// Resolves and verifies the selected drive without creating directories, repairing its
+    /// layout, or rewriting a bookmark after a volume rename. Health and status paths use this so
+    /// diagnostics observe the same identity as startup without becoming a second lifecycle owner.
+    public func inspectSelection(
+        requestedRoot: String? = nil,
+        fileManager: FileManager = .default
+    ) throws -> DoryDataDrive? {
+        guard let existing = try read(fileManager: fileManager) else { return nil }
+        let selectedRoot = try requestedRoot ?? selectedPath(fileManager: fileManager)
+        let drive = try DoryDataDrive(home: home, overrideRoot: selectedRoot)
+        return try verify(
+            drive,
+            against: existing,
+            recordResolvedPath: false,
+            repairLayout: false,
             fileManager: fileManager
         )
     }
@@ -149,6 +178,7 @@ public struct DoryDataDriveSelectionStore: Sendable, Equatable {
                 drive,
                 against: existing,
                 recordResolvedPath: true,
+                repairLayout: true,
                 fileManager: fileManager
             )
         }
@@ -163,6 +193,7 @@ public struct DoryDataDriveSelectionStore: Sendable, Equatable {
         _ drive: DoryDataDrive,
         against selection: DoryDataDriveSelection,
         recordResolvedPath: Bool,
+        repairLayout: Bool,
         fileManager: FileManager
     ) throws -> DoryDataDrive {
         guard try drive.inspect(fileManager: fileManager) == .ready else {
@@ -180,7 +211,9 @@ public struct DoryDataDriveSelectionStore: Sendable, Equatable {
                 path: drive.root
             )
         }
-        try drive.prepare(fileManager: fileManager)
+        if repairLayout {
+            try drive.prepare(fileManager: fileManager)
+        }
         if recordResolvedPath, drive.root != selection.canonicalPath {
             try writeSelection(for: drive, fileManager: fileManager)
         }

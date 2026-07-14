@@ -3,6 +3,24 @@ import Foundation
 import XCTest
 
 final class DoryDataDriveSelectionStoreTests: XCTestCase {
+    func testFirstSelectionRefusesToAdoptAnExistingUnselectedDrive() throws {
+        let base = try temporaryHome(named: "unselected-existing")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let store = try DoryDataDriveSelectionStore(home: base.path)
+        let drive = try DoryDataDrive(home: base.path)
+        try drive.prepare()
+        let existingID = try drive.readManifest().id
+
+        XCTAssertThrowsError(try store.prepareSelection()) { error in
+            XCTAssertEqual(
+                error as? DoryDataDriveSelectionError,
+                .unselectedExistingDrive(drive.root)
+            )
+        }
+        XCTAssertEqual(try drive.readManifest().id, existingID)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.path))
+    }
+
     func testFirstSelectionSurvivesReplacementOfTransientRuntimeState() throws {
         let base = try temporaryHome(named: "runtime-reset")
         defer { try? FileManager.default.removeItem(at: base) }
@@ -86,6 +104,25 @@ final class DoryDataDriveSelectionStoreTests: XCTestCase {
         XCTAssertEqual(try store.read()?.canonicalPath, relocated.root)
         XCTAssertEqual(try store.selectedPath(), relocated.root)
         XCTAssertFalse(FileManager.default.fileExists(atPath: original.root))
+    }
+
+    func testInspectionUsesSelectedDriveWithoutRepairingOrRewritingIt() throws {
+        let base = try temporaryHome(named: "inspect-selected")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let store = try DoryDataDriveSelectionStore(home: base.path)
+        let root = base.appendingPathComponent(
+            "Library/Application Support/Dory/Selected.dorydrive",
+            isDirectory: true
+        ).path
+        let selected = try store.prepareSelection(requestedRoot: root)
+        let recordBefore = try Data(contentsOf: URL(fileURLWithPath: store.path))
+        try FileManager.default.removeItem(atPath: selected.exportsDirectory)
+
+        let inspected = try XCTUnwrap(store.inspectSelection())
+
+        XCTAssertEqual(inspected.root, selected.root)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: selected.exportsDirectory))
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: store.path)), recordBefore)
     }
 
     func testSelectionRecordSymlinkIsRejectedWithoutFollowingOrChangingTarget() throws {

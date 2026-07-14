@@ -87,8 +87,9 @@ final class HealthReporterTests: XCTestCase {
     func testDataDriveHealthReportsManagedPathAndPhysicalAllocation() throws {
         let base = "/tmp/dory-health-drive-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
         defer { try? FileManager.default.removeItem(atPath: base) }
-        let drive = try DoryDataDrive(home: base)
-        try drive.prepare()
+        let selectedRoot = base + "/Library/Application Support/Dory/Selected.dorydrive"
+        let store = try DoryDataDriveSelectionStore(home: base)
+        let drive = try store.prepareSelection(requestedRoot: selectedRoot)
         try Data(repeating: 0x44, count: 4096).write(to: URL(fileURLWithPath: drive.backupsDirectory + "/sample.bin"))
 
         let reporter = HealthReporter(
@@ -114,6 +115,29 @@ final class HealthReporterTests: XCTestCase {
         XCTAssertEqual(check.data["engine_disk_logical_bytes"], "0")
         XCTAssertEqual(check.data["engine_disk_allocated_bytes"], "0")
         XCTAssertGreaterThan(Int(check.data["allocated_bytes"] ?? "0") ?? 0, 0)
+    }
+
+    func testDataDriveHealthRefusesAnExistingDriveWithoutSelectionMetadata() throws {
+        let base = "/tmp/dory-health-unselected-drive-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        defer { try? FileManager.default.removeItem(atPath: base) }
+        let drive = try DoryDataDrive(home: base)
+        try drive.prepare()
+        let reporter = HealthReporter(
+            socketPath: base + "/missing.sock",
+            dockerTier: nil,
+            remoteManager: nil,
+            dockerAPIProbe: HealthFakeDockerAPIProbe(result: .unreachable("missing")),
+            commandRunner: HealthFakeCommandRunner(),
+            registryProbe: HealthFakeRegistryProbe(),
+            environment: ["PATH": base + "/bin", "DORY_CONFIG": base + "/config.json"],
+            home: base
+        )
+
+        let check = try XCTUnwrap(reporter.doctorReport().results.first { $0.id == "disk.dory_drive" })
+        XCTAssertEqual(check.status, .fail)
+        XCTAssertEqual(check.code, "disk.dory_drive_unselected")
+        XCTAssertEqual(check.data["path"], drive.root)
+        XCTAssertTrue(check.action?.contains("dory data use") == true)
     }
 
     func testDockerCLIResolverFindsInstalledDoryBinOutsideLaunchdPath() throws {

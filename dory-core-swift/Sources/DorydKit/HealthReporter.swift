@@ -1288,11 +1288,13 @@ public final class HealthReporter: @unchecked Sendable {
     }
 
     private func doryDataDriveCheck() -> HealthCheck {
+        let configuredRoot = environment["DORYD_DATA_DRIVE"] ?? environment["DORY_DATA_DRIVE"]
         do {
-            let drive = try DoryDataDrive(
-                home: home,
-                overrideRoot: environment["DORYD_DATA_DRIVE"] ?? environment["DORY_DATA_DRIVE"]
-            )
+            let selectionStore = try DoryDataDriveSelectionStore(home: home)
+            let drive = try selectionStore.inspectSelection(
+                requestedRoot: configuredRoot,
+                fileManager: fileManager
+            ) ?? DoryDataDrive(home: home, overrideRoot: configuredRoot)
             switch try drive.inspect(fileManager: fileManager) {
             case .absent:
                 return HealthCheck(
@@ -1305,6 +1307,9 @@ public final class HealthReporter: @unchecked Sendable {
                     data: ["path": drive.root, "available": "false"]
                 )
             case .ready:
+                guard try selectionStore.read(fileManager: fileManager) != nil else {
+                    throw DoryDataDriveSelectionError.unselectedExistingDrive(drive.root)
+                }
                 let manifest = try drive.readManifest(fileManager: fileManager)
                 let allocated = allocatedDirectoryBytes(at: drive.root)
                 var diskStatus = stat()
@@ -1350,14 +1355,30 @@ public final class HealthReporter: @unchecked Sendable {
                 )
             }
         } catch {
+            if let selectionError = error as? DoryDataDriveSelectionError,
+               case let .unselectedExistingDrive(path) = selectionError {
+                return HealthCheck(
+                    id: "disk.dory_drive",
+                    status: .fail,
+                    code: "disk.dory_drive_unselected",
+                    title: "Dory data drive needs explicit selection",
+                    detail: selectionError.description,
+                    action: "After confirming this is the drive you want, run `dory data use \"\(path)\"`.",
+                    data: ["path": path, "available": "false"]
+                )
+            }
+            let rememberedRoot = try? DoryDataDriveSelectionStore(home: home)
+                .selectedPath(fileManager: fileManager)
             let path = (try? DoryDataDrive(
                 home: home,
-                overrideRoot: environment["DORYD_DATA_DRIVE"] ?? environment["DORY_DATA_DRIVE"]
+                overrideRoot: configuredRoot ?? rememberedRoot
             ).root) ?? "invalid data-drive path"
             return HealthCheck(
                 id: "disk.dory_drive",
                 status: .fail,
-                code: error is DoryDataDriveError ? "disk.dory_drive_unavailable" : "disk.dory_drive_failed",
+                code: error is DoryDataDriveError || error is DoryDataDriveSelectionError
+                    ? "disk.dory_drive_unavailable"
+                    : "disk.dory_drive_failed",
                 title: "Dory data drive is unavailable",
                 detail: String(describing: error),
                 action: "Reconnect the configured drive or restore a valid Dory.dorydrive bundle before starting the engine.",

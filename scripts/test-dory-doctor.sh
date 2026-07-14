@@ -663,9 +663,11 @@ assert "docker" in data
 assert data["docker"]["available"] is False
 '
 
-# A clean launch creates the public v1 data model. Keep diagnostics on that exact schema so a
-# healthy first install cannot be reported as an incompatible data drive.
-FIRST_LAUNCH_DRIVE="$TMP_HOME/Library/Application Support/Dory/Dory.dorydrive"
+# A clean launch creates both the public v1 data model and its durable selection authority. Use a
+# non-default path here so the CLI proves that it inspects the selected drive rather than a shadow
+# default.
+FIRST_LAUNCH_DRIVE="$TMP_HOME/Library/Application Support/Dory/Selected.dorydrive"
+FIRST_LAUNCH_SELECTION="$TMP_HOME/Library/Application Support/Dory/data-drive-selection.json"
 mkdir -p "$FIRST_LAUNCH_DRIVE"
 cat > "$FIRST_LAUNCH_DRIVE/drive.json" <<'JSON'
 {
@@ -680,8 +682,24 @@ chmod 600 "$FIRST_LAUNCH_DRIVE/drive.json"
 DORY_DATA_DRIVE="$FIRST_LAUNCH_DRIVE" scripts/dory-doctor disk --json | python3 -c '
 import json, sys
 drive = json.load(sys.stdin)["data_drive"]
+assert drive["available"] is False
+assert drive["unselected"] is True
+'
+cat > "$FIRST_LAUNCH_SELECTION" <<JSON
+{
+  "canonicalPath": "$FIRST_LAUNCH_DRIVE",
+  "driveID": "11111111-1111-4111-8111-111111111111",
+  "schemaVersion": 1,
+  "selectedAt": "2026-07-14T00:00:00.000Z"
+}
+JSON
+chmod 600 "$FIRST_LAUNCH_SELECTION"
+scripts/dory-doctor disk --json | python3 -c '
+import json, sys
+drive = json.load(sys.stdin)["data_drive"]
 assert drive["available"] is True
 assert drive["initialized"] is True
+assert drive["path"].endswith("/Selected.dorydrive")
 assert drive["schema_version"] == 1
 assert drive["drive_id"] == "11111111-1111-4111-8111-111111111111"
 '
