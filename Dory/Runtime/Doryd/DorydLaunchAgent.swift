@@ -80,6 +80,7 @@ enum DorydLaunchAgent {
 
     struct Status: Sendable, Equatable {
         var loaded: Bool
+        var running: Bool
         var plistPath: String?
         var programPath: String?
     }
@@ -131,7 +132,9 @@ enum DorydLaunchAgent {
             currentPlistChanged: plistChanged
         ) {
         case .upToDate:
-            return true
+            guard status?.running == false else { return true }
+            let kickstarted = await runner(["kickstart", "-k", service])
+            return kickstarted.ok
         case .bootstrap:
             return await bootstrapAndKickstart(
                 uid: uid,
@@ -254,7 +257,8 @@ enum DorydLaunchAgent {
 
     static func parseStatus(_ output: String) -> Status {
         Status(
-            loaded: output.contains("state = running") || output.contains("job state = running"),
+            loaded: !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            running: output.contains("state = running") || output.contains("job state = running"),
             plistPath: value(for: "path", in: output),
             programPath: value(for: "program", in: output)
         )

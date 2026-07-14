@@ -2,6 +2,7 @@ import Foundation
 import Testing
 @testable import Dory
 
+@MainActor
 struct DorydLaunchAgentTests {
     @Test func parseStatusExtractsProgramAndPlistPaths() {
         let status = DorydLaunchAgent.parseStatus(
@@ -19,6 +20,73 @@ struct DorydLaunchAgentTests {
         #expect(status.programPath == "/Applications/Dory.app/Contents/Helpers/doryd")
     }
 
+    @Test func parseStatusTreatsWaitingJobAsLoadedButNotRunning() {
+        let status = DorydLaunchAgent.parseStatus(
+            """
+            gui/501/dev.dory.doryd = {
+                path = /Users/me/Library/LaunchAgents/dev.dory.doryd.plist
+                state = waiting
+                program = /Applications/Dory.app/Contents/Helpers/doryd
+            }
+            """
+        )
+
+        #expect(status.loaded)
+        #expect(!status.running)
+    }
+
+    @Test func ensureCurrentKickstartsLoadedWaitingJob() async throws {
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DorydLaunchAgentTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+
+        let bundleURL = temporaryDirectory.appendingPathComponent("Dory.app", isDirectory: true)
+        let contentsURL = bundleURL.appendingPathComponent("Contents", isDirectory: true)
+        let helpersURL = contentsURL.appendingPathComponent("Helpers", isDirectory: true)
+        let launchAgentsDirectory = temporaryDirectory.appendingPathComponent("LaunchAgents", isDirectory: true)
+        try FileManager.default.createDirectory(at: helpersURL, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: launchAgentsDirectory, withIntermediateDirectories: true)
+        try """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict><key>CFBundleIdentifier</key><string>dev.dory.test</string></dict></plist>
+        """.write(to: contentsURL.appendingPathComponent("Info.plist"), atomically: true, encoding: .utf8)
+        let dorydURL = helpersURL.appendingPathComponent("doryd")
+        try "#!/bin/sh\n".write(to: dorydURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dorydURL.path)
+        let bundle = try #require(Bundle(url: bundleURL))
+        let configuration = DorydLaunchAgent.Configuration()
+        let plistURL = launchAgentsDirectory.appendingPathComponent("\(DorydLaunchAgent.label).plist")
+        try DorydLaunchAgent.launchAgentPlist(
+            program: dorydURL.path,
+            helpersDirectory: helpersURL,
+            configuration: configuration
+        ).write(to: plistURL, atomically: true, encoding: .utf8)
+        let recorder = LaunchctlRecorder(printOutput:
+            """
+            gui/501/dev.dory.doryd = {
+                path = \(plistURL.path)
+                state = waiting
+                program = \(dorydURL.path)
+            }
+            """
+        )
+
+        let ok = await DorydLaunchAgent.ensureCurrent(
+            bundle: bundle,
+            launchAgentsDirectory: launchAgentsDirectory,
+            configuration: configuration
+        ) { arguments in
+            recorder.run(arguments)
+        }
+
+        #expect(ok)
+        #expect(recorder.commands == [
+            ["print", DorydLaunchAgent.serviceTarget()],
+            ["kickstart", "-k", DorydLaunchAgent.serviceTarget()],
+        ])
+    }
+
     @Test func decisionBootstrapsWhenJobIsMissing() {
         let decision = DorydLaunchAgent.decision(
             status: nil,
@@ -32,6 +100,7 @@ struct DorydLaunchAgentTests {
     @Test func decisionReplacesWhenLaunchdPointsAtOldAppBundle() {
         let status = DorydLaunchAgent.Status(
             loaded: true,
+            running: true,
             plistPath: "/Users/me/Library/LaunchAgents/dev.dory.doryd.plist",
             programPath: "/Users/me/Library/Developer/Xcode/DerivedData/Dory/Build/Products/Debug/Dory.app/Contents/Helpers/doryd"
         )
@@ -48,6 +117,7 @@ struct DorydLaunchAgentTests {
     @Test func decisionLeavesCurrentLaunchdJobAlone() {
         let status = DorydLaunchAgent.Status(
             loaded: true,
+            running: true,
             plistPath: "/Users/me/Library/LaunchAgents/dev.dory.doryd.plist",
             programPath: "/Applications/Dory.app/Contents/Helpers/doryd"
         )
@@ -64,6 +134,7 @@ struct DorydLaunchAgentTests {
     @Test func decisionReplacesWhenPlistEnvironmentChanged() {
         let status = DorydLaunchAgent.Status(
             loaded: true,
+            running: true,
             plistPath: "/Users/me/Library/LaunchAgents/dev.dory.doryd.plist",
             programPath: "/Applications/Dory.app/Contents/Helpers/doryd"
         )
