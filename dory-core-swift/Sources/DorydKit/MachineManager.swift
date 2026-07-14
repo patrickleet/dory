@@ -304,6 +304,7 @@ public final class MachineManager: @unchecked Sendable {
 
     private static let handoffReadyTimeoutSeconds: TimeInterval = 60
     private static let deletionQuarantinePrefix = ".dory-machine-delete-"
+    private static let machineMetadataTemporaryPrefix = ".dory-machine-metadata-"
     private static let snapshotDeletionQuarantinePrefix = ".dory-snapshot-delete-"
     private static let snapshotMetadataTemporaryPrefix = ".dory-snapshot-metadata-"
     /// Public Apple-Silicon machine resource contract. These match the app's steppers; enforcing
@@ -338,6 +339,7 @@ public final class MachineManager: @unchecked Sendable {
             includeDescendants: true
         )
         Self.removeStaleDeletionQuarantines(stateDirectory: configuration.stateDirectory)
+        Self.removeStaleMachineMetadataArtifacts(stateDirectory: configuration.stateDirectory)
         Self.removeStaleSnapshotArtifacts(stateDirectory: configuration.stateDirectory)
         self.machines = Self.loadPersistedMachines(configuration: configuration)
     }
@@ -360,14 +362,34 @@ public final class MachineManager: @unchecked Sendable {
         guard !exists else {
             throw MachineManagerError.duplicateMachine(machine.id)
         }
-        let preparedMachine = try prepareMachineDisk(machine)
-        lock.lock()
-        defer { lock.unlock() }
-        guard machines[machine.id] == nil, !deletingMachineIDs.contains(machine.id) else {
-            throw MachineManagerError.duplicateMachine(machine.id)
+        let fileManager = FileManager.default
+        do {
+            try fileManager.createDirectory(atPath: configuration.stateDirectory, withIntermediateDirectories: true)
+        } catch {
+            throw MachineManagerError.persistence("could not create machine state root: \(error)")
         }
+        let statePath = machineStateDirectory(id: machine.id)
+        guard mkdir(statePath, 0o700) == 0 else {
+            if errno == EEXIST {
+                throw MachineManagerError.duplicateMachine(machine.id)
+            }
+            throw MachineManagerError.persistence(
+                "could not create state for \(machine.id): \(String(cString: strerror(errno)))"
+            )
+        }
+        var committed = false
+        defer {
+            if !committed {
+                try? fileManager.removeItem(atPath: statePath)
+            }
+        }
+
+        let preparedMachine = try prepareMachineDisk(machine)
         try persist(preparedMachine)
+        lock.lock()
         machines[machine.id] = MachineEntry(configuration: preparedMachine, state: .created)
+        lock.unlock()
+        committed = true
         return DoryMachineStatus(
             id: preparedMachine.id,
             state: .created,
@@ -750,7 +772,18 @@ public final class MachineManager: @unchecked Sendable {
             cpuCount: snapshot.cpuCount
         )
         _ = try create(machine)
-        return try start(id: newID)
+        do {
+            return try start(id: newID)
+        } catch {
+            do {
+                try delete(id: newID)
+            } catch let cleanupError {
+                throw MachineManagerError.persistence(
+                    "could not start cloned machine \(newID): \(error); cleanup failed: \(cleanupError)"
+                )
+            }
+            throw error
+        }
     }
 
     public func restoreSnapshot(machineID: String, snapshotID: String) throws -> DoryMachineStatus {
@@ -1121,20 +1154,30 @@ public final class MachineManager: @unchecked Sendable {
     }
 
     private func persist(_ machine: DoryMachineConfiguration) throws {
+        let fileManager = FileManager.default
+        let directory = machineStateDirectory(id: machine.id)
+        let temporaryPath = "\(directory)/\(Self.machineMetadataTemporaryPrefix)\(UUID().uuidString)"
         do {
-            try FileManager.default.createDirectory(
-                atPath: machineStateDirectory(id: machine.id),
+            try fileManager.createDirectory(
+                atPath: directory,
                 withIntermediateDirectories: true
             )
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(machine)
             let path = machineConfigPath(id: machine.id)
-            try data.write(to: URL(fileURLWithPath: path), options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+            try data.write(to: URL(fileURLWithPath: temporaryPath), options: .atomic)
+            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporaryPath)
+            guard rename(temporaryPath, path) == 0 else {
+                throw MachineManagerError.persistence(
+                    "could not publish machine metadata: \(String(cString: strerror(errno)))"
+                )
+            }
         } catch let error as MachineManagerError {
+            try? fileManager.removeItem(atPath: temporaryPath)
             throw error
         } catch {
+            try? fileManager.removeItem(atPath: temporaryPath)
             throw MachineManagerError.persistence("\(error)")
         }
     }
@@ -1356,6 +1399,22 @@ public final class MachineManager: @unchecked Sendable {
         }
         for entry in entries where entry.hasPrefix(deletionQuarantinePrefix) {
             try? fileManager.removeItem(atPath: "\(stateDirectory)/\(entry)")
+        }
+    }
+
+    private static func removeStaleMachineMetadataArtifacts(stateDirectory: String) {
+        let fileManager = FileManager.default
+        guard let machineIDs = try? fileManager.contentsOfDirectory(atPath: stateDirectory) else {
+            return
+        }
+        for machineID in machineIDs where isValidID(machineID) {
+            let directory = "\(stateDirectory)/\(machineID)"
+            guard let entries = try? fileManager.contentsOfDirectory(atPath: directory) else {
+                continue
+            }
+            for entry in entries where entry.hasPrefix(machineMetadataTemporaryPrefix) {
+                try? fileManager.removeItem(atPath: "\(directory)/\(entry)")
+            }
         }
     }
 

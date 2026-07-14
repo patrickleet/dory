@@ -719,6 +719,21 @@ grep -F 'configuration.memorySize = memorySize' \
   || fail "the VMM can silently change the machine memory size"
 grep -F 'malformedResources?.cpuCount == 0' DoryTests/DorydClientTests.swift >/dev/null \
   || fail "malformed app machine resource overrides can silently fall back to defaults"
+grep -F 'machineMetadataTemporaryPrefix = ".dory-machine-metadata-"' \
+  dory-core-swift/Sources/DorydKit/MachineManager.swift >/dev/null \
+  || fail "machine definitions can be published before metadata permissions and content are complete"
+grep -F 'testCreateNeverOverwritesAnAbandonedMachineStateDirectory' \
+  dory-core-swift/Tests/DorydKitTests/MachineManagerTests.swift >/dev/null \
+  || fail "machine creation can overwrite an abandoned or unrecognized state directory"
+grep -F 'testUpdatePersistenceFailurePreservesThePublishedDefinition' \
+  dory-core-swift/Tests/DorydKitTests/MachineManagerTests.swift >/dev/null \
+  || fail "failed machine updates can partially publish a definition that differs after restart"
+grep -F 'testCloneStartFailureDeletesTheNewMachineDefinition' \
+  dory-core-swift/Tests/DorydKitTests/MachineManagerTests.swift >/dev/null \
+  || fail "failed machine clones can leave hidden definitions and disks on the data drive"
+grep -F 'testManagerRemovesInterruptedMachineMetadataOnStartup' \
+  dory-core-swift/Tests/DorydKitTests/MachineManagerTests.swift >/dev/null \
+  || fail "interrupted machine definition publication can accumulate hidden metadata"
 for required_recipe in \
   'guest/kernel/build.sh arm64' \
   'guest/initfs/build.sh arm64' \

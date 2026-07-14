@@ -90,6 +90,24 @@ final class MachineManagerTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: quarantine))
     }
 
+    func testManagerRemovesInterruptedMachineMetadataOnStartup() throws {
+        let base = "/tmp/dory-machine-metadata-cleanup-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        let temporaryMetadata = "\(base)/dev/.dory-machine-metadata-fixture"
+        try FileManager.default.createDirectory(atPath: "\(base)/dev", withIntermediateDirectories: true)
+        try Data("partial".utf8).write(to: URL(fileURLWithPath: temporaryMetadata))
+        defer { try? FileManager.default.removeItem(atPath: base) }
+
+        _ = MachineManager(configuration: MachineManagerConfiguration(
+            vmmExecutablePath: "/bin/sleep",
+            stateDirectory: base,
+            baseArguments: ["30"],
+            passMachineArguments: false,
+            requiresReadyHandoff: false
+        ))
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: temporaryMetadata))
+    }
+
     func testRejectsDuplicateAndInvalidMachineIDs() throws {
         let base = "/tmp/dory-machine-manager-invalid-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
         defer { try? FileManager.default.removeItem(atPath: base) }
@@ -113,6 +131,32 @@ final class MachineManagerTests: XCTestCase {
         XCTAssertThrowsError(try manager.create(DoryMachineConfiguration(id: "dev", kernelPath: "/tmp/kernel", rootfsPath: "/tmp/rootfs"))) { error in
             XCTAssertEqual(error as? MachineManagerError, .duplicateMachine("dev"))
         }
+    }
+
+    func testCreateNeverOverwritesAnAbandonedMachineStateDirectory() throws {
+        let base = "/tmp/dory-machine-abandoned-create-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        let abandoned = "\(base)/dev"
+        try FileManager.default.createDirectory(atPath: abandoned, withIntermediateDirectories: true)
+        let sentinel = "\(abandoned)/keep"
+        try Data("keep".utf8).write(to: URL(fileURLWithPath: sentinel))
+        defer { try? FileManager.default.removeItem(atPath: base) }
+        let manager = MachineManager(configuration: MachineManagerConfiguration(
+            vmmExecutablePath: "/bin/sleep",
+            stateDirectory: base,
+            baseArguments: ["30"],
+            passMachineArguments: false,
+            requiresReadyHandoff: false
+        ))
+
+        XCTAssertThrowsError(try manager.create(DoryMachineConfiguration(
+            id: "dev",
+            kernelPath: "/tmp/kernel",
+            rootfsPath: "/tmp/rootfs"
+        ))) { error in
+            XCTAssertEqual(error as? MachineManagerError, .duplicateMachine("dev"))
+        }
+        XCTAssertEqual(try String(contentsOfFile: sentinel, encoding: .utf8), "keep")
+        XCTAssertTrue(manager.list().isEmpty)
     }
 
     func testRejectsDotAndDotDotMachineIDsForCreateAndDelete() throws {
@@ -593,6 +637,37 @@ final class MachineManagerTests: XCTestCase {
         XCTAssertEqual(stored.environment, ["NODE_ENV": "production"])
     }
 
+    func testUpdatePersistenceFailurePreservesThePublishedDefinition() throws {
+        let base = "/tmp/dory-machine-update-persistence-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        defer { try? FileManager.default.removeItem(atPath: base) }
+        let manager = MachineManager(configuration: MachineManagerConfiguration(
+            vmmExecutablePath: "/bin/sleep",
+            stateDirectory: base,
+            baseArguments: ["30"],
+            passMachineArguments: false,
+            requiresReadyHandoff: false
+        ))
+        defer { try? manager.delete(id: "dev") }
+        _ = try manager.create(DoryMachineConfiguration(
+            id: "dev",
+            kernelPath: "/tmp/kernel",
+            rootfsPath: "/tmp/rootfs",
+            memoryMB: 2048,
+            cpuCount: 2
+        ))
+        let definitionPath = "\(base)/dev/machine.json"
+        let before = try Data(contentsOf: URL(fileURLWithPath: definitionPath))
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: "\(base)/dev")
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: "\(base)/dev")
+        }
+
+        XCTAssertThrowsError(try manager.update(id: "dev", memoryMB: 4096))
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: definitionPath)), before)
+        XCTAssertEqual(manager.status(id: "dev")?.memoryMB, 2048)
+        XCTAssertEqual(manager.status(id: "dev")?.cpuCount, 2)
+    }
+
     func testRejectsNonIPv4MachineAddress() throws {
         let base = "/tmp/dory-machine-address-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
         defer { try? FileManager.default.removeItem(atPath: base) }
@@ -761,6 +836,39 @@ final class MachineManagerTests: XCTestCase {
         XCTAssertEqual(imported.machineID, "dev")
         XCTAssertEqual(try manager.listSnapshots(machineID: "dev").map(\.id), ["s1"])
         XCTAssertEqual(String(data: try Data(contentsOf: URL(fileURLWithPath: imported.rootfsPath)), encoding: .utf8), "snapshot-v1")
+    }
+
+    func testCloneStartFailureDeletesTheNewMachineDefinition() throws {
+        let base = "/tmp/dory-machine-clone-rollback-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+        let sourceRootfs = "\(base)/base-rootfs.ext4"
+        try Data("base-rootfs".utf8).write(to: URL(fileURLWithPath: sourceRootfs))
+        let manager = MachineManager(configuration: MachineManagerConfiguration(
+            vmmExecutablePath: "\(base)/missing-dory-vmm",
+            stateDirectory: "\(base)/machines",
+            passMachineArguments: false,
+            requiresReadyHandoff: false
+        ))
+        defer { try? manager.delete(id: "dev") }
+        _ = try manager.create(DoryMachineConfiguration(
+            id: "dev",
+            kernelPath: "/tmp/kernel",
+            rootfsPath: sourceRootfs
+        ))
+        _ = try manager.snapshot(id: "dev", snapshotID: "s1")
+
+        XCTAssertThrowsError(try manager.cloneSnapshot(machineID: "dev", snapshotID: "s1", newID: "dev-copy"))
+        XCTAssertEqual(manager.list().map(\.id), ["dev"])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: "\(base)/machines/dev-copy"))
+
+        let reloaded = MachineManager(configuration: MachineManagerConfiguration(
+            vmmExecutablePath: "\(base)/missing-dory-vmm",
+            stateDirectory: "\(base)/machines",
+            passMachineArguments: false,
+            requiresReadyHandoff: false
+        ))
+        XCTAssertEqual(reloaded.list().map(\.id), ["dev"])
     }
 
     func testRequiredHandoffMovesMachineFromStartingToRunning() throws {
