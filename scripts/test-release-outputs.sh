@@ -1569,6 +1569,10 @@ for required in (
     'NEW_PID" != "$OLD_PID',
     'verify-release-sbom.py" --sbom "$SBOM" --app "$INSTALL_APP',
     "source=Notarized Developer ID",
+    'echo "update_zip_sha256=$UPDATE_ZIP_SHA"',
+    'echo "release_manifest_sha256=$RELEASE_MANIFEST_SHA"',
+    'echo "sbom_sha256=$SBOM_SHA"',
+    'echo "gate_script_sha256=$GATE_SCRIPT_SHA"',
     "rollback_fixture_restored=PASS",
     "initial_clean_user_state_restored=PASS",
 ):

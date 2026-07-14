@@ -207,6 +207,11 @@ assert len(values) == 1
 print(values[0])
 PY
 )"
+GATE_SCRIPT_SHA="$(shasum -a 256 "$ROOT/scripts/sparkle-install-relaunch-gate.sh" | awk '{print $1}')"
+UPDATE_ZIP_SHA="$(shasum -a 256 "$UPDATE_ZIP" | awk '{print $1}')"
+APPCAST_SHA="$(shasum -a 256 "$APPCAST" | awk '{print $1}')"
+RELEASE_MANIFEST_SHA="$(shasum -a 256 "$RELEASE_MANIFEST" | awk '{print $1}')"
+SBOM_SHA="$(shasum -a 256 "$SBOM" | awk '{print $1}')"
 
 if [ "$BUILD_ONLY" -eq 1 ]; then
   {
@@ -217,6 +222,11 @@ if [ "$BUILD_ONLY" -eq 1 ]; then
     echo "candidate_version=$VERSION"
     echo "candidate_build=$BUILD"
     echo "candidate_tree_sha256=$CANDIDATE_TREE_SHA"
+    echo "update_zip_sha256=$UPDATE_ZIP_SHA"
+    echo "appcast_sha256=$APPCAST_SHA"
+    echo "release_manifest_sha256=$RELEASE_MANIFEST_SHA"
+    echo "sbom_sha256=$SBOM_SHA"
+    echo "gate_script_sha256=$GATE_SCRIPT_SHA"
     echo "sparkle_version=$SPARKLE_VERSION"
     echo "sparkle_revision=$SPARKLE_REVISION"
     echo "sparkle_cli_sha256=$SPARKLE_CLI_SHA"
@@ -520,8 +530,11 @@ CLEAN_USER_ARMED=0
   echo "candidate_build=$BUILD"
   echo "previous_fixture_build=$PREVIOUS_BUILD"
   echo "candidate_tree_sha256=$CANDIDATE_TREE_SHA"
-  echo "update_zip_sha256=$(shasum -a 256 "$UPDATE_ZIP" | awk '{print $1}')"
-  echo "appcast_sha256=$(shasum -a 256 "$APPCAST" | awk '{print $1}')"
+  echo "update_zip_sha256=$UPDATE_ZIP_SHA"
+  echo "appcast_sha256=$APPCAST_SHA"
+  echo "release_manifest_sha256=$RELEASE_MANIFEST_SHA"
+  echo "sbom_sha256=$SBOM_SHA"
+  echo "gate_script_sha256=$GATE_SCRIPT_SHA"
   echo "sparkle_version=$SPARKLE_VERSION"
   echo "sparkle_revision=$SPARKLE_REVISION"
   echo "sparkle_cli_sha256=$SPARKLE_CLI_SHA"
