@@ -623,15 +623,16 @@ to the final release tag rather than representing this candidate as built from c
   `DORY_SOURCE_GATE_IMAGE`, `DORY_RELEASE_ALPINE_IMAGE`,
   `DORY_RELEASE_NONNATIVE_BUILD_IMAGE`, and `DORY_RELEASE_SSH_CLIENT_IMAGE` repository variables
   were configured and live-reverified on 2026-07-14; every reference contains an exact `@sha256:`
-  digest. Still set `DORY_CORPORATE_DNS_SERVER`,
+  digest. The ECR registry/repository/region and repository-scoped GitHub OIDC role variables are
+  also configured and live-reverified; no long-lived AWS secret is required. Still set `DORY_CORPORATE_DNS_SERVER`,
   `DORY_CORPORATE_VPN_PROBE_HOST`, and `DORY_CORPORATE_VPN_PROBE_URL`; the URL must use the exact
   split-DNS hostname over HTTPS, `DORY_TAILSCALE_EXIT_NODE` for real exit-node route churn, plus
   `DORY_EXTERNAL_VOLUME_TEST_ROOT` for the marked physical APFS test volume. The live API check
   confirms the tap deploy key is configured, while the five environment-specific variables and
   four physical-peer secrets are absent; the six Developer ID, keychain, notarization, and Sparkle
   secret names are present. GitHub does not expose secret
-  values, so the five-minute release preflight validates presence, image pinning, and an
-  authenticated dry-run tap push before any build starts.
+  values, so the five-minute release preflight validates presence, image pinning, temporary AWS
+  identity/repository access, and an authenticated dry-run tap push before any build starts.
 - [ ] Execute the real Sparkle updater install/relaunch gate on the exact notarized candidate. The
   release workflow now builds the updater CLI from the `Package.resolved`-pinned Sparkle 2.9.4
   revision, feeds it the byte-identical signed archive, requires the running previous app to exit
@@ -750,12 +751,18 @@ to the final release tag rather than representing this candidate as built from c
   forwarder, and gvproxy tests passed. Release provenance and validation bind the toolchain,
   module files, both thin-slice hashes, and universal hash. Exact notarized-artifact replay remains
   mandatory.
-- [ ] Configure a dedicated disposable ECR repository and short-lived CI credentials, then certify
-  authenticated manifest PUT and interrupted large-layer upload recovery on the exact notarized
-  candidate. Local registry auth/push and a fresh Docker Hub manifest pull already pass, but Apple
-  container #1707/#1895 and containerization #790 specifically involve ECR retry semantics and
-  cannot be closed by the local registry. The release remains NO-GO until resumed push, repull/run,
-  credential cleanup, and repository cleanup are retained without exposing secrets.
+- [x] Certify authenticated manifest PUT and interrupted large-layer upload recovery against real
+  ECR on the exact notarized candidate. The first campaign exposed that the isolated credential
+  directory also hid Dory's bundled Buildx plugin; the gate now binds and hashes the candidate's
+  sibling plugin without retaining credentials. The rerun observed active upload progress, forced a
+  nonzero interruption, resumed the 96 MiB layer, repeated the manifest PUT, repulled and ran the
+  exact checksum, and proved local image, remote tag, isolated credentials, temporary repository,
+  and runtime cleanup. Retained evidence is at
+  `/tmp/dory-ecr-exact-evidence-20260714T062401Z/20260714T062417Z-27505/manifest.txt`. A persistent
+  empty `dory-release-qualification` repository now has a one-day orphan lifecycle backstop, and
+  GitHub uses a main/`v*`-restricted OIDC role scoped only to that repository; no long-lived AWS
+  access keys are stored. IAM simulation proves exact-repository allow, other-repository deny, and
+  unrelated-IAM deny, and all four GitHub release variables match the provisioned resources.
 - [x] Rebuild the signed candidate with transactional migration/backup, daemon-owned recovery and
   Auto-Idle, state locking, virtiofs ownership, standalone dataplane, explicit legacy-state
   isolation, prune/bind-coherence gates, binfmt probe, IPv6 localhost, and bundled Buildx. The

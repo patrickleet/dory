@@ -202,13 +202,18 @@ grep -F 'flags: POCF' Packages/ContainerizationEngine/Sources/DoryHV/BinfmtRegis
   || fail "FEX binfmt registration lost its preserve/open/credential/fix-binary flags"
 grep -F 'start --mem-mb 8192 --cpus 6 --amd64' scripts/qualify-release-candidate.sh >/dev/null \
   || fail "exact qualification does not enable its mandatory non-native architecture path"
-for ecr_contract in authenticated_login interrupted_push_nonzero resumed_blob_upload \
+for ecr_contract in authenticated_login bundled_buildx interrupted_push_progress \
+  interrupted_push_nonzero resumed_blob_upload \
   repeated_manifest_put repull_run_checksum local_image_cleanup remote_tag_cleanup \
   isolated_credential_cleanup; do
   grep -F "$ecr_contract" scripts/ecr-registry-retry-gate.sh \
     scripts/qualify-release-candidate.sh scripts/verify-release-qualification.sh >/dev/null \
     || fail "managed ECR qualification omits $ecr_contract"
 done
+grep -F 'DOCKER_CONFIG/cli-plugins/docker-buildx' scripts/ecr-registry-retry-gate.sh >/dev/null \
+  || fail "managed ECR qualification hides the exact candidate Buildx plugin behind its isolated Docker config"
+grep -F 'BUILDX="$(dirname "$DOCKER")/docker-buildx"' scripts/ecr-registry-retry-gate.sh >/dev/null \
+  || fail "managed ECR qualification does not bind Buildx to the exact candidate Docker client"
 grep -F 'apple/container/issues/1707' COMPETITOR_ISSUE_COVERAGE.md >/dev/null \
   || fail "competitor coverage omits Apple's ECR manifest PUT regression"
 grep -F 'apple/container/issues/1895' COMPETITOR_ISSUE_COVERAGE.md >/dev/null \

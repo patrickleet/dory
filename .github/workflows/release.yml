@@ -18,9 +18,6 @@ name: Release
 #   DORY_LAN_HOST_IPV4           release Mac's physical-LAN IPv4 address
 #   DORY_TAILSCALE_PEER_SSH      noninteractive SSH peer over Tailscale
 #   DORY_TAILSCALE_HOST_IPV4     release Mac's Tailscale IPv4 address
-#   DORY_ECR_ACCESS_KEY_ID       least-privilege key for the disposable ECR test repository
-#   DORY_ECR_SECRET_ACCESS_KEY   matching least-privilege secret key
-#   DORY_ECR_SESSION_TOKEN       optional matching session token when temporary credentials are used
 # Required repository variable:
 #   DORY_SOURCE_GATE_IMAGE       digest-pinned image containing python3
 #   DORY_RELEASE_ALPINE_IMAGE    digest-pinned Alpine fixture used by every release smoke/soak
@@ -36,6 +33,7 @@ name: Release
 #   DORY_RELEASE_ECR_REGISTRY     ACCOUNT.dkr.ecr.REGION.amazonaws.com test registry
 #   DORY_RELEASE_ECR_REPOSITORY   pre-created disposable retry-test repository
 #   DORY_RELEASE_ECR_REGION       AWS region containing that repository
+#   DORY_RELEASE_AWS_ROLE_ARN      GitHub-OIDC role scoped to the disposable ECR repository
 #
 # NOTE: Dory.app targets macOS 14+ and the public production track is Apple Silicon first.
 # Intel jobs are roadmap-only and never block or contribute artifacts to the public release.
@@ -65,6 +63,9 @@ jobs:
     name: Required release credentials and tap access
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
     env:
       DEVELOPER_ID_CERT_P12_BASE64: ${{ secrets.DEVELOPER_ID_CERT_P12_BASE64 }}
       DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
@@ -77,9 +78,6 @@ jobs:
       DORY_LAN_HOST_IPV4: ${{ secrets.DORY_LAN_HOST_IPV4 }}
       DORY_TAILSCALE_PEER_SSH: ${{ secrets.DORY_TAILSCALE_PEER_SSH }}
       DORY_TAILSCALE_HOST_IPV4: ${{ secrets.DORY_TAILSCALE_HOST_IPV4 }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.DORY_ECR_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.DORY_ECR_SECRET_ACCESS_KEY }}
-      AWS_SESSION_TOKEN: ${{ secrets.DORY_ECR_SESSION_TOKEN }}
       DORY_SOURCE_GATE_IMAGE: ${{ vars.DORY_SOURCE_GATE_IMAGE }}
       DORY_RELEASE_ALPINE_IMAGE: ${{ vars.DORY_RELEASE_ALPINE_IMAGE }}
       DORY_RELEASE_NONNATIVE_BUILD_IMAGE: ${{ vars.DORY_RELEASE_NONNATIVE_BUILD_IMAGE }}
@@ -92,7 +90,15 @@ jobs:
       DORY_RELEASE_ECR_REGISTRY: ${{ vars.DORY_RELEASE_ECR_REGISTRY }}
       DORY_RELEASE_ECR_REPOSITORY: ${{ vars.DORY_RELEASE_ECR_REPOSITORY }}
       DORY_RELEASE_ECR_REGION: ${{ vars.DORY_RELEASE_ECR_REGION }}
+      DORY_RELEASE_AWS_ROLE_ARN: ${{ vars.DORY_RELEASE_AWS_ROLE_ARN }}
     steps:
+      - name: Obtain short-lived ECR credentials through GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: ${{ vars.DORY_RELEASE_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.DORY_RELEASE_ECR_REGION }}
+          role-session-name: DoryReleasePreflight
+          role-duration-seconds: 900
       - name: Preflight required credentials and advertised Homebrew tap access
         run: |
           missing=0
@@ -108,8 +114,6 @@ jobs:
             DORY_LAN_HOST_IPV4 \
             DORY_TAILSCALE_PEER_SSH \
             DORY_TAILSCALE_HOST_IPV4 \
-            AWS_ACCESS_KEY_ID \
-            AWS_SECRET_ACCESS_KEY \
             DORY_SOURCE_GATE_IMAGE \
             DORY_RELEASE_ALPINE_IMAGE \
             DORY_RELEASE_NONNATIVE_BUILD_IMAGE \
@@ -121,7 +125,8 @@ jobs:
             DORY_TAILSCALE_EXIT_NODE \
             DORY_RELEASE_ECR_REGISTRY \
             DORY_RELEASE_ECR_REPOSITORY \
-            DORY_RELEASE_ECR_REGION; do
+            DORY_RELEASE_ECR_REGION \
+            DORY_RELEASE_AWS_ROLE_ARN; do
             if [ -z "${!name}" ]; then
               echo "required release secret is missing: $name" >&2
               missing=1
@@ -152,6 +157,9 @@ jobs:
             *".dkr.ecr.$DORY_RELEASE_ECR_REGION.amazonaws.com") ;;
             *) echo "DORY_RELEASE_ECR_REGISTRY and DORY_RELEASE_ECR_REGION disagree" >&2; exit 1 ;;
           esac
+          printf '%s\n' "$DORY_RELEASE_AWS_ROLE_ARN" \
+            | grep -Eq '^arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$' \
+            || { echo "DORY_RELEASE_AWS_ROLE_ARN is invalid" >&2; exit 1; }
           command -v aws >/dev/null \
             || { echo "AWS CLI is required for release ECR preflight" >&2; exit 1; }
           aws sts get-caller-identity >/dev/null
@@ -711,6 +719,7 @@ jobs:
     timeout-minutes: 1800
     permissions:
       contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@c915c33a16f01166c17c4e35fe1d4085a2d71adb # v4
         with:
@@ -726,6 +735,13 @@ jobs:
           test -x "$xcode_app/Contents/Developer/usr/bin/xcodebuild"
           echo "selected: $xcode_app"
           echo "DEVELOPER_DIR=$xcode_app/Contents/Developer" >> "$GITHUB_ENV"
+      - name: Obtain short-lived ECR credentials through GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: ${{ vars.DORY_RELEASE_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.DORY_RELEASE_ECR_REGION }}
+          role-session-name: DoryReleaseQualification
+          role-duration-seconds: 21600
       - name: Run concurrent release-duration gates and retain runner-local evidence
         env:
           DORY_SOURCE_GATE_IMAGE: ${{ vars.DORY_SOURCE_GATE_IMAGE }}
@@ -734,9 +750,6 @@ jobs:
           DORY_RELEASE_ECR_REGISTRY: ${{ vars.DORY_RELEASE_ECR_REGISTRY }}
           DORY_RELEASE_ECR_REPOSITORY: ${{ vars.DORY_RELEASE_ECR_REPOSITORY }}
           DORY_RELEASE_ECR_REGION: ${{ vars.DORY_RELEASE_ECR_REGION }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.DORY_ECR_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.DORY_ECR_SECRET_ACCESS_KEY }}
-          AWS_SESSION_TOKEN: ${{ secrets.DORY_ECR_SESSION_TOKEN }}
         run: |
           scripts/qualify-release-candidate.sh \
             --build-dir release-build \

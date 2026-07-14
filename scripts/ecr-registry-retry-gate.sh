@@ -56,6 +56,10 @@ done
   || die "requires --confirm DISPOSABLE-ECR-INTERRUPT-RETRY"
 [ -S "$SOCKET" ] || die "Dory socket is unavailable: $SOCKET"
 [ -x "$DOCKER" ] || die "Docker CLI is not executable: $DOCKER"
+DOCKER="$(cd "$(dirname "$DOCKER")" && pwd)/$(basename "$DOCKER")"
+BUILDX="$(dirname "$DOCKER")/docker-buildx"
+[ -x "$BUILDX" ] \
+  || die "the exact candidate Docker CLI has no sibling docker-buildx plugin: $BUILDX"
 printf '%s\n' "$BASE_IMAGE" | grep -Eq '^.+@sha256:[0-9a-f]{64}$' \
   || die "--base-image must be digest-pinned"
 printf '%s\n' "$REGISTRY" | grep -Eq '^[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com$' \
@@ -77,11 +81,14 @@ WORKDIR="$WORKROOT/$RUN_ID"
 DOCKER_CONFIG="$WORKDIR/docker-config"
 CONTEXT="$WORKDIR/context"
 MANIFEST="$WORKDIR/manifest.txt"
-mkdir -p "$DOCKER_CONFIG" "$CONTEXT"
+mkdir -p "$DOCKER_CONFIG/cli-plugins" "$CONTEXT"
+ln -s "$BUILDX" "$DOCKER_CONFIG/cli-plugins/docker-buildx"
 REMOTE_DELETED=0
 
 docker_e() { DOCKER_HOST="unix://$SOCKET" DOCKER_CONFIG="$DOCKER_CONFIG" "$DOCKER" "$@"; }
 docker_e version >/dev/null || die "Docker API is not ready"
+docker_e buildx version >/dev/null \
+  || die "the bundled Buildx plugin is unavailable inside the isolated credential store"
 docker_e image inspect "$BASE_IMAGE" >/dev/null 2>&1 \
   || die "base image is not present in the isolated store"
 aws ecr describe-repositories --region "$REGION" --repository-names "$REPOSITORY" \
@@ -150,10 +157,15 @@ push_pid=$!
 interrupted=0
 for _ in $(seq 1 600); do
   if ! kill -0 "$push_pid" 2>/dev/null; then break; fi
-  if grep -Eq '([[:space:]]|:)Pushing([[:space:]]|$)' \
+  # Docker 28's non-TTY progress renderer reports active uploads as `Waiting` and then jumps
+  # directly to `Pushed`; older clients report `Pushing`. Accept either active-progress spelling,
+  # but require the push process to remain alive through a one-second upload window before killing
+  # it. A completed fast push cannot masquerade as the interrupted-upload regression.
+  if grep -Eq '([[:space:]]|:)(Pushing|Waiting)([[:space:]]|$)' \
       "$WORKDIR/interrupted-push.out" "$WORKDIR/interrupted-push.err" 2>/dev/null; then
     sleep 1
-    kill -TERM "$push_pid" 2>/dev/null || true
+    kill -0 "$push_pid" 2>/dev/null || break
+    kill -TERM "$push_pid"
     interrupted=1
     break
   fi
@@ -210,9 +222,12 @@ rm -rf "$DOCKER_CONFIG" "$CONTEXT"
   echo "region=$REGION"
   echo "base_image=$BASE_IMAGE"
   echo "docker_cli_sha256=$(shasum -a 256 "$DOCKER" | awk '{print $1}')"
+  echo "buildx_cli_sha256=$(shasum -a 256 "$BUILDX" | awk '{print $1}')"
   echo "layer_mib=$LAYER_MIB"
   echo "layer_sha256=$layer_sha"
   echo "authenticated_login=PASS"
+  echo "bundled_buildx=PASS"
+  echo "interrupted_push_progress=PASS"
   echo "interrupted_push_nonzero=PASS"
   echo "resumed_blob_upload=PASS"
   echo "repeated_manifest_put=PASS"

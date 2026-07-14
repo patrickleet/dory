@@ -420,7 +420,8 @@ for key, path, architecture in (
 PY
 
 ecr_manifest="$(single_evidence_file ecr-registry manifest.txt)"
-for proof in status authenticated_login interrupted_push_nonzero resumed_blob_upload \
+for proof in status authenticated_login bundled_buildx interrupted_push_progress \
+  interrupted_push_nonzero resumed_blob_upload \
   repeated_manifest_put repull_run_checksum local_image_cleanup remote_tag_cleanup \
   isolated_credential_cleanup; do
   grep -qx "$proof=PASS" "$ecr_manifest" \
@@ -430,6 +431,7 @@ grep -Eq '^registry_sha256=[0-9a-f]{64}$' "$ecr_manifest" \
   && grep -Eq '^repository_sha256=[0-9a-f]{64}$' "$ecr_manifest" \
   && grep -Eq '^layer_sha256=[0-9a-f]{64}$' "$ecr_manifest" \
   && grep -Eq '^docker_cli_sha256=[0-9a-f]{64}$' "$ecr_manifest" \
+  && grep -Eq '^buildx_cli_sha256=[0-9a-f]{64}$' "$ecr_manifest" \
   || die "retained managed ECR evidence omits provenance digests"
 ecr_layer_mib="$(sed -n 's/^layer_mib=//p' "$ecr_manifest")"
 [ -n "$ecr_layer_mib" ] && [ "$ecr_layer_mib" -ge 64 ] \

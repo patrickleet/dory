@@ -586,9 +586,12 @@ repository_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 region=us-east-1
 base_image=alpine:3.22@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 docker_cli_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+buildx_cli_sha256=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 layer_mib=96
 layer_sha256=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
 authenticated_login=PASS
+bundled_buildx=PASS
+interrupted_push_progress=PASS
 interrupted_push_nonzero=PASS
 resumed_blob_upload=PASS
 repeated_manifest_put=PASS
@@ -1583,6 +1586,23 @@ assert "needs: [release_candidate, release_qualification, sonoma_vz_certificatio
     "publication is not blocked on duration, Sonoma VZ, source-preservation, and Homebrew certification"
 assert "permissions:\n      contents: write" in publication, "publication job lacks explicit release permission"
 assert "permissions:\n  contents: read" in release, "non-publication release jobs inherit contents:write"
+oidc_action = "aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708"
+assert release.count(oidc_action) == 2, \
+    "release must use the pinned AWS OIDC action for preflight and exact qualification"
+assert "DORY_RELEASE_AWS_ROLE_ARN: ${{ vars.DORY_RELEASE_AWS_ROLE_ARN }}" in release, \
+    "release does not receive its repository-scoped AWS role"
+assert release.count("id-token: write") == 3, \
+    "OIDC token permission changed outside release preflight, exact qualification, or Pages"
+for forbidden in ("DORY_ECR_ACCESS_KEY_ID", "DORY_ECR_SECRET_ACCESS_KEY", "DORY_ECR_SESSION_TOKEN"):
+    assert forbidden not in release, f"release still accepts long-lived AWS credential secret: {forbidden}"
+assert release.index("role-session-name: DoryReleasePreflight") \
+    < release.index("aws sts get-caller-identity"), \
+    "release preflight calls AWS before obtaining short-lived OIDC credentials"
+assert release.index("role-session-name: DoryReleaseQualification") \
+    < release.index("scripts/qualify-release-candidate.sh"), \
+    "exact qualification starts before obtaining short-lived OIDC credentials"
+assert "role-duration-seconds: 900" in release and "role-duration-seconds: 21600" in release, \
+    "OIDC sessions do not bound preflight tightly or cover the pre-soak qualification gates"
 assert "scripts/verify-release-qualification.sh" in publication, \
     "publication does not invoke the qualification verifier"
 qualification_verify = open("scripts/verify-release-qualification.sh", encoding="utf-8").read()

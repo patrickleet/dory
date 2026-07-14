@@ -828,7 +828,8 @@ bounded 1800 scripts/ecr-registry-retry-gate.sh \
   || die "managed ECR interrupted-upload/retry gate failed"
 ecr_manifest="$(find "$WORKDIR/evidence/ecr-registry" -name manifest.txt -type f -print -quit)"
 [ -s "$ecr_manifest" ] || die "managed ECR evidence manifest is missing"
-for proof in status authenticated_login interrupted_push_nonzero resumed_blob_upload \
+for proof in status authenticated_login bundled_buildx interrupted_push_progress \
+  interrupted_push_nonzero resumed_blob_upload \
   repeated_manifest_put repull_run_checksum local_image_cleanup remote_tag_cleanup \
   isolated_credential_cleanup; do
   grep -qx "$proof=PASS" "$ecr_manifest" \
