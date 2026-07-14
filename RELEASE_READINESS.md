@@ -422,6 +422,24 @@ to the final release tag rather than representing this candidate as built from c
   SHA-256 is `cb61f7372b8e75d14192751762ab8b72d350b3dbabf8a0c679902ab9b1d25224`.
   Qualification and publication now reject competitor evidence whose source commit differs from
   the immutable release manifest; ordinary development runs may still default to repository HEAD.
+- Four additional standalone gates pass on those same exact candidate bits. Offline boot starts
+  from the bundled compressed kernel/rootfs under dead proxies, then starts again after hiding both
+  bundle sources with no host TCP dependency (manifest SHA-256
+  `476264c4d4147a388cd9906558d5de1ba2ae469c075f628da8aa92c0388cd2f2`). The managed-drive gate
+  preserves images, writable container layers, named volumes, and custom networks through total
+  transient-runtime replacement while rejecting mismatched, missing, unwritable, concurrent, and
+  alias attachments (summary SHA-256
+  `074ad46e7099c338ec24a043748163336e5cb83ffeeb3f946db4a05d5846fd0b`). The growth gate safely
+  expands a deliberately seeded 16 GiB ext4 image to a sparse 128 GiB image, reclaims allocation
+  from 1,217,708,032 to 172,228,608 bytes through boot trim/discard, and preserves its named-volume
+  marker across restart (summary SHA-256
+  `73680260b620ad1ae09bd35fad4c215400132060c89fc986b548add19c1ca915`). The digest-pinned
+  cross-container advisory-lock gate and disposable-key SSH-agent gate both pass; the latter proves
+  one plus eight concurrent clients and a network-disabled required BuildKit mount using identical
+  public-listing hashes, retains no key text, and binds the exact candidate Docker and Buildx hashes.
+  Evidence is retained at `/tmp/dory-exact-offline-boot-20260714`,
+  `/tmp/dory-exact-managed-drive-20260714`, `/tmp/dory-exact-data-growth-20260714`, and
+  `/tmp/dory-exact-lock-ssh-evidence-20260714T070012Z`.
 - A live migration reproduction now covers the user-visible failure where images imported but
   volumes and containers did not. The owned smoke imported image archives, named-volume bytes,
   networks, full create configuration, bind/volume mounts, stopped/running state, and an untagged
@@ -575,7 +593,9 @@ to the final release tag rather than representing this candidate as built from c
   `<volume-root>/.dory-release-external-volume` containing exactly
   `DORY-DEDICATED-RELEASE-APFS-V1`; this is the explicit authorization for the gate to unmount,
   reject missing-drive/internal-shadow writes, and remount that whole dedicated volume.
-- [ ] Run the exact-candidate cross-container bind advisory-lock gate. Current source and 59 focused
+- [ ] Repeat the exact-candidate cross-container bind advisory-lock gate through both clean
+  notarized app paths and long qualification. The exact standalone candidate already passed, and
+  current source plus 59 focused
   FUSE tests implement and prove owner-isolated POSIX ranges and BSD `flock`, `GETLK`, blocking
   acquisition, interrupt cancellation, partial unlock, flush/direct-release cleanup, and reset.
   Both notarized app paths and long qualification now require the digest-pinned live gate to prove
@@ -589,7 +609,9 @@ to the final release tag rather than representing this candidate as built from c
   isolated raw-HV live run passed one plus eight concurrent clients with only identity hashes
   retained at `~/.dory-new-gate-evidence/20260713T012556Z-ssh-agent-capped`.
 - [ ] Repeat the SSH-agent gate through both exact notarized app paths and long qualification, and
-  require fresh-boot plus restart proof on the physical macOS 14 VZ runner. Publication now binds
+  require fresh-boot plus restart proof on the physical macOS 14 VZ runner. The exact standalone
+  candidate passed ordinary and eight-client concurrency plus the required BuildKit SSH mount with
+  no retained key text. Publication now binds
   that evidence to `DORY_RELEASE_SSH_CLIENT_IMAGE` and rejects missing or mismatched identity/image
   digests.
 - [x] Re-enable macOS UI automation for the rebuilt DoryUITests runner and pass the new machine
@@ -602,7 +624,9 @@ to the final release tag rather than representing this candidate as built from c
 - [ ] Run both exact notarized app paths from empty release accounts and prove the clean v1 drive,
   selected-drive authority, full Docker inventory, settings, stop/start persistence, crash
   recovery, and uninstall-without-data-loss contracts. No pre-release Dory state may be discovered
-  or adopted.
+  or adopted. The exact standalone candidate already passed managed-drive persistence, total
+  transient-state replacement, attachment locking, and fail-closed missing/mismatched/unwritable
+  drive cases; this blocker now covers the two installed-app account paths and uninstall behavior.
 - [ ] Roadmap after the Apple Silicon release: run physical Intel validation before publishing any
   Intel or universal artifact. It is not a blocker for the current arm64 release.
 - [ ] Configure the dedicated GitHub release runners. A live API check on 2026-07-14 reports
@@ -710,10 +734,10 @@ to the final release tag rather than representing this candidate as built from c
   when both are missing. The mandatory exact-candidate gate boots once from bundled compressed
   kernel/rootfs bytes under dead proxies, hides those source files only in a disposable APFS clone,
   and boots again from the unchanged prepared cache while recording zero host TCP dependencies.
-  Current-source evidence passed both graceful phases at
-  `~/.dory-new-gate-evidence/20260713T-offline-cached-boot-current` (archive SHA-256
-  `2a87b1316c7b5441cdc2fa677e993ac14b3e8f9dd9ab5e9e9497834aa782cb57`), covering Lima #5188's
-  cached-image/remote-HEAD failure class without claiming final-artifact certification.
+  The exact notarized candidate passed both graceful phases at
+  `/tmp/dory-exact-offline-boot-20260714/20260714T065230Z-57984/manifest.txt` (manifest SHA-256
+  `476264c4d4147a388cd9906558d5de1ba2ae469c075f628da8aa92c0388cd2f2`), covering Lima #5188's
+  cached-image/remote-HEAD failure class with exact runtime payload hashes.
 - [x] Make default multi-platform pull/storage semantics publication-bound. The qualifier now starts
   with the digest-pinned fixture absent, pulls it without `--platform`, requires a Linux arm64 image
   and default arm64 container, and re-parses the retained `image inspect`, `/images/json`, and

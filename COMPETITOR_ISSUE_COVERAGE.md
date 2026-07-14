@@ -24,6 +24,14 @@ runtime uncertainty from the affected rows. It does not waive rows whose closure
 final tagged rebuild, eight/25-hour duration, a clean app/update install, physical sleep/networking,
 or external APFS media.
 
+The same exact candidate standalone archive also passes cached offline boot with its bundle sources
+hidden, complete managed-drive persistence and transient-runtime replacement, 16→128 GiB sparse
+growth with real discard reclaim and restart persistence, cross-container BSD/POSIX advisory locks,
+and SSH-agent forwarding through one plus eight concurrent clients and a required network-disabled
+BuildKit mount. The SSH proof binds both candidate Docker and Buildx hashes and retains no public or
+private key text. Installed direct/Sparkle app paths, physical VZ restart, uninstall, external-drive,
+and final-duration requirements remain blockers where the table explicitly calls for them.
+
 | Competitor failure class | Dory coverage | Remaining release action |
 |---|---|---|
 | OrbStack [Wi-Fi failure after sleep](https://github.com/orbstack/orbstack/issues/702), Colima [sleep failure](https://github.com/abiosoft/colima/issues/460), Rancher Desktop [socket failure after sleep](https://github.com/rancher-sandbox/rancher-desktop/issues/1274) | **LAUNCH BLOCKER — exact physical certification**. Wake/clock repair and bounded lifecycle tests exist. The notarized direct-candidate workflow now binds the exact app/Docker/doryd/dory-hv hashes and commit/run/attempt, schedules a hardware wake, physically sleeps the Apple-Silicon Mac five times, and requires unchanged default route, scoped DNS/search state, proxies, `/etc/resolver`, associated Wi-Fi, an active VPN, the configured corporate resolver, internal host/container HTTPS reachability, and Docker API recovery after every wake. Publication semantically rejects immediate-return sleep, missing schedule/pmset logs, incomplete/failed cycles, changed network contracts, different candidate binaries, or a different private network contract. | Execute the five-cycle gate on the dedicated physical release Mac while its corporate split-DNS VPN is active. It requires the exact `SLEEP-AND-WAKE-THIS-MAC` token and passwordless `pmset` only on that clean runner; ordinary development tests never sleep the user's Mac. |
