@@ -678,7 +678,6 @@ public final class MachineManager: @unchecked Sendable {
             let persisted = (try? FileManager.default.contentsOfDirectory(atPath: configuration.stateDirectory)) ?? []
             ids = persisted.filter(Self.isValidID(_:))
         }
-        let decoder = JSONDecoder()
         let snapshots = ids.flatMap { id -> [DoryMachineSnapshot] in
             let directory = snapshotDirectory(machineID: id)
             guard let files = try? FileManager.default.contentsOfDirectory(atPath: directory) else {
@@ -687,15 +686,8 @@ public final class MachineManager: @unchecked Sendable {
             return files
                 .filter { $0.hasSuffix(".json") }
                 .compactMap { file in
-                    let path = "\(directory)/\(file)"
-                    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-                          let snapshot = try? decoder.decode(DoryMachineSnapshot.self, from: data),
-                          snapshot.machineID == id,
-                          Self.isValidID(snapshot.id),
-                          FileManager.default.fileExists(atPath: snapshot.rootfsPath) else {
-                        return nil
-                    }
-                    return snapshot
+                    let snapshotID = String(file.dropLast(".json".count))
+                    return try? loadSnapshot(machineID: id, snapshotID: snapshotID)
                 }
         }
         return snapshots.sorted { lhs, rhs in
@@ -1096,13 +1088,18 @@ public final class MachineManager: @unchecked Sendable {
             throw MachineManagerError.invalidID(snapshotID)
         }
         let path = snapshotMetadataPath(machineID: machineID, snapshotID: snapshotID)
+        let expectedRootfsPath = snapshotRootfsPath(machineID: machineID, snapshotID: snapshotID)
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               let snapshot = try? JSONDecoder().decode(DoryMachineSnapshot.self, from: data),
               snapshot.machineID == machineID,
-              FileManager.default.fileExists(atPath: snapshot.rootfsPath) else {
+              snapshot.id == snapshotID,
+              snapshot.rootfsPath == expectedRootfsPath,
+              Self.isPrivateRegularFile(path: expectedRootfsPath) else {
             throw MachineManagerError.unknownSnapshot(snapshotID)
         }
-        return snapshot
+        var validated = snapshot
+        validated.sizeBytes = Self.fileSize(path: expectedRootfsPath)
+        return validated
     }
 
     private func handleHandoff(machineID: String, result: Result<VmmHandoff, Error>) {
@@ -1229,6 +1226,17 @@ public final class MachineManager: @unchecked Sendable {
             return number.int64Value
         }
         return 0
+    }
+
+    private static func isPrivateRegularFile(path: String) -> Bool {
+        var info = stat()
+        guard lstat(path, &info) == 0,
+              (info.st_mode & S_IFMT) == S_IFREG,
+              info.st_uid == getuid(),
+              info.st_nlink == 1 else {
+            return false
+        }
+        return (info.st_mode & 0o077) == 0
     }
 
     private static func loadPersistedMachines(configuration: MachineManagerConfiguration) -> [String: MachineEntry] {

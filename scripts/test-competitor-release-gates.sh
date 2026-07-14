@@ -675,6 +675,18 @@ grep -F 'testDeleteFailurePreservesPersistedStoppedMachine' \
 grep -F 'testManagerRemovesInterruptedDeletionQuarantinesOnStartup' \
   dory-core-swift/Tests/DorydKitTests/MachineManagerTests.swift >/dev/null \
   || fail "interrupted daemon machine deletions can accumulate hidden data-drive storage"
+grep -F 'snapshot.rootfsPath == expectedRootfsPath' \
+  dory-core-swift/Sources/DorydKit/MachineManager.swift >/dev/null \
+  || fail "persisted machine snapshot metadata can redirect operations outside managed storage"
+grep -F 'Self.isPrivateRegularFile(path: expectedRootfsPath)' \
+  dory-core-swift/Sources/DorydKit/MachineManager.swift >/dev/null \
+  || fail "machine snapshot operations can follow substituted links to host files"
+grep -F 'testSnapshotMetadataCannotRedirectOperationsOutsideManagedStorage' \
+  dory-core-swift/Tests/DorydKitTests/MachineManagerTests.swift >/dev/null \
+  || fail "machine snapshot path confinement no longer has a tamper regression test"
+grep -F 'testSnapshotOperationsRejectSymlinkAndHardLinkRootfsSubstitution' \
+  dory-core-swift/Tests/DorydKitTests/MachineManagerTests.swift >/dev/null \
+  || fail "machine snapshot operations no longer prove link substitution fails closed"
 for required_recipe in \
   'guest/kernel/build.sh arm64' \
   'guest/initfs/build.sh arm64' \

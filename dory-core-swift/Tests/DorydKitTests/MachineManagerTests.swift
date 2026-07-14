@@ -217,6 +217,93 @@ final class MachineManagerTests: XCTestCase {
         )
     }
 
+    func testSnapshotMetadataCannotRedirectOperationsOutsideManagedStorage() throws {
+        let base = "/tmp/dory-machine-snapshot-redirect-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+        let sourceRootfs = "\(base)/base-rootfs.ext4"
+        let sentinel = "\(base)/sentinel"
+        try Data("base-rootfs".utf8).write(to: URL(fileURLWithPath: sourceRootfs))
+        try Data("private-host-data".utf8).write(to: URL(fileURLWithPath: sentinel))
+        let manager = MachineManager(configuration: MachineManagerConfiguration(
+            vmmExecutablePath: "/bin/sleep",
+            stateDirectory: "\(base)/machines",
+            baseArguments: ["30"],
+            passMachineArguments: false,
+            requiresReadyHandoff: false
+        ))
+        defer { try? manager.delete(id: "dev") }
+
+        _ = try manager.create(DoryMachineConfiguration(
+            id: "dev",
+            kernelPath: "/tmp/kernel",
+            rootfsPath: sourceRootfs
+        ))
+        var snapshot = try manager.snapshot(id: "dev", snapshotID: "s1")
+        snapshot.rootfsPath = sentinel
+        let metadataPath = "\(base)/machines/dev/snapshots/s1.json"
+        try JSONEncoder().encode(snapshot).write(to: URL(fileURLWithPath: metadataPath), options: .atomic)
+
+        XCTAssertTrue(try manager.listSnapshots(machineID: "dev").isEmpty)
+        XCTAssertThrowsError(try manager.restoreSnapshot(machineID: "dev", snapshotID: "s1")) { error in
+            XCTAssertEqual(error as? MachineManagerError, .unknownSnapshot("s1"))
+        }
+        XCTAssertThrowsError(try manager.exportSnapshot(
+            machineID: "dev",
+            snapshotID: "s1",
+            toPath: "\(base)/redirected.dorymachine"
+        )) { error in
+            XCTAssertEqual(error as? MachineManagerError, .unknownSnapshot("s1"))
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: "\(base)/redirected.dorymachine"))
+    }
+
+    func testSnapshotOperationsRejectSymlinkAndHardLinkRootfsSubstitution() throws {
+        let base = "/tmp/dory-machine-snapshot-links-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+        let sourceRootfs = "\(base)/base-rootfs.ext4"
+        let sentinel = "\(base)/sentinel"
+        try Data("base-rootfs".utf8).write(to: URL(fileURLWithPath: sourceRootfs))
+        try Data("private-host-data".utf8).write(to: URL(fileURLWithPath: sentinel))
+        let manager = MachineManager(configuration: MachineManagerConfiguration(
+            vmmExecutablePath: "/bin/sleep",
+            stateDirectory: "\(base)/machines",
+            baseArguments: ["30"],
+            passMachineArguments: false,
+            requiresReadyHandoff: false
+        ))
+        defer { try? manager.delete(id: "dev") }
+
+        _ = try manager.create(DoryMachineConfiguration(
+            id: "dev",
+            kernelPath: "/tmp/kernel",
+            rootfsPath: sourceRootfs
+        ))
+        let snapshot = try manager.snapshot(id: "dev", snapshotID: "s1")
+        try FileManager.default.removeItem(atPath: snapshot.rootfsPath)
+        XCTAssertEqual(symlink(sentinel, snapshot.rootfsPath), 0)
+        XCTAssertThrowsError(try manager.exportSnapshot(
+            machineID: "dev",
+            snapshotID: "s1",
+            toPath: "\(base)/symlink.dorymachine"
+        )) { error in
+            XCTAssertEqual(error as? MachineManagerError, .unknownSnapshot("s1"))
+        }
+
+        try FileManager.default.removeItem(atPath: snapshot.rootfsPath)
+        XCTAssertEqual(link(sentinel, snapshot.rootfsPath), 0)
+        XCTAssertThrowsError(try manager.exportSnapshot(
+            machineID: "dev",
+            snapshotID: "s1",
+            toPath: "\(base)/hardlink.dorymachine"
+        )) { error in
+            XCTAssertEqual(error as? MachineManagerError, .unknownSnapshot("s1"))
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: "\(base)/symlink.dorymachine"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: "\(base)/hardlink.dorymachine"))
+    }
+
     func testMachineDefinitionsPersistAcrossManagerRestart() throws {
         let base = "/tmp/dory-machine-persist-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
         let share = "\(base)-share"
