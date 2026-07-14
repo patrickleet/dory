@@ -27,6 +27,18 @@ if rg -q 'dory\.autoUpdate|automaticallyChecksForUpdates' Dory; then
   echo "test-release-outputs: app code overrides Sparkle automatic-check consent" >&2
   exit 1
 fi
+grep -Fq 'DORY_CLI_VERSION="0.0.0-dev"' scripts/dory \
+  || { echo "test-release-outputs: source CLI has a release-specific version" >&2; exit 1; }
+grep -Fq 'BUNDLED_APP_VERSION="$(/usr/libexec/PlistBuddy' scripts/bundle-engine.sh \
+  || { echo "test-release-outputs: bundler does not derive the CLI version from Dory.app" >&2; exit 1; }
+if grep -Fq 'scripts/dory version' scripts/release.sh; then
+  echo "test-release-outputs: release policy still treats the source CLI as the version owner" >&2
+  exit 1
+fi
+grep -Fq 'bundled dory CLI version' scripts/release.sh \
+  || { echo "test-release-outputs: release does not verify the bundled CLI version" >&2; exit 1; }
+grep -Fq 'bundled dory CLI version' scripts/validate-release-outputs.sh \
+  || { echo "test-release-outputs: artifact validation does not verify the CLI version" >&2; exit 1; }
 
 VERSION="0.3.0"
 BUILD="42"
@@ -42,6 +54,8 @@ for helper in dory-dataplane-proxy docker-buildx dory-network-helper dory-hv; do
   printf '#!/bin/sh\nexit 0\n' > "$HELPERS/$helper"
   chmod 0755 "$HELPERS/$helper"
 done
+printf '#!/bin/sh\nprintf "%%s\\n" "%s"\n' "$VERSION" > "$HELPERS/dory"
+chmod 0755 "$HELPERS/dory"
 DORY_HV_SHA="$(shasum -a 256 "$HELPERS/dory-hv" | awk '{print $1}')"
 cp Config/dev.dory.network-helper.plist \
   "$LAUNCH_DAEMONS/dev.dory.network-helper.plist"

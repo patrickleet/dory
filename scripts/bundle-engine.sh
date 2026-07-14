@@ -893,17 +893,36 @@ bundle_universal_host_cli docker-buildx
 bundle_universal_host_cli docker-compose
 LC_ALL=C sort -o "$HOST_CLI_PROVENANCE" "$HOST_CLI_PROVENANCE"
 
-# The `dory` CLI + its Python helper, so the in-app Health panel and `dory doctor`/`dory compat`
-# work on a clean Mac with nothing installed. They must sit together in Helpers so the
-# bash wrapper resolves dory-doctor beside itself (stdlib-only Python; needs the
-# system python3). Files under Contents/Helpers are treated as nested code, so codesign must sign
-# each one individually (its CMS signature rides in an xattr) or the non-deep app re-sign fails with
-# "code object is not signed at all".
+# Keep the CLI and doctor together so a clean install needs no external Dory tooling.
 echo "==> Bundling the dory CLI helpers (Health panel + doctor/compat)…"
 DORY_SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
+BUNDLED_APP_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+  "$APP/Contents/Info.plist")"
+[ -n "$BUNDLED_APP_VERSION" ] || {
+  echo "ERROR: Dory.app has no CFBundleShortVersionString" >&2
+  exit 1
+}
 for script in dory dory-doctor; do
   if [ -f "$DORY_SCRIPTS/$script" ]; then
     install -m0755 "$DORY_SCRIPTS/$script" "$HELPERS/$script"
+    if [ "$script" = dory ]; then
+      python3 - "$HELPERS/$script" "$BUNDLED_APP_VERSION" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+version = sys.argv[2]
+source, replacements = re.subn(
+    r'(?m)^DORY_CLI_VERSION="[^"]+"$',
+    f'DORY_CLI_VERSION="{version}"',
+    path.read_text(),
+)
+if replacements != 1:
+    raise SystemExit(f"expected one DORY_CLI_VERSION assignment in {path}")
+path.write_text(source)
+PY
+    fi
     codesign --force --timestamp -s "${DORY_SIGN_ID:-Developer ID Application}" "$HELPERS/$script" 2>/dev/null \
       || codesign --force -s - "$HELPERS/$script"
     echo "    bundled + signed Helpers/$script"

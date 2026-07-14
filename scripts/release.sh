@@ -257,10 +257,6 @@ preflight_public_release() {
   [ -z "${DORY_SPARKLE_SIGN_UPDATE:-}" ] \
     || release_error "public releases must use sign_update from the release build's pinned Sparkle package"
 
-  local cli_version
-  cli_version="$(sed -nE 's/^DORY_CLI_VERSION="([^"]+)"$/\1/p' scripts/dory | head -1)"
-  [ "$cli_version" = "$VERSION" ] \
-    || release_error "scripts/dory version $cli_version does not match public release $VERSION"
   scripts/verify-clean-release-source.sh . >/dev/null \
     || release_error "public release source does not exactly match commit $SOURCE_COMMIT"
 }
@@ -497,7 +493,7 @@ validate_stapled_dmg() {
 }
 
 verify_full_bundle() {
-  local app="$1" helpers resources launch_agent asset_arch helper
+  local app="$1" helpers resources launch_agent asset_arch helper cli_version
   helpers="$app/Contents/Helpers"
   resources="$app/Contents/Resources"
   launch_agent="$resources/dev.dory.doryd.plist"
@@ -516,6 +512,9 @@ verify_full_bundle() {
   for helper in doryd dorydctl dory-vmm dory-network-helper dory-dataplane-proxy dory-hv gvproxy docker docker-buildx docker-compose kubectl dory dory-doctor; do
     verify_developer_id_signature "$helpers/$helper"
   done
+  cli_version="$("$helpers/dory" version)"
+  [ "$cli_version" = "$VERSION" ] \
+    || release_error "bundled dory CLI version $cli_version does not match $VERSION"
 
   for asset_arch in $BUNDLE_ARCHES; do
     assert_file_exists "$resources/dory-agent-linux-$asset_arch" "guest agent"

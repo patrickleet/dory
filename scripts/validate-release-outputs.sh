@@ -201,6 +201,8 @@ test_payload="$(find "$APP" \
   || fail "arm64 app marketing version does not match $VERSION"
 [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO")" = "$BUILD" ] \
   || fail "arm64 app build does not match $BUILD"
+[ "$("$APP/Contents/Helpers/dory" version)" = "$VERSION" ] \
+  || fail "bundled dory CLI version does not match $VERSION"
 
 [ -x "$NETWORK_HELPER" ] || fail "arm64 app has no privileged network helper"
 [ -s "$NETWORK_DAEMON_PLIST" ] || fail "arm64 app has no privileged network daemon plist"

@@ -15,7 +15,7 @@ while [ -L "$DORY_SCRIPT_SOURCE" ]; do
 done
 DORY_SCRIPT_DIR="$(cd -P "$(dirname "$DORY_SCRIPT_SOURCE")" >/dev/null 2>&1 && pwd)"
 
-DORY_CLI_VERSION="0.3.0"
+DORY_CLI_VERSION="0.0.0-dev"
 DORY_SOCK="${DORY_SOCK:-$HOME/.dory/dory.sock}"
 KUBECONFIG_DORY="$HOME/.kube/dory-config"
 RECIPE_DIR="${DORY_RECIPE_DIR:-$HOME/.dory/recipes}"
