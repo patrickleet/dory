@@ -411,6 +411,17 @@ grep -F 'case .interrupt' Packages/ContainerizationEngine/Sources/DoryHV/Fuse/Fu
 grep -F 'scripts/bind-advisory-lock-gate.sh' scripts/release-candidate-live-smoke.sh \
   scripts/qualify-release-candidate.sh >/dev/null \
   || fail "exact release paths omit the live cross-container bind-lock gate"
+for clean_user_gate in \
+  scripts/release-candidate-live-smoke.sh \
+  scripts/sparkle-install-relaunch-gate.sh; do
+  grep -F 'APP_SUPPORT="$HOME/Library/Application Support/Dory"' "$clean_user_gate" \
+    >/dev/null \
+    || fail "clean-user release gate checks the wrong managed data-drive root: $clean_user_gate"
+  if grep -F 'APP_SUPPORT="$HOME/Library/Application Support/com.pythonxi.Dory"' \
+      "$clean_user_gate" >/dev/null; then
+    fail "clean-user release gate still uses the obsolete bundle-ID state root: $clean_user_gate"
+  fi
+done
 grep -F 'env HOME="$ENGINE_HOME" scripts/bind-advisory-lock-gate.sh' \
   scripts/qualify-release-candidate.sh >/dev/null \
   || fail "isolated release qualifier runs the bind-lock gate outside its shared engine HOME"

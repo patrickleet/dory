@@ -252,7 +252,7 @@ security find-identity -v -p codesigning \
   || die "Developer ID signing identity is unavailable: $SIGNING_IDENTITY"
 
 STATE="$HOME/.dory"
-APP_SUPPORT="$HOME/Library/Application Support/com.pythonxi.Dory"
+APP_SUPPORT="$HOME/Library/Application Support/Dory"
 PREF_DOMAIN="com.pythonxi.Dory"
 SERVICE="gui/$(id -u)/dev.dory.doryd"
 PLIST="$HOME/Library/LaunchAgents/dev.dory.doryd.plist"
