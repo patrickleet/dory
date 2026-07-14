@@ -746,6 +746,24 @@ grep -F 'testShareArgumentsRoundTripDelimiterHeavyPathsAndJSON' \
 grep -F 'Share JSON supports delimiter-heavy paths:' \
   dory-core-swift/Sources/dorydctl/main.swift >/dev/null \
   || fail "the machine CLI does not document its unambiguous delimiter-heavy share syntax"
+grep -F 'private static let magic = Data("DORYMACHINE2\n".utf8)' \
+  dory-core-swift/Sources/DorydKit/MachineManager.swift >/dev/null \
+  || fail "machine snapshot exports are not bound to the checksummed bundle format"
+grep -F 'payloadDigest == header.payloadDigest' \
+  dory-core-swift/Sources/DorydKit/MachineManager.swift >/dev/null \
+  || fail "machine snapshot imports do not verify rootfs content integrity"
+grep -F 'header.contentID == expectedContentID' \
+  dory-core-swift/Sources/DorydKit/MachineManager.swift >/dev/null \
+  || fail "machine snapshot imports can mix metadata and rootfs from different bundle versions"
+grep -F 'O_NOFOLLOW | O_NONBLOCK' \
+  dory-core-swift/Sources/DorydKit/MachineManager.swift >/dev/null \
+  || fail "machine snapshot import can follow links or block on special files"
+grep -F 'testImportSnapshotRejectsCorruptTruncatedTrailingAndLegacyBundles' \
+  dory-core-swift/Tests/DorydKitTests/MachineManagerTests.swift >/dev/null \
+  || fail "machine snapshot imports no longer prove corrupt bundles fail without artifacts"
+grep -F 'testSnapshotExportFailurePreservesExistingBundle' \
+  dory-core-swift/Tests/DorydKitTests/MachineManagerTests.swift >/dev/null \
+  || fail "failed machine snapshot exports can destroy an existing user bundle"
 for required_recipe in \
   'guest/kernel/build.sh arm64' \
   'guest/initfs/build.sh arm64' \

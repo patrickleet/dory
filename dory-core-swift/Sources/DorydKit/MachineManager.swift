@@ -907,7 +907,8 @@ public final class MachineManager: @unchecked Sendable {
         defer { operationLock.unlock() }
         var extractedRootfsPath: String?
         do {
-            var snapshot = try MachineSnapshotBundle.readMetadata(fromPath: path)
+            let bundle = try MachineSnapshotBundle.readDescriptor(fromPath: path)
+            var snapshot = bundle.snapshot
             guard Self.isValidID(snapshot.machineID), Self.isValidID(snapshot.id) else {
                 throw MachineManagerError.persistence("invalid snapshot metadata")
             }
@@ -918,7 +919,11 @@ public final class MachineManager: @unchecked Sendable {
             }
             snapshot.rootfsPath = snapshotRootfsPath(machineID: snapshot.machineID, snapshotID: snapshot.id)
             extractedRootfsPath = snapshot.rootfsPath
-            try MachineSnapshotBundle.extractRootfs(fromPath: path, toPath: snapshot.rootfsPath)
+            try MachineSnapshotBundle.extractRootfs(
+                fromPath: path,
+                expectedContentID: bundle.contentID,
+                toPath: snapshot.rootfsPath
+            )
             snapshot.sizeBytes = Self.fileSize(path: snapshot.rootfsPath)
             try persistSnapshot(snapshot)
             return snapshot
@@ -1486,103 +1491,275 @@ public final class MachineManager: @unchecked Sendable {
 }
 
 private enum MachineSnapshotBundle {
-    private static let magic = Data("DORYMACHINE1\n".utf8)
+    private struct Header {
+        var snapshot: DoryMachineSnapshot
+        var payloadOffset: UInt64
+        var payloadLength: UInt64
+        var payloadDigest: Data
+        var contentID: Data
+    }
+
+    private static let magic = Data("DORYMACHINE2\n".utf8)
     private static let lengthByteCount = 8
+    private static let digestByteCount = 32
+    private static let maximumMetadataLength: UInt64 = 16 * 1024 * 1024
+    private static let copyChunkSize = 4 * 1024 * 1024
 
     static func write(snapshot: DoryMachineSnapshot, toPath path: String) throws {
+        let input = try openRegularFileForReading(path: snapshot.rootfsPath, requirePrivateOwnership: true)
+        defer { try? input.close() }
+        let payloadLength = try input.seekToEnd()
+        guard payloadLength > 0, payloadLength <= UInt64(Int64.max) else {
+            throw MachineManagerError.persistence("invalid machine snapshot payload size")
+        }
+        try input.seek(toOffset: 0)
+
+        var exportedSnapshot = snapshot
+        exportedSnapshot.sizeBytes = Int64(payloadLength)
+        let metadata = try JSONEncoder().encode(exportedSnapshot)
+        guard !metadata.isEmpty, UInt64(metadata.count) <= maximumMetadataLength else {
+            throw MachineManagerError.persistence("invalid dory machine bundle metadata")
+        }
+        let metadataDigest = Data(SHA256.hash(data: metadata))
+
         let outputURL = URL(fileURLWithPath: path)
         let parent = outputURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
         let temporaryURL = parent.appendingPathComponent(".\(outputURL.lastPathComponent).tmp-\(UUID().uuidString)")
-        FileManager.default.createFile(atPath: temporaryURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
+        guard FileManager.default.createFile(
+            atPath: temporaryURL.path,
+            contents: nil,
+            attributes: [.posixPermissions: 0o600]
+        ) else {
+            throw MachineManagerError.persistence("could not create temporary machine bundle")
+        }
         let output = try FileHandle(forWritingTo: temporaryURL)
+        var outputIsOpen = true
+        defer {
+            if outputIsOpen {
+                try? output.close()
+            }
+        }
         do {
-            let metadata = try JSONEncoder().encode(snapshot)
             try output.write(contentsOf: magic)
             try output.write(contentsOf: bigEndianBytes(UInt64(metadata.count)))
+            try output.write(contentsOf: bigEndianBytes(payloadLength))
+            try output.write(contentsOf: metadataDigest)
+            let payloadDigestOffset = try output.offset()
+            try output.write(contentsOf: Data(repeating: 0, count: digestByteCount))
             try output.write(contentsOf: metadata)
-            try appendFile(path: snapshot.rootfsPath, to: output)
+            let payloadDigest = try copyExactly(
+                from: input,
+                to: output,
+                byteCount: payloadLength,
+                rejectTrailingInput: true
+            )
+            try output.seek(toOffset: payloadDigestOffset)
+            try output.write(contentsOf: payloadDigest)
+            try output.synchronize()
             try output.close()
-            if FileManager.default.fileExists(atPath: path) {
-                try FileManager.default.removeItem(atPath: path)
+            outputIsOpen = false
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: temporaryURL.path
+            )
+            guard rename(temporaryURL.path, outputURL.path) == 0 else {
+                throw MachineManagerError.persistence(
+                    "could not publish machine bundle: \(String(cString: strerror(errno)))"
+                )
             }
-            try FileManager.default.moveItem(at: temporaryURL, to: outputURL)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
         } catch {
-            try? output.close()
             try? FileManager.default.removeItem(at: temporaryURL)
             throw error
         }
     }
 
-    static func readMetadata(fromPath path: String) throws -> DoryMachineSnapshot {
-        let input = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
+    static func readDescriptor(fromPath path: String) throws -> (snapshot: DoryMachineSnapshot, contentID: Data) {
+        let input = try openRegularFileForReading(path: path)
         defer { try? input.close() }
-        return try readHeader(from: input).snapshot
+        let header = try readHeader(from: input)
+        return (header.snapshot, header.contentID)
     }
 
-    static func extractRootfs(fromPath path: String, toPath destination: String) throws {
-        let input = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
+    static func extractRootfs(fromPath path: String, expectedContentID: Data, toPath destination: String) throws {
+        let input = try openRegularFileForReading(path: path)
+        var inputIsOpen = true
+        defer {
+            if inputIsOpen {
+                try? input.close()
+            }
+        }
+        let header = try readHeader(from: input)
+        guard header.contentID == expectedContentID else {
+            throw MachineManagerError.persistence("machine bundle changed during import")
+        }
         let outputURL = URL(fileURLWithPath: destination)
         let parent = outputURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
         let temporaryURL = parent.appendingPathComponent(".\(outputURL.lastPathComponent).tmp-\(UUID().uuidString)")
-        FileManager.default.createFile(atPath: temporaryURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
-        let output = try FileHandle(forWritingTo: temporaryURL)
-        do {
-            let header = try readHeader(from: input)
-            try input.seek(toOffset: header.payloadOffset)
-            try copyRemaining(from: input, to: output)
-            try input.close()
-            try output.close()
-            if FileManager.default.fileExists(atPath: destination) {
-                try FileManager.default.removeItem(atPath: destination)
-            }
-            try FileManager.default.moveItem(at: temporaryURL, to: outputURL)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination)
-        } catch {
+        guard FileManager.default.createFile(
+            atPath: temporaryURL.path,
+            contents: nil,
+            attributes: [.posixPermissions: 0o600]
+        ) else {
             try? input.close()
-            try? output.close()
+            throw MachineManagerError.persistence("could not create temporary machine snapshot rootfs")
+        }
+        let output = try FileHandle(forWritingTo: temporaryURL)
+        var outputIsOpen = true
+        defer {
+            if outputIsOpen {
+                try? output.close()
+            }
+        }
+        do {
+            try input.seek(toOffset: header.payloadOffset)
+            let payloadDigest = try copyExactly(
+                from: input,
+                to: output,
+                byteCount: header.payloadLength
+            )
+            guard payloadDigest == header.payloadDigest else {
+                throw MachineManagerError.persistence("corrupt dory machine bundle payload")
+            }
+            try output.synchronize()
+            try input.close()
+            inputIsOpen = false
+            try output.close()
+            outputIsOpen = false
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: temporaryURL.path
+            )
+            guard rename(temporaryURL.path, outputURL.path) == 0 else {
+                throw MachineManagerError.persistence(
+                    "could not publish machine snapshot rootfs: \(String(cString: strerror(errno)))"
+                )
+            }
+        } catch {
             try? FileManager.default.removeItem(at: temporaryURL)
             throw error
         }
     }
 
-    private static func readHeader(from input: FileHandle) throws -> (snapshot: DoryMachineSnapshot, payloadOffset: UInt64) {
-        let gotMagic = try input.read(upToCount: magic.count) ?? Data()
+    private static func readHeader(from input: FileHandle) throws -> Header {
+        try input.seek(toOffset: 0)
+        let gotMagic = try readExactly(from: input, count: magic.count)
         guard gotMagic == magic else {
             throw MachineManagerError.persistence("not a dory machine bundle")
         }
-        let lengthData = try input.read(upToCount: lengthByteCount) ?? Data()
-        guard lengthData.count == lengthByteCount else {
-            throw MachineManagerError.persistence("truncated dory machine bundle")
-        }
-        let metadataLength = lengthData.reduce(UInt64(0)) { partial, byte in
-            (partial << 8) | UInt64(byte)
-        }
-        guard metadataLength > 0, metadataLength <= 16 * 1024 * 1024 else {
+        let metadataLength = decodeUInt64(try readExactly(from: input, count: lengthByteCount))
+        let payloadLength = decodeUInt64(try readExactly(from: input, count: lengthByteCount))
+        guard metadataLength > 0, metadataLength <= maximumMetadataLength else {
             throw MachineManagerError.persistence("invalid dory machine bundle metadata")
         }
-        let metadata = try input.read(upToCount: Int(metadataLength)) ?? Data()
-        guard metadata.count == Int(metadataLength) else {
-            throw MachineManagerError.persistence("truncated dory machine bundle metadata")
+        guard payloadLength > 0, payloadLength <= UInt64(Int64.max) else {
+            throw MachineManagerError.persistence("invalid dory machine bundle payload size")
+        }
+        let metadataDigest = try readExactly(from: input, count: digestByteCount)
+        let payloadDigest = try readExactly(from: input, count: digestByteCount)
+        let metadata = try readExactly(from: input, count: Int(metadataLength))
+        guard Data(SHA256.hash(data: metadata)) == metadataDigest else {
+            throw MachineManagerError.persistence("corrupt dory machine bundle metadata")
         }
         let snapshot = try JSONDecoder().decode(DoryMachineSnapshot.self, from: metadata)
-        let payloadOffset = UInt64(magic.count + lengthByteCount) + metadataLength
-        return (snapshot, payloadOffset)
+        guard snapshot.sizeBytes == Int64(payloadLength) else {
+            throw MachineManagerError.persistence("machine bundle payload size does not match metadata")
+        }
+        let fixedHeaderLength = UInt64(magic.count + (lengthByteCount * 2) + (digestByteCount * 2))
+        let (payloadOffset, offsetOverflow) = fixedHeaderLength.addingReportingOverflow(metadataLength)
+        let (expectedFileLength, lengthOverflow) = payloadOffset.addingReportingOverflow(payloadLength)
+        guard !offsetOverflow, !lengthOverflow, try input.seekToEnd() == expectedFileLength else {
+            throw MachineManagerError.persistence("truncated or trailing dory machine bundle payload")
+        }
+        var identity = Data()
+        identity.append(bigEndianBytes(metadataLength))
+        identity.append(bigEndianBytes(payloadLength))
+        identity.append(metadataDigest)
+        identity.append(payloadDigest)
+        return Header(
+            snapshot: snapshot,
+            payloadOffset: payloadOffset,
+            payloadLength: payloadLength,
+            payloadDigest: payloadDigest,
+            contentID: Data(SHA256.hash(data: identity))
+        )
     }
 
-    private static func appendFile(path: String, to output: FileHandle) throws {
-        let input = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
-        defer { try? input.close() }
-        try copyRemaining(from: input, to: output)
+    private static func openRegularFileForReading(
+        path: String,
+        requirePrivateOwnership: Bool = false
+    ) throws -> FileHandle {
+        let descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+        guard descriptor >= 0 else {
+            throw MachineManagerError.persistence(
+                "could not open machine bundle file: \(String(cString: strerror(errno)))"
+            )
+        }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0 else {
+            let code = errno
+            close(descriptor)
+            throw MachineManagerError.persistence(
+                "could not inspect machine bundle file: \(String(cString: strerror(code)))"
+            )
+        }
+        guard (info.st_mode & S_IFMT) == S_IFREG else {
+            close(descriptor)
+            throw MachineManagerError.persistence("machine bundle input is not a regular file")
+        }
+        if requirePrivateOwnership {
+            guard info.st_uid == getuid(), info.st_nlink == 1, (info.st_mode & 0o077) == 0 else {
+                close(descriptor)
+                throw MachineManagerError.persistence("machine snapshot rootfs is not private")
+            }
+        }
+        return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
     }
 
-    private static func copyRemaining(from input: FileHandle, to output: FileHandle) throws {
-        while true {
-            let chunk = try input.read(upToCount: 4 * 1024 * 1024) ?? Data()
-            guard !chunk.isEmpty else { return }
+    private static func copyExactly(
+        from input: FileHandle,
+        to output: FileHandle,
+        byteCount: UInt64,
+        rejectTrailingInput: Bool = false
+    ) throws -> Data {
+        var remaining = byteCount
+        var hasher = SHA256()
+        while remaining > 0 {
+            let requested = Int(min(remaining, UInt64(copyChunkSize)))
+            let chunk = try input.read(upToCount: requested) ?? Data()
+            guard !chunk.isEmpty else {
+                throw MachineManagerError.persistence("truncated dory machine bundle payload")
+            }
             try output.write(contentsOf: chunk)
+            hasher.update(data: chunk)
+            remaining -= UInt64(chunk.count)
+        }
+        if rejectTrailingInput {
+            let extra = try input.read(upToCount: 1) ?? Data()
+            guard extra.isEmpty else {
+                throw MachineManagerError.persistence("machine snapshot changed while exporting")
+            }
+        }
+        return Data(hasher.finalize())
+    }
+
+    private static func readExactly(from input: FileHandle, count: Int) throws -> Data {
+        var result = Data()
+        result.reserveCapacity(count)
+        while result.count < count {
+            let chunk = try input.read(upToCount: count - result.count) ?? Data()
+            guard !chunk.isEmpty else {
+                throw MachineManagerError.persistence("truncated dory machine bundle")
+            }
+            result.append(chunk)
+        }
+        return result
+    }
+
+    private static func decodeUInt64(_ data: Data) -> UInt64 {
+        data.reduce(UInt64(0)) { partial, byte in
+            (partial << 8) | UInt64(byte)
         }
     }
 

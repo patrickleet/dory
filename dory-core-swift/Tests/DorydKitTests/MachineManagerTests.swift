@@ -1,3 +1,4 @@
+import CryptoKit
 import DoryCore
 @testable import DorydKit
 import XCTest
@@ -296,6 +297,76 @@ final class MachineManagerTests: XCTestCase {
         XCTAssertThrowsError(try manager.importSnapshot(fromPath: bundlePath))
         XCTAssertFalse(FileManager.default.fileExists(atPath: "\(base)/machines/dev/snapshots/s1.ext4"))
         XCTAssertFalse(FileManager.default.fileExists(atPath: "\(base)/machines/dev/snapshots/s1.json"))
+    }
+
+    func testImportSnapshotRejectsCorruptTruncatedTrailingAndLegacyBundles() throws {
+        let base = "/tmp/dory-machine-import-integrity-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+        let manager = MachineManager(configuration: MachineManagerConfiguration(
+            vmmExecutablePath: "/bin/sleep",
+            stateDirectory: "\(base)/machines",
+            baseArguments: ["30"],
+            passMachineArguments: false,
+            requiresReadyHandoff: false
+        ))
+        let validPath = "\(base)/valid.dorymachine"
+        try writeMachineBundle(
+            toPath: validPath,
+            snapshot: DoryMachineSnapshot(
+                id: "s1",
+                machineID: "dev",
+                note: "integrity",
+                createdISO: "2026-07-07T00:00:00Z",
+                rootfsPath: "/ignored",
+                sizeBytes: 0,
+                kernelPath: "/tmp/kernel",
+                memoryMB: 2048,
+                cpuCount: 2
+            ),
+            rootfs: Data("machine-rootfs-payload".utf8)
+        )
+        let valid = try Data(contentsOf: URL(fileURLWithPath: validPath))
+        let payloadOffset = try machineBundlePayloadOffset(valid)
+
+        var corruptMetadata = valid
+        corruptMetadata[payloadOffset - 1] ^= 0xff
+        var corruptPayload = valid
+        corruptPayload[payloadOffset] ^= 0xff
+        var trailing = valid
+        trailing.append(0xff)
+        var legacy = valid
+        legacy[Data("DORYMACHINE".utf8).count] = Character("1").asciiValue!
+        let variants = [
+            ("corrupt-metadata", corruptMetadata),
+            ("corrupt-payload", corruptPayload),
+            ("truncated", valid.dropLast()),
+            ("trailing", trailing),
+            ("legacy", legacy),
+        ]
+
+        for (name, bytes) in variants {
+            let path = "\(base)/\(name).dorymachine"
+            try Data(bytes).write(to: URL(fileURLWithPath: path))
+            XCTAssertThrowsError(try manager.importSnapshot(fromPath: path), name)
+            XCTAssertFalse(FileManager.default.fileExists(
+                atPath: "\(base)/machines/dev/snapshots/s1.ext4"
+            ), name)
+            XCTAssertFalse(FileManager.default.fileExists(
+                atPath: "\(base)/machines/dev/snapshots/s1.json"
+            ), name)
+            let artifacts = (try? FileManager.default.contentsOfDirectory(
+                atPath: "\(base)/machines/dev/snapshots"
+            )) ?? []
+            XCTAssertTrue(artifacts.isEmpty, "\(name) left import artifacts: \(artifacts)")
+        }
+
+        let symlinkPath = "\(base)/symlink.dorymachine"
+        XCTAssertEqual(symlink(validPath, symlinkPath), 0)
+        XCTAssertThrowsError(try manager.importSnapshot(fromPath: symlinkPath))
+        let fifoPath = "\(base)/fifo.dorymachine"
+        XCTAssertEqual(mkfifo(fifoPath, 0o600), 0)
+        XCTAssertThrowsError(try manager.importSnapshot(fromPath: fifoPath))
     }
 
     func testRestoreSnapshotLeavesLiveRootfsIntactWhenCopyFails() throws {
@@ -896,6 +967,46 @@ final class MachineManagerTests: XCTestCase {
         XCTAssertEqual(imported.machineID, "dev")
         XCTAssertEqual(try manager.listSnapshots(machineID: "dev").map(\.id), ["s1"])
         XCTAssertEqual(String(data: try Data(contentsOf: URL(fileURLWithPath: imported.rootfsPath)), encoding: .utf8), "snapshot-v1")
+    }
+
+    func testSnapshotExportFailurePreservesExistingBundle() throws {
+        let base = "/tmp/dory-machine-export-atomic-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+        let sourceRootfs = "\(base)/base-rootfs.ext4"
+        try Data("base-rootfs".utf8).write(to: URL(fileURLWithPath: sourceRootfs))
+        let manager = MachineManager(configuration: MachineManagerConfiguration(
+            vmmExecutablePath: "/bin/sleep",
+            stateDirectory: "\(base)/machines",
+            baseArguments: ["30"],
+            passMachineArguments: false,
+            requiresReadyHandoff: false
+        ))
+        defer { try? manager.delete(id: "dev") }
+        _ = try manager.create(DoryMachineConfiguration(
+            id: "dev",
+            kernelPath: "/tmp/kernel",
+            rootfsPath: sourceRootfs
+        ))
+        _ = try manager.snapshot(id: "dev", snapshotID: "s1")
+
+        let exportDirectory = "\(base)/exports"
+        let bundlePath = "\(exportDirectory)/dev.dorymachine"
+        try FileManager.default.createDirectory(atPath: exportDirectory, withIntermediateDirectories: true)
+        let existing = Data("existing-export-must-survive".utf8)
+        try existing.write(to: URL(fileURLWithPath: bundlePath))
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: exportDirectory)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: exportDirectory)
+        }
+
+        XCTAssertThrowsError(try manager.exportSnapshot(
+            machineID: "dev",
+            snapshotID: "s1",
+            toPath: bundlePath
+        ))
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: bundlePath)), existing)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: exportDirectory), ["dev.dorymachine"])
     }
 
     func testCloneStartFailureDeletesTheNewMachineDefinition() throws {
@@ -1511,19 +1622,44 @@ private func writeMachineBundle(
     snapshot: DoryMachineSnapshot,
     rootfs: Data
 ) throws {
-    let magic = Data("DORYMACHINE1\n".utf8)
+    let magic = Data("DORYMACHINE2\n".utf8)
+    var snapshot = snapshot
+    snapshot.sizeBytes = Int64(rootfs.count)
     let metadata = try JSONEncoder().encode(snapshot)
-    var length = Data()
-    let count = UInt64(metadata.count)
-    for shift in stride(from: 56, through: 0, by: -8) {
-        length.append(UInt8((count >> UInt64(shift)) & 0xff))
-    }
     var bundle = Data()
     bundle.append(magic)
-    bundle.append(length)
+    bundle.append(machineBundleUInt64(UInt64(metadata.count)))
+    bundle.append(machineBundleUInt64(UInt64(rootfs.count)))
+    bundle.append(contentsOf: SHA256.hash(data: metadata))
+    bundle.append(contentsOf: SHA256.hash(data: rootfs))
     bundle.append(metadata)
     bundle.append(rootfs)
     try bundle.write(to: URL(fileURLWithPath: path))
+}
+
+private func machineBundlePayloadOffset(_ bundle: Data) throws -> Int {
+    let magic = Data("DORYMACHINE2\n".utf8)
+    let fixedHeaderLength = magic.count + 8 + 8 + 32 + 32
+    guard bundle.count >= fixedHeaderLength,
+          bundle.prefix(magic.count) == magic else {
+        throw MachineManagerError.persistence("invalid test machine bundle")
+    }
+    let lengthStart = magic.count
+    let metadataLength = bundle[lengthStart..<(lengthStart + 8)].reduce(UInt64(0)) { partial, byte in
+        (partial << 8) | UInt64(byte)
+    }
+    guard metadataLength <= UInt64(Int.max - fixedHeaderLength) else {
+        throw MachineManagerError.persistence("invalid test machine bundle length")
+    }
+    return fixedHeaderLength + Int(metadataLength)
+}
+
+private func machineBundleUInt64(_ value: UInt64) -> Data {
+    var bytes = Data()
+    for shift in stride(from: 56, through: 0, by: -8) {
+        bytes.append(UInt8((value >> UInt64(shift)) & 0xff))
+    }
+    return bytes
 }
 
 private func waitForMachineState(
