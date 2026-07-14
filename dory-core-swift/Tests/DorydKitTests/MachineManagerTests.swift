@@ -304,6 +304,64 @@ final class MachineManagerTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: "\(base)/hardlink.dorymachine"))
     }
 
+    func testSnapshotDeleteFailurePreservesVisibleSnapshot() throws {
+        let base = "/tmp/dory-machine-snapshot-delete-failure-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+        let sourceRootfs = "\(base)/base-rootfs.ext4"
+        try Data("base-rootfs".utf8).write(to: URL(fileURLWithPath: sourceRootfs))
+        let manager = MachineManager(configuration: MachineManagerConfiguration(
+            vmmExecutablePath: "/bin/sleep",
+            stateDirectory: "\(base)/machines",
+            baseArguments: ["30"],
+            passMachineArguments: false,
+            requiresReadyHandoff: false
+        ))
+        defer { try? manager.delete(id: "dev") }
+
+        _ = try manager.create(DoryMachineConfiguration(
+            id: "dev",
+            kernelPath: "/tmp/kernel",
+            rootfsPath: sourceRootfs
+        ))
+        let snapshot = try manager.snapshot(id: "dev", snapshotID: "s1")
+        let snapshotDirectory = "\(base)/machines/dev/snapshots"
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: snapshotDirectory)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: snapshotDirectory)
+        }
+
+        XCTAssertThrowsError(try manager.deleteSnapshot(machineID: "dev", snapshotID: "s1"))
+        XCTAssertEqual(try manager.listSnapshots(machineID: "dev").map(\.id), ["s1"])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: snapshot.rootfsPath))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: "\(snapshotDirectory)/s1.json"))
+    }
+
+    func testManagerRemovesInterruptedSnapshotArtifactsOnStartup() throws {
+        let base = "/tmp/dory-machine-snapshot-cleanup-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        let directory = "\(base)/dev/snapshots"
+        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        let quarantinedRootfs = "\(directory)/.dory-snapshot-delete-s1-fixture.ext4"
+        let quarantinedMetadata = "\(directory)/.dory-snapshot-delete-s1-fixture.json"
+        let temporaryMetadata = "\(directory)/.dory-snapshot-metadata-s1-fixture"
+        for path in [quarantinedRootfs, quarantinedMetadata, temporaryMetadata] {
+            try Data("stale".utf8).write(to: URL(fileURLWithPath: path))
+        }
+        defer { try? FileManager.default.removeItem(atPath: base) }
+
+        _ = MachineManager(configuration: MachineManagerConfiguration(
+            vmmExecutablePath: "/bin/sleep",
+            stateDirectory: base,
+            baseArguments: ["30"],
+            passMachineArguments: false,
+            requiresReadyHandoff: false
+        ))
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: quarantinedRootfs))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: quarantinedMetadata))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: temporaryMetadata))
+    }
+
     func testMachineDefinitionsPersistAcrossManagerRestart() throws {
         let base = "/tmp/dory-machine-persist-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
         let share = "\(base)-share"

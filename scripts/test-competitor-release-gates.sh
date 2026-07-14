@@ -687,6 +687,21 @@ grep -F 'testSnapshotMetadataCannotRedirectOperationsOutsideManagedStorage' \
 grep -F 'testSnapshotOperationsRejectSymlinkAndHardLinkRootfsSubstitution' \
   dory-core-swift/Tests/DorydKitTests/MachineManagerTests.swift >/dev/null \
   || fail "machine snapshot operations no longer prove link substitution fails closed"
+grep -F 'private let operationLock = NSRecursiveLock()' \
+  dory-core-swift/Sources/DorydKit/MachineManager.swift >/dev/null \
+  || fail "machine lifecycle and snapshot mutations can race each other"
+grep -F 'snapshotMetadataTemporaryPrefix = ".dory-snapshot-metadata-"' \
+  dory-core-swift/Sources/DorydKit/MachineManager.swift >/dev/null \
+  || fail "machine snapshot metadata can be published before permissions and content are complete"
+grep -F 'snapshotDeletionQuarantinePrefix = ".dory-snapshot-delete-"' \
+  dory-core-swift/Sources/DorydKit/MachineManager.swift >/dev/null \
+  || fail "machine snapshot deletion can orphan a hidden rootfs on the user data drive"
+grep -F 'testSnapshotDeleteFailurePreservesVisibleSnapshot' \
+  dory-core-swift/Tests/DorydKitTests/MachineManagerTests.swift >/dev/null \
+  || fail "failed machine snapshot deletion no longer proves the snapshot remains usable"
+grep -F 'testManagerRemovesInterruptedSnapshotArtifactsOnStartup' \
+  dory-core-swift/Tests/DorydKitTests/MachineManagerTests.swift >/dev/null \
+  || fail "interrupted machine snapshot transactions can accumulate hidden data-drive storage"
 for required_recipe in \
   'guest/kernel/build.sh arm64' \
   'guest/initfs/build.sh arm64' \

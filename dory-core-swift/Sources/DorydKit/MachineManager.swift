@@ -304,6 +304,8 @@ public final class MachineManager: @unchecked Sendable {
 
     private static let handoffReadyTimeoutSeconds: TimeInterval = 60
     private static let deletionQuarantinePrefix = ".dory-machine-delete-"
+    private static let snapshotDeletionQuarantinePrefix = ".dory-snapshot-delete-"
+    private static let snapshotMetadataTemporaryPrefix = ".dory-snapshot-metadata-"
     /// Public Apple-Silicon machine resource contract. These match the app's steppers; enforcing
     /// them again in doryd prevents CLI/XPC callers from persisting values that the VMM would later
     /// clamp silently, which would make status disagree with the running guest.
@@ -315,6 +317,7 @@ public final class MachineManager: @unchecked Sendable {
     private let configuration: MachineManagerConfiguration
     private let agentConnector: AgentConnector
     private let balloonController: any MachineBalloonControlling
+    private let operationLock = NSRecursiveLock()
     private let lock = NSLock()
     private var machines: [String: MachineEntry] = [:]
     private var deletingMachineIDs: Set<String> = []
@@ -335,11 +338,14 @@ public final class MachineManager: @unchecked Sendable {
             includeDescendants: true
         )
         Self.removeStaleDeletionQuarantines(stateDirectory: configuration.stateDirectory)
+        Self.removeStaleSnapshotArtifacts(stateDirectory: configuration.stateDirectory)
         self.machines = Self.loadPersistedMachines(configuration: configuration)
     }
 
     @discardableResult
     public func create(_ machine: DoryMachineConfiguration) throws -> DoryMachineStatus {
+        operationLock.lock()
+        defer { operationLock.unlock() }
         guard Self.isValidID(machine.id) else {
             throw MachineManagerError.invalidID(machine.id)
         }
@@ -375,6 +381,8 @@ public final class MachineManager: @unchecked Sendable {
 
     @discardableResult
     public func start(id: String) throws -> DoryMachineStatus {
+        operationLock.lock()
+        defer { operationLock.unlock() }
         lock.lock()
         guard var entry = machines[id] else {
             lock.unlock()
@@ -451,6 +459,8 @@ public final class MachineManager: @unchecked Sendable {
     }
 
     public func stop(id: String) throws -> DoryMachineStatus {
+        operationLock.lock()
+        defer { operationLock.unlock() }
         lock.lock()
         guard var entry = machines[id] else {
             lock.unlock()
@@ -472,6 +482,8 @@ public final class MachineManager: @unchecked Sendable {
     }
 
     public func stopAll() {
+        operationLock.lock()
+        defer { operationLock.unlock() }
         lock.lock()
         let runningEntries = machines.map { id, entry in
             (id: id, process: entry.process, handoffServer: entry.handoffServer)
@@ -492,6 +504,8 @@ public final class MachineManager: @unchecked Sendable {
     }
 
     public func delete(id: String) throws {
+        operationLock.lock()
+        defer { operationLock.unlock() }
         // Reject traversal ids before any path is derived: delete() removes the machine's
         // state directory, so a "." / ".." id must never reach machineStateDirectory(id:).
         guard Self.isValidID(id) else {
@@ -555,6 +569,8 @@ public final class MachineManager: @unchecked Sendable {
         environment: [String: String]? = nil,
         updatesEnvironment: Bool = false
     ) throws -> DoryMachineStatus {
+        operationLock.lock()
+        defer { operationLock.unlock() }
         if memoryMB != nil || cpuCount != nil {
             let current = try configurationAndRunningState(id: id).0
             try Self.validateResources(
@@ -622,6 +638,8 @@ public final class MachineManager: @unchecked Sendable {
         createdISO: String = ISO8601DateFormatter().string(from: Date()),
         snapshotID explicitSnapshotID: String? = nil
     ) throws -> DoryMachineSnapshot {
+        operationLock.lock()
+        defer { operationLock.unlock() }
         let snapshotID = explicitSnapshotID ?? Self.generatedSnapshotID()
         guard Self.isValidID(snapshotID) else {
             throw MachineManagerError.invalidID(snapshotID)
@@ -636,9 +654,10 @@ public final class MachineManager: @unchecked Sendable {
         if wasRunning {
             _ = try stop(id: id)
         }
+        let snapshot: DoryMachineSnapshot
         do {
             try Self.cloneOrCopyFile(source: machine.rootfsPath, destination: rootfsPath)
-            let snapshot = DoryMachineSnapshot(
+            snapshot = DoryMachineSnapshot(
                 id: snapshotID,
                 machineID: id,
                 note: note,
@@ -650,24 +669,36 @@ public final class MachineManager: @unchecked Sendable {
                 cpuCount: machine.cpuCount
             )
             try persistSnapshot(snapshot)
-            if wasRunning {
-                _ = try start(id: id)
-            }
-            return snapshot
-        } catch let error as MachineManagerError {
-            if wasRunning {
-                _ = try? start(id: id)
-            }
-            throw error
         } catch {
+            try? FileManager.default.removeItem(atPath: rootfsPath)
             if wasRunning {
                 _ = try? start(id: id)
+            }
+            if let error = error as? MachineManagerError {
+                throw error
             }
             throw MachineManagerError.persistence("could not snapshot \(id): \(error)")
         }
+
+        if wasRunning {
+            do {
+                _ = try start(id: id)
+            } catch let firstError {
+                do {
+                    _ = try start(id: id)
+                } catch {
+                    throw MachineManagerError.persistence(
+                        "snapshot \(snapshotID) was created, but \(id) could not restart: \(firstError); retry: \(error)"
+                    )
+                }
+            }
+        }
+        return snapshot
     }
 
     public func listSnapshots(machineID: String? = nil) throws -> [DoryMachineSnapshot] {
+        operationLock.lock()
+        defer { operationLock.unlock() }
         let ids: [String]
         if let machineID {
             guard Self.isValidID(machineID) else {
@@ -699,6 +730,8 @@ public final class MachineManager: @unchecked Sendable {
     }
 
     public func cloneSnapshot(machineID: String, snapshotID: String, newID: String) throws -> DoryMachineStatus {
+        operationLock.lock()
+        defer { operationLock.unlock() }
         let snapshot = try loadSnapshot(machineID: machineID, snapshotID: snapshotID)
         let machine = DoryMachineConfiguration(
             id: newID,
@@ -712,6 +745,8 @@ public final class MachineManager: @unchecked Sendable {
     }
 
     public func restoreSnapshot(machineID: String, snapshotID: String) throws -> DoryMachineStatus {
+        operationLock.lock()
+        defer { operationLock.unlock() }
         let snapshot = try loadSnapshot(machineID: machineID, snapshotID: snapshotID)
         let (machine, wasRunning) = try configurationAndRunningState(id: machineID)
         if wasRunning {
@@ -737,16 +772,39 @@ public final class MachineManager: @unchecked Sendable {
     }
 
     public func deleteSnapshot(machineID: String, snapshotID: String) throws {
+        operationLock.lock()
+        defer { operationLock.unlock() }
         _ = try loadSnapshot(machineID: machineID, snapshotID: snapshotID)
+        let metadataPath = snapshotMetadataPath(machineID: machineID, snapshotID: snapshotID)
+        let rootfsPath = snapshotRootfsPath(machineID: machineID, snapshotID: snapshotID)
+        let token = "\(Self.snapshotDeletionQuarantinePrefix)\(snapshotID)-\(UUID().uuidString)"
+        let directory = snapshotDirectory(machineID: machineID)
+        let quarantinedMetadataPath = "\(directory)/\(token).json"
+        let quarantinedRootfsPath = "\(directory)/\(token).ext4"
         do {
-            try FileManager.default.removeItem(atPath: snapshotMetadataPath(machineID: machineID, snapshotID: snapshotID))
-            try? FileManager.default.removeItem(atPath: snapshotRootfsPath(machineID: machineID, snapshotID: snapshotID))
+            try FileManager.default.moveItem(atPath: rootfsPath, toPath: quarantinedRootfsPath)
         } catch {
             throw MachineManagerError.persistence("could not delete snapshot \(snapshotID): \(error)")
         }
+        do {
+            try FileManager.default.moveItem(atPath: metadataPath, toPath: quarantinedMetadataPath)
+        } catch {
+            do {
+                try FileManager.default.moveItem(atPath: quarantinedRootfsPath, toPath: rootfsPath)
+            } catch let rollbackError {
+                throw MachineManagerError.persistence(
+                    "could not delete snapshot \(snapshotID): \(error); rootfs rollback failed: \(rollbackError)"
+                )
+            }
+            throw MachineManagerError.persistence("could not delete snapshot \(snapshotID): \(error)")
+        }
+        try? FileManager.default.removeItem(atPath: quarantinedMetadataPath)
+        try? FileManager.default.removeItem(atPath: quarantinedRootfsPath)
     }
 
     public func exportSnapshot(machineID: String, snapshotID: String, toPath path: String) throws {
+        operationLock.lock()
+        defer { operationLock.unlock() }
         let snapshot = try loadSnapshot(machineID: machineID, snapshotID: snapshotID)
         do {
             try MachineSnapshotBundle.write(snapshot: snapshot, toPath: path)
@@ -758,6 +816,9 @@ public final class MachineManager: @unchecked Sendable {
     }
 
     public func importSnapshot(fromPath path: String) throws -> DoryMachineSnapshot {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        var extractedRootfsPath: String?
         do {
             var snapshot = try MachineSnapshotBundle.readMetadata(fromPath: path)
             guard Self.isValidID(snapshot.machineID), Self.isValidID(snapshot.id) else {
@@ -768,13 +829,20 @@ public final class MachineManager: @unchecked Sendable {
                 snapshot.id = Self.generatedSnapshotID(prefix: "import")
             }
             snapshot.rootfsPath = snapshotRootfsPath(machineID: snapshot.machineID, snapshotID: snapshot.id)
+            extractedRootfsPath = snapshot.rootfsPath
             try MachineSnapshotBundle.extractRootfs(fromPath: path, toPath: snapshot.rootfsPath)
             snapshot.sizeBytes = Self.fileSize(path: snapshot.rootfsPath)
             try persistSnapshot(snapshot)
             return snapshot
         } catch let error as MachineManagerError {
+            if let extractedRootfsPath {
+                try? FileManager.default.removeItem(atPath: extractedRootfsPath)
+            }
             throw error
         } catch {
+            if let extractedRootfsPath {
+                try? FileManager.default.removeItem(atPath: extractedRootfsPath)
+            }
             throw MachineManagerError.persistence("could not import machine snapshot: \(error)")
         }
     }
@@ -1062,20 +1130,31 @@ public final class MachineManager: @unchecked Sendable {
     }
 
     private func persistSnapshot(_ snapshot: DoryMachineSnapshot) throws {
+        let fileManager = FileManager.default
+        let directory = snapshotDirectory(machineID: snapshot.machineID)
+        let temporaryPath = "\(directory)/\(Self.snapshotMetadataTemporaryPrefix)\(snapshot.id)-\(UUID().uuidString)"
         do {
-            try FileManager.default.createDirectory(
-                atPath: snapshotDirectory(machineID: snapshot.machineID),
+            try fileManager.createDirectory(
+                atPath: directory,
                 withIntermediateDirectories: true
             )
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(snapshot)
             let path = snapshotMetadataPath(machineID: snapshot.machineID, snapshotID: snapshot.id)
-            try data.write(to: URL(fileURLWithPath: path), options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+            try data.write(to: URL(fileURLWithPath: temporaryPath), options: .atomic)
+            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporaryPath)
+            guard link(temporaryPath, path) == 0 else {
+                throw MachineManagerError.persistence(
+                    "could not publish snapshot metadata: \(String(cString: strerror(errno)))"
+                )
+            }
+            try? fileManager.removeItem(atPath: temporaryPath)
         } catch let error as MachineManagerError {
+            try? fileManager.removeItem(atPath: temporaryPath)
             throw error
         } catch {
+            try? fileManager.removeItem(atPath: temporaryPath)
             throw MachineManagerError.persistence("\(error)")
         }
     }
@@ -1266,6 +1345,23 @@ public final class MachineManager: @unchecked Sendable {
         }
         for entry in entries where entry.hasPrefix(deletionQuarantinePrefix) {
             try? fileManager.removeItem(atPath: "\(stateDirectory)/\(entry)")
+        }
+    }
+
+    private static func removeStaleSnapshotArtifacts(stateDirectory: String) {
+        let fileManager = FileManager.default
+        guard let machineIDs = try? fileManager.contentsOfDirectory(atPath: stateDirectory) else {
+            return
+        }
+        for machineID in machineIDs where isValidID(machineID) {
+            let directory = "\(stateDirectory)/\(machineID)/snapshots"
+            guard let entries = try? fileManager.contentsOfDirectory(atPath: directory) else {
+                continue
+            }
+            for entry in entries where entry.hasPrefix(snapshotDeletionQuarantinePrefix)
+                || entry.hasPrefix(snapshotMetadataTemporaryPrefix) {
+                try? fileManager.removeItem(atPath: "\(directory)/\(entry)")
+            }
         }
     }
 
