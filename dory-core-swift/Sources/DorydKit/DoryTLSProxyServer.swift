@@ -24,6 +24,7 @@ public final class DoryTLSProxyServer: @unchecked Sendable {
     private let lock = NSLock()
     private var routes: [DomainRoute]
     private var listener: NWListener?
+    private var listenerState: TLSListenerState?
     private var activePort: UInt16 = 0
     private let queue = DispatchQueue(label: "dev.dory.doryd.tls-proxy")
 
@@ -87,7 +88,7 @@ public final class DoryTLSProxyServer: @unchecked Sendable {
         }
         let listener = try NWListener(using: parameters, on: nwPort)
         let ready = DispatchSemaphore(value: 0)
-        let startState = TLSListenerStartState(ready: ready)
+        let startState = TLSListenerState(ready: ready)
         listener.stateUpdateHandler = { [weak self, weak listener] state in
             switch state {
             case .ready:
@@ -99,6 +100,8 @@ public final class DoryTLSProxyServer: @unchecked Sendable {
                 startState.signal()
             case let .failed(error):
                 startState.signal(error: error)
+            case .cancelled:
+                startState.signalCancelled()
             default:
                 break
             }
@@ -110,6 +113,7 @@ public final class DoryTLSProxyServer: @unchecked Sendable {
 
         lock.lock()
         self.listener = listener
+        self.listenerState = startState
         self.activePort = requestedPort
         lock.unlock()
 
@@ -126,10 +130,15 @@ public final class DoryTLSProxyServer: @unchecked Sendable {
     public func stop() {
         lock.lock()
         let current = listener
+        let currentState = listenerState
         listener = nil
+        listenerState = nil
         activePort = 0
         lock.unlock()
         current?.cancel()
+        if current != nil {
+            _ = currentState?.waitUntilCancelled()
+        }
     }
 
     private func accept(_ client: NWConnection) {
@@ -288,10 +297,12 @@ public final class DoryTLSProxyServer: @unchecked Sendable {
     }
 }
 
-private final class TLSListenerStartState: @unchecked Sendable {
+private final class TLSListenerState: @unchecked Sendable {
     private let lock = NSLock()
     private let ready: DispatchSemaphore
+    private let cancelled = DispatchSemaphore(value: 0)
     private var didSignal = false
+    private var didCancel = false
     private var storedError: Error?
 
     init(ready: DispatchSemaphore) {
@@ -317,5 +328,25 @@ private final class TLSListenerStartState: @unchecked Sendable {
         if shouldSignal {
             ready.signal()
         }
+    }
+
+    func signalCancelled() {
+        lock.lock()
+        let shouldSignal = !didCancel
+        if shouldSignal {
+            didCancel = true
+        }
+        lock.unlock()
+        if shouldSignal {
+            cancelled.signal()
+        }
+    }
+
+    func waitUntilCancelled() -> Bool {
+        lock.lock()
+        let alreadyCancelled = didCancel
+        lock.unlock()
+        if alreadyCancelled { return true }
+        return cancelled.wait(timeout: .now() + 5) == .success
     }
 }

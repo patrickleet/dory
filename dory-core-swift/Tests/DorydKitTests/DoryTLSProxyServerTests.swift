@@ -3,6 +3,27 @@ import Darwin
 import XCTest
 
 final class DoryTLSProxyServerTests: XCTestCase {
+    func testCanRestartFixedPortWithoutAddressInUse() throws {
+        let base = NSTemporaryDirectory() + "doryd-tls-restart-\(getpid())-\(UUID().uuidString)"
+        let ca = DoryLocalCA(directory: URL(fileURLWithPath: base).appendingPathComponent("ca"))
+        defer { try? FileManager.default.removeItem(atPath: base) }
+
+        let p12 = try ca.issuePKCS12(domain: "dory.local", password: "test-password")
+        let fixedPort = try availableTCPPort()
+        let proxy = try DoryTLSProxyServer(
+            port: fixedPort,
+            p12Path: p12.path,
+            password: "test-password"
+        )
+        defer { proxy.stop() }
+
+        for attempt in 1...20 {
+            XCTAssertNoThrow(try proxy.start(), "restart \(attempt) failed")
+            XCTAssertEqual(proxy.port, fixedPort)
+            proxy.stop()
+        }
+    }
+
     func testTerminatesTLSAndProxiesHostHeaderToMatchingRoute() throws {
         let base = NSTemporaryDirectory() + "doryd-tls-\(getpid())-\(UUID().uuidString)"
         let ca = DoryLocalCA(directory: URL(fileURLWithPath: base).appendingPathComponent("ca"))
@@ -38,6 +59,32 @@ final class DoryTLSProxyServerTests: XCTestCase {
         XCTAssertEqual(response, "hello over tls")
         XCTAssertTrue(backend.lastRequest.contains("Host: web.dory.local"))
     }
+}
+
+private func availableTCPPort() throws -> UInt16 {
+    let fd = socket(AF_INET, SOCK_STREAM, 0)
+    guard fd >= 0 else { throw TLSProxyTestError.syscall("socket", errno) }
+    defer { close(fd) }
+    var address = sockaddr_in()
+    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    address.sin_family = sa_family_t(AF_INET)
+    address.sin_port = UInt16(0).bigEndian
+    inet_pton(AF_INET, "127.0.0.1", &address.sin_addr)
+    let bound = withUnsafePointer(to: &address) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { raw in
+            Darwin.bind(fd, raw, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+    }
+    guard bound == 0 else { throw TLSProxyTestError.syscall("bind", errno) }
+    var actual = sockaddr_in()
+    var actualLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+    let gotName = withUnsafeMutablePointer(to: &actual) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { raw in
+            getsockname(fd, raw, &actualLength)
+        }
+    }
+    guard gotName == 0 else { throw TLSProxyTestError.syscall("getsockname", errno) }
+    return UInt16(bigEndian: actual.sin_port)
 }
 
 private final class TinyTLSHTTPBackend: @unchecked Sendable {
