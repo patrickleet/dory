@@ -91,8 +91,8 @@ full. Host validation also rejects invalid ext4 geometry before changing a file,
 boot path now permits `mkfs.ext4` only for a host-proven unallocated blank; an existing ext4 mount
 failure powers off instead of falling through to reformatting. Current worktree and isolated-runtime
 proof now cover these fixes, including the 16→128 GiB disk gate and disposable two-engine
-migration. A fresh Developer ID-signed 0.3.0/17 arm64 rehearsal from commit
-`dbb359e1b091aca653277ca74b384f5b2bea7d7e` passes the complete build, package, recursive-signature,
+migration. A fresh Developer ID-signed 0.3.0/18 arm64 rehearsal from commit
+`85775703c1eddb77925237fc93c46146ac6bfb8a` passes the complete build, package, recursive-signature,
 payload, mounted-DMG, archive, and SBOM contracts. It is deliberately marked non-public and remains
 unnotarized until the `dory-notary` keychain profile is provisioned.
 
@@ -366,18 +366,19 @@ unnotarized until the `dory-notary` keychain profile is provisioned.
 - All committed guest assets converged and passed deterministic provenance verification: arm64
   headless, arm64 GPU, and amd64. Repeating the arm64 build reproduced the same fingerprint, and
   switching build contexts did not allow one variant to reuse another variant's outputs.
-- The exact arm64 0.3.0/17 archive was rebuilt from those assets at clean commit
-  `dbb359e1b091aca653277ca74b384f5b2bea7d7e`. The app and every nested executable, including
+- The exact arm64 0.3.0/18 archive was rebuilt from those assets at clean commit
+  `85775703c1eddb77925237fc93c46146ac6bfb8a`. The app and every nested executable, including
   `dory-dataplane-proxy` and `docker-buildx`, pass strict recursive Developer ID verification and
   the clean-Mac bundle/payload checks. All eight manifest artifacts independently match their
   recorded lengths and hashes; the ZIPs and runtime archive pass integrity checks; the mounted DMG
   contains the exact signed app; the SBOM matches the shipped tree; and no XCTest runner or bundle
-  appears anywhere. `release-build/Dory-0.3.0-arm64.zip` is 445 MiB with SHA-256
-  `072181f004e37a2d4e4fd422b4664496290aec4126d3f0bf61ba15e9acae9a9d`; the standalone runtime is
-  `2162a1c70182866ac016be5f89c2ef7df8c13d7e687e5d465c1e7cb8117b292f`; the DMG is
-  `90daf3204ec7df520462d4e3484089aa2920bce46295f0fbfc0b06f3c036d719`; the lite ZIP is
-  `ba0df6bd277222aefa8214dd2aa7cfbee350228fff52b33a007dc307cb970e61`; and the app-update ZIP is
-  `a0f3a896fd374bb39e98a23e7804112d101731d704ae2b0706231546ff9dd866`. These are qualification
+  appears anywhere. `release-build/Dory-0.3.0-arm64.zip` is 446 MiB with SHA-256
+  `70910a277f029f6e03f235cf5ca7821575c4e450573fc01b5bceda4441d2bcb2`; the standalone runtime is
+  `7f61afd8aca4cdec45b52136e43bb4ce57493e83aa7abce576dfc8a2fb1533a6`; the DMG is
+  `e24674fbcea9d0fc975134511dc117833178e12c8730ec4876d3a653670c2d67`; the lite ZIP is
+  `77a8e8d7e3d73720666664b03d2288b49c93395a881d7c6b3d2643088d7926a1`; the app-update ZIP is
+  `16414e4c4d7ec3d2f6867c908710b4db5c4d23aa8cf5de5bcbc40304560c2da8`; and the exact-tree SBOM is
+  `dde985828413fe724acdc03466a28fb94fb77eaed2be3b1f8ac1c8a0620e98e6`. These are qualification
   artifacts, not distributable artifacts: the manifest is deliberately non-public and the app is
   not notarized or stapled.
 - A live migration reproduction now covers the user-visible failure where images imported but
@@ -505,7 +506,7 @@ unnotarized until the `dory-notary` keychain profile is provisioned.
 
 - [x] Finish and converge the deterministic amd64 guest asset, then verify all committed arm64,
   arm64-GPU, and amd64 fingerprints and compressed artifacts.
-- [ ] Notarize and staple the exact signed 0.3.0/17 arm64 candidate, then validate the final ZIP and
+- [ ] Notarize and staple the exact signed 0.3.0/18 arm64 candidate, then validate the final ZIP and
   appcast artifacts. The fresh signed candidate exists and passes recursive signature, payload,
   archive, mounted-DMG, manifest-hash, and SBOM checks. This Mac still has no `dory-notary`
   keychain profile; `notarytool history` exits 69 with `No Keychain password item found`, and
@@ -729,10 +730,11 @@ unnotarized until the `dory-notary` keychain profile is provisioned.
   container #1707/#1895 and containerization #790 specifically involve ECR retry semantics and
   cannot be closed by the local registry. The release remains NO-GO until resumed push, repull/run,
   credential cleanup, and repository cleanup are retained without exposing secrets.
-- [x] Rebuild the signed candidate with the state-lock, virtiofs ownership, standalone dataplane,
-  explicit legacy-state isolation, prune/bind-coherence gates, binfmt probe, and IPv6-localhost
-  changes plus bundled Buildx; rerun the exact-runtime migration, network, bind, prune, state-lock,
-  ownership, private-registry, app-update-payload, and five-cycle cold-start gates.
+- [x] Rebuild the signed candidate with transactional migration/backup, daemon-owned recovery and
+  Auto-Idle, state locking, virtiofs ownership, standalone dataplane, explicit legacy-state
+  isolation, prune/bind-coherence gates, binfmt probe, IPv6 localhost, and bundled Buildx. The
+  complete package/signature/inventory rehearsal is current; exact-runtime and physical campaigns
+  remain separately tracked above because they must bind the notarized artifact.
 
 ## Market-claim guardrails
 
