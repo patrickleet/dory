@@ -155,6 +155,7 @@ final class AppStore {
     @ObservationIgnored private let dorydEngineExplicitlyRequested: Bool
     @ObservationIgnored private let managesDorydLaunchAgent: Bool
     @ObservationIgnored private let dorydLaunchAgentEnsurer: @Sendable (DorydLaunchAgent.Configuration) async -> Bool
+    @ObservationIgnored private let authorizedNetworkingRemover: @Sendable () async throws -> Void
     @ObservationIgnored private let environment: [String: String]
     @ObservationIgnored private let machineEnvResolver: @Sendable ([String]) async -> [String: String]
     @ObservationIgnored private let composeCommandRunner: any ToolCommandRunning
@@ -170,6 +171,7 @@ final class AppStore {
         dorydClient: DorydClient = DorydClient(),
         useDorydEngine: Bool? = nil,
         dorydLaunchAgentEnsurer: (@Sendable (DorydLaunchAgent.Configuration) async -> Bool)? = nil,
+        authorizedNetworkingRemover: (@Sendable () async throws -> Void)? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         composeCommandRunner: any ToolCommandRunning = BoundedToolProcessRunner(),
         buildCommandRunner: any ToolCommandRunning = BoundedToolProcessRunner(),
@@ -190,6 +192,9 @@ final class AppStore {
         self.managesDorydLaunchAgent = dorydClient.usesMachService || dorydLaunchAgentEnsurer != nil
         self.dorydLaunchAgentEnsurer = dorydLaunchAgentEnsurer ?? { configuration in
             await DorydLaunchAgent.ensureCurrent(configuration: configuration)
+        }
+        self.authorizedNetworkingRemover = authorizedNetworkingRemover ?? {
+            try await Self.removeAuthorizedNetworkingIfPresent()
         }
         let networkHelperMaintenance = DoryAppDelegate.isNetworkHelperMaintenance()
         let realLaunch = !networkHelperMaintenance
@@ -1411,8 +1416,8 @@ final class AppStore {
     static let httpProxyPortKey = "dory.httpProxyPort"
     static let httpsProxyPortKey = "dory.httpsProxyPort"
     static let domainsEnabledKey = "dory.domainsEnabled"
-    static let defaultDomainSuffix = "dory.local"
-    static let domainSuffixKey = "dory.domainSuffix"
+    nonisolated static let defaultDomainSuffix = "dory.local"
+    nonisolated static let domainSuffixKey = "dory.domainSuffix"
     // User-configurable: 8080 collides with common dev servers, and MDM-managed DNS can't be pointed
     // at Dory, so the whole *.dory.local feature is turn-off-able (GitHub #2).
     var dnsPort: UInt16 = AppStore.defaultDNSPort
@@ -1450,8 +1455,13 @@ final class AppStore {
         domainsEnabled: Bool? = nil,
         domainSuffix: String? = nil
     ) {
+        guard domainsEnabled == nil || !networkingAuthorizationInFlight else {
+            showSettingsFailure("Wait for the current networking change to finish.")
+            return
+        }
         var launchAgentNeedsRefresh = false
         var suffixChanged = false
+        var domainsChanged = false
         if let domainSuffix {
             guard let normalized = Self.normalizedDomainSuffix(domainSuffix) else {
                 networkingAuthorizationMessage = "Use a DNS-style suffix such as dev.dory.local."
@@ -1468,7 +1478,12 @@ final class AppStore {
         if let dnsPort { self.dnsPort = dnsPort; UserDefaults.standard.set(Int(dnsPort), forKey: Self.dnsPortKey) }
         if let httpProxyPort { self.httpProxyPort = httpProxyPort; UserDefaults.standard.set(Int(httpProxyPort), forKey: Self.httpProxyPortKey) }
         if let httpsProxyPort { self.httpsProxyPort = httpsProxyPort; UserDefaults.standard.set(Int(httpsProxyPort), forKey: Self.httpsProxyPortKey) }
-        if let domainsEnabled { self.domainsEnabled = domainsEnabled; UserDefaults.standard.set(domainsEnabled, forKey: Self.domainsEnabledKey) }
+        if let domainsEnabled, domainsEnabled != self.domainsEnabled {
+            self.domainsEnabled = domainsEnabled
+            UserDefaults.standard.set(domainsEnabled, forKey: Self.domainsEnabledKey)
+            domainsChanged = true
+            launchAgentNeedsRefresh = true
+        }
         stopLocalNetworking()
         if suffixChanged {
             domainTable.replaceContainers([:])
@@ -1476,22 +1491,67 @@ final class AppStore {
             dns = DoryDNS(suffix: self.domainSuffix)
         }
         startPortForwarding()
-        if dnsPort != nil || httpProxyPort != nil || httpsProxyPort != nil || launchAgentNeedsRefresh {
-            refreshDorydLaunchAgentForNetworkingSettings()
+        let refreshRequired = dnsPort != nil || httpProxyPort != nil || httpsProxyPort != nil
+            || launchAgentNeedsRefresh
+        if domainsChanged, !self.domainsEnabled, managesDorydLaunchAgent {
+            disableDaemonOwnedDomains()
+            return
+        }
+        if refreshRequired {
+            Task { [weak self] in
+                guard let self else { return }
+                if await refreshDorydLaunchAgentForNetworkingSettings() {
+                    showSettingsSuccess("Networking settings applied.")
+                } else {
+                    showSettingsFailure("doryd could not apply the selected networking settings.")
+                }
+            }
+            return
         }
         showSettingsSuccess("Networking settings applied.")
     }
 
-    private func refreshDorydLaunchAgentForNetworkingSettings() {
-        guard dorydClient.usesMachService else { return }
-        let configuration = dorydLaunchAgentConfiguration()
-        Task {
-            _ = await DorydLaunchAgent.ensureCurrent(configuration: configuration)
+    private func disableDaemonOwnedDomains() {
+        guard !networkingAuthorizationInFlight else { return }
+        networkingAuthorizationInFlight = true
+        networkingAuthorizationMessage = "Removing Dory's system domain routing…"
+        Task { [weak self] in
+            guard let self else { return }
+            var authorizationRemoved = false
+            do {
+                try await authorizedNetworkingRemover()
+                authorizationRemoved = true
+                guard await refreshDorydLaunchAgentForNetworkingSettings() else {
+                    throw NetworkingAuthorizationUIError.cleanupFailed(
+                        "doryd could not restart with local domains disabled."
+                    )
+                }
+                networkingAuthorizationMessage = "Local domains and their system routing are disabled."
+                showSettingsSuccess("Local domains disabled.")
+            } catch {
+                domainsEnabled = true
+                UserDefaults.standard.set(true, forKey: Self.domainsEnabledKey)
+                _ = await refreshDorydLaunchAgentForNetworkingSettings()
+                let detail = error.localizedDescription
+                if authorizationRemoved {
+                    networkingAuthorizationMessage = "System routing was removed safely, but doryd could not keep local domains disabled. Reauthorize before using local domains again."
+                } else {
+                    networkingAuthorizationMessage = "Local domains stayed enabled because their system routing could not be removed: \(detail)"
+                }
+                showSettingsFailure("Local domains were not disabled: \(detail)")
+            }
+            networkingAuthorizationInFlight = false
         }
+    }
+
+    private func refreshDorydLaunchAgentForNetworkingSettings() async -> Bool {
+        guard managesDorydLaunchAgent else { return true }
+        return await dorydLaunchAgentEnsurer(dorydLaunchAgentConfiguration())
     }
 
     private func dorydLaunchAgentConfiguration() -> DorydLaunchAgent.Configuration {
         DorydLaunchAgent.Configuration(
+            domainsEnabled: domainsEnabled,
             domainSuffix: domainSuffix,
             dnsPort: dnsPort,
             httpProxyPort: httpProxyPort,
@@ -1822,10 +1882,44 @@ final class AppStore {
     }
 
     nonisolated private static func removeOwnedNetworkingWithBundledHelper() async throws {
+        try await runBundledNetworkingRemoval(
+            argument: "--remove-owned-networking",
+            stateStillExists: privilegedNetworkingStateExists
+        )
+    }
+
+    nonisolated private static func removeAuthorizedNetworkingIfPresent() async throws {
+        let service = SMAppService.daemon(plistName: "dev.dory.network-helper.plist")
+        switch service.status {
+        case .enabled:
+            try await runBundledNetworkingRemoval(
+                argument: "--remove-authorized-networking",
+                stateStillExists: authorizedNetworkingStateExists
+            )
+        case .requiresApproval:
+            guard !authorizedNetworkingStateExists() else {
+                SMAppService.openSystemSettingsLoginItems()
+                throw NetworkingAuthorizationUIError.daemonApprovalRequired
+            }
+        case .notRegistered, .notFound:
+            guard !authorizedNetworkingStateExists() else {
+                throw NetworkingAuthorizationUIError.cleanupFailed(
+                    "Dory's domain networking is authorized but its privileged service is unavailable."
+                )
+            }
+        @unknown default:
+            throw NetworkingAuthorizationUIError.daemonUnavailable
+        }
+    }
+
+    nonisolated private static func runBundledNetworkingRemoval(
+        argument: String,
+        stateStillExists: @Sendable () -> Bool
+    ) async throws {
         guard let helper = bundledHelper("dory-network-helper") else {
             throw NetworkingAuthorizationUIError.helperMissing
         }
-        let result = await Shell.runAsyncResult(helper, ["--remove-owned-networking"])
+        let result = await Shell.runAsyncResult(helper, [argument])
         let output = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
         guard result.exit == 0,
               output == "network-authorization=removed"
@@ -1834,7 +1928,7 @@ final class AppStore {
                 output.isEmpty ? "The privileged helper returned exit \(result.exit)." : output
             )
         }
-        guard !privilegedNetworkingStateExists() else {
+        guard !stateStillExists() else {
             throw NetworkingAuthorizationUIError.cleanupFailed(
                 "The privileged helper returned success but Dory networking files still exist."
             )
@@ -1842,6 +1936,14 @@ final class AppStore {
     }
 
     nonisolated private static func privilegedNetworkingStateExists() -> Bool {
+        authorizedNetworkingStateExists() || [
+            "/etc/pf.anchors/dev.dory.lan",
+            "/var/run/dev.dory/pf-enable-token",
+            "/var/run/dev.dory/ipv4-forwarding-owner",
+        ].contains { FileManager.default.fileExists(atPath: $0) }
+    }
+
+    nonisolated private static func authorizedNetworkingStateExists() -> Bool {
         let configuredSuffix = normalizedDomainSuffix(
             UserDefaults.standard.string(forKey: domainSuffixKey)
         ) ?? defaultDomainSuffix
@@ -1849,11 +1951,8 @@ final class AppStore {
             "/private/var/db/dev.dory/network-authorization.json",
             "/private/var/db/dev.dory/local-ca.crt",
             "/etc/pf.anchors/dev.dory",
-            "/etc/pf.anchors/dev.dory.lan",
             "/etc/resolver/\(configuredSuffix)",
             "/var/run/dev.dory/system-pf-enable-token",
-            "/var/run/dev.dory/pf-enable-token",
-            "/var/run/dev.dory/ipv4-forwarding-owner",
         ].contains { FileManager.default.fileExists(atPath: $0) }
     }
 

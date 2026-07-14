@@ -18,6 +18,7 @@ enum DorydLaunchAgent {
     }
 
     struct Configuration: Sendable, Equatable {
+        var domainsEnabled: Bool
         var domainSuffix: String
         var idleSleepAfterSeconds: UInt32
         var dnsPort: UInt16
@@ -36,6 +37,7 @@ enum DorydLaunchAgent {
         var sshAuthSock: String?
 
         nonisolated init(
+            domainsEnabled: Bool = true,
             domainSuffix: String = "dory.local",
             idleSleepAfterSeconds: UInt32 = 300,
             dnsPort: UInt16 = 15353,
@@ -48,6 +50,7 @@ enum DorydLaunchAgent {
             memoryMB: UInt32? = nil,
             sshAuthSock: String? = nil
         ) {
+            self.domainsEnabled = domainsEnabled
             self.domainSuffix = domainSuffix
             self.idleSleepAfterSeconds = idleSleepAfterSeconds
             self.dnsPort = dnsPort
@@ -419,7 +422,7 @@ enum DorydLaunchAgent {
                 <key>DORYD_HV_RESTART_DELAY</key>
                 <string>0.5</string>
                 <key>DORYD_NETWORKING</key>
-                <string>1</string>
+                <string>\(configuration.domainsEnabled ? "1" : "0")</string>
                 <key>DORYD_DOMAIN_SUFFIX</key>
                 <string>\(xmlEscaped(configuration.domainSuffix))</string>
                 <key>DORYD_IDLE_SLEEP_AFTER_SECONDS</key>

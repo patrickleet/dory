@@ -414,6 +414,22 @@ struct DorydLaunchAgentTests {
         #expect(plist.contains("<string>0</string>"))
     }
 
+    @Test func launchAgentCanDisableDaemonOwnedDomains() throws {
+        let plist = DorydLaunchAgent.launchAgentPlist(
+            program: "/Applications/Dory.app/Contents/Helpers/doryd",
+            helpersDirectory: URL(fileURLWithPath: "/Applications/Dory.app/Contents/Helpers"),
+            configuration: DorydLaunchAgent.Configuration(domainsEnabled: false)
+        )
+        let data = try #require(plist.data(using: .utf8))
+        let root = try #require(
+            try PropertyListSerialization.propertyList(from: data, options: [], format: nil)
+                as? [String: Any]
+        )
+        let environment = try #require(root["EnvironmentVariables"] as? [String: String])
+
+        #expect(environment["DORYD_NETWORKING"] == "0")
+    }
+
     @Test func launchAgentOwnsEngineResourcePolicy() {
         let plist = DorydLaunchAgent.launchAgentPlist(
             program: "/Applications/Dory.app/Contents/Helpers/doryd",

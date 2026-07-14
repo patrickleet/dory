@@ -184,7 +184,9 @@ public struct DorydEnvironment: Sendable {
     }
 
     public func networkingConfiguration() -> NetworkingConfiguration? {
-        guard bool("DORYD_NETWORKING", default: false) || string("DORYD_DNS_PORT") != nil else {
+        if string("DORYD_NETWORKING") != nil {
+            guard bool("DORYD_NETWORKING", default: false) else { return nil }
+        } else if string("DORYD_DNS_PORT") == nil {
             return nil
         }
         return NetworkingConfiguration(

@@ -1290,6 +1290,7 @@ struct SettingsView: View {
                     isOn: Binding(get: { store.domainsEnabled }, set: { store.applyNetworkingSettings(domainsEnabled: $0) }),
                     divider: true
                 )
+                .disabled(store.networkingAuthorizationInFlight)
                 domainSuffixField
             }
             .background(p.bgElevated, in: RoundedRectangle(cornerRadius: 11))

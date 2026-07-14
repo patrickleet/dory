@@ -14,6 +14,10 @@ import Foundation
     func removeOwnedNetworking(
         withReply reply: @escaping (Bool, NSString?) -> Void
     )
+
+    func removeAuthorizedNetworking(
+        withReply reply: @escaping (Bool, NSString?) -> Void
+    )
 }
 
 public enum DoryPrivilegedNetworkXPC {

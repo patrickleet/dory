@@ -52,6 +52,25 @@ public final class AuthorizedNetworkingClient: AuthorizedNetworkingApplying, @un
     /// Removes the caller's exact root-owned authorization and any live source-preserving LAN
     /// session. The root service verifies the signing identity and effective UID.
     public func removeOwnedNetworking() throws -> Bool {
+        try performRemoval { proxy, reply in
+            proxy.removeOwnedNetworking(withReply: reply)
+        }
+    }
+
+    /// Removes only the caller's persisted resolver, trusted CA, and system PF authorization.
+    /// Source-preserving LAN remains available while Dory is installed.
+    public func removeAuthorizedNetworking() throws -> Bool {
+        try performRemoval { proxy, reply in
+            proxy.removeAuthorizedNetworking(withReply: reply)
+        }
+    }
+
+    private func performRemoval(
+        _ invoke: (
+            DoryPrivilegedNetworkControl,
+            @escaping (Bool, NSString?) -> Void
+        ) -> Void
+    ) throws -> Bool {
         let connection = connectionFactory()
         connection.remoteObjectInterface = NSXPCInterface(with: DoryPrivilegedNetworkControl.self)
         connection.setCodeSigningRequirement(DoryPrivilegedNetworkXPC.productionHelperRequirement)
@@ -64,7 +83,7 @@ public final class AuthorizedNetworkingClient: AuthorizedNetworkingApplying, @un
         }) as? DoryPrivilegedNetworkControl else {
             throw SourcePreservingLANClientError.invalidResponse
         }
-        proxy.removeOwnedNetworking { removed, error in
+        invoke(proxy) { removed, error in
             completion.finish(reconciled: removed, error: error as String?)
         }
         guard completion.wait(timeout: timeout) else {

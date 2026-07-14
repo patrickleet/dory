@@ -2,6 +2,7 @@ import Foundation
 import Testing
 @testable import Dory
 
+@Suite(.serialized)
 struct DorydClientTests {
     @MainActor
     @Test func dorydEngineIsPreferredByDefaultOutsideAutomationAndCanBeDisabled() {
@@ -1077,6 +1078,80 @@ struct DorydClientTests {
     }
 
     @MainActor
+    @Test func disablingDomainsRemovesAuthorizationBeforeStoppingDaemonListeners() async throws {
+        let key = AppStore.domainsEnabledKey
+        let previous = UserDefaults.standard.object(forKey: key)
+        defer {
+            if let previous { UserDefaults.standard.set(previous, forKey: key) }
+            else { UserDefaults.standard.removeObject(forKey: key) }
+        }
+        let removal = AuthorizedNetworkingRemovalRecorder()
+        let launchAgent = LaunchAgentConfigurationRecorder()
+        let store = AppStore(
+            dorydLaunchAgentEnsurer: { configuration in launchAgent.ensure(configuration) },
+            authorizedNetworkingRemover: { try removal.remove() }
+        )
+
+        store.applyNetworkingSettings(domainsEnabled: false)
+        try await waitUntil { !store.networkingAuthorizationInFlight }
+
+        #expect(removal.callCount == 1)
+        #expect(launchAgent.configurations.map(\.domainsEnabled) == [false])
+        #expect(!store.domainsEnabled)
+        #expect(UserDefaults.standard.object(forKey: key) as? Bool == false)
+        #expect(store.networkingAuthorizationMessage == "Local domains and their system routing are disabled.")
+    }
+
+    @MainActor
+    @Test func failedDomainAuthorizationRemovalKeepsDaemonNetworkingEnabled() async throws {
+        let key = AppStore.domainsEnabledKey
+        let previous = UserDefaults.standard.object(forKey: key)
+        defer {
+            if let previous { UserDefaults.standard.set(previous, forKey: key) }
+            else { UserDefaults.standard.removeObject(forKey: key) }
+        }
+        let removal = AuthorizedNetworkingRemovalRecorder(fails: true)
+        let launchAgent = LaunchAgentConfigurationRecorder()
+        let store = AppStore(
+            dorydLaunchAgentEnsurer: { configuration in launchAgent.ensure(configuration) },
+            authorizedNetworkingRemover: { try removal.remove() }
+        )
+
+        store.applyNetworkingSettings(domainsEnabled: false)
+        try await waitUntil { !store.networkingAuthorizationInFlight }
+
+        #expect(removal.callCount == 1)
+        #expect(launchAgent.configurations.map(\.domainsEnabled) == [true])
+        #expect(store.domainsEnabled)
+        #expect(UserDefaults.standard.object(forKey: key) as? Bool == true)
+        #expect(store.networkingAuthorizationMessage?.contains("stayed enabled") == true)
+    }
+
+    @MainActor
+    @Test func rejectedDomainDisableRestoresEnabledDaemonConfiguration() async throws {
+        let key = AppStore.domainsEnabledKey
+        let previous = UserDefaults.standard.object(forKey: key)
+        defer {
+            if let previous { UserDefaults.standard.set(previous, forKey: key) }
+            else { UserDefaults.standard.removeObject(forKey: key) }
+        }
+        let removal = AuthorizedNetworkingRemovalRecorder()
+        let launchAgent = LaunchAgentConfigurationRecorder(rejectDisabledDomains: true)
+        let store = AppStore(
+            dorydLaunchAgentEnsurer: { configuration in launchAgent.ensure(configuration) },
+            authorizedNetworkingRemover: { try removal.remove() }
+        )
+
+        store.applyNetworkingSettings(domainsEnabled: false)
+        try await waitUntil { !store.networkingAuthorizationInFlight }
+
+        #expect(removal.callCount == 1)
+        #expect(launchAgent.configurations.map(\.domainsEnabled) == [false, true])
+        #expect(store.domainsEnabled)
+        #expect(store.networkingAuthorizationMessage?.contains("Reauthorize") == true)
+    }
+
+    @MainActor
     @Test func idleSettingsShowInAppNoticeOnSuccess() async throws {
         let listener = NSXPCListener.anonymous()
         let service = FakeDorydService()
@@ -1192,10 +1267,12 @@ private struct RecordingWorkloadRuntime: ContainerRuntime {
 private final class LaunchAgentConfigurationRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private let rejectAMD64: Bool
+    private let rejectDisabledDomains: Bool
     private var recorded: [DorydLaunchAgent.Configuration] = []
 
-    init(rejectAMD64: Bool = false) {
+    init(rejectAMD64: Bool = false, rejectDisabledDomains: Bool = false) {
         self.rejectAMD64 = rejectAMD64
+        self.rejectDisabledDomains = rejectDisabledDomains
     }
 
     var configurations: [DorydLaunchAgent.Configuration] {
@@ -1209,7 +1286,35 @@ private final class LaunchAgentConfigurationRecorder: @unchecked Sendable {
         recorded.append(configuration)
         lock.unlock()
         return !(rejectAMD64 && configuration.amd64EmulationEnabled)
+            && !(rejectDisabledDomains && !configuration.domainsEnabled)
     }
+}
+
+private final class AuthorizedNetworkingRemovalRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private let fails: Bool
+    private var calls = 0
+
+    init(fails: Bool = false) {
+        self.fails = fails
+    }
+
+    var callCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return calls
+    }
+
+    func remove() throws {
+        lock.lock()
+        calls += 1
+        lock.unlock()
+        if fails { throw AuthorizedNetworkingRemovalError.injectedFailure }
+    }
+}
+
+private enum AuthorizedNetworkingRemovalError: Error {
+    case injectedFailure
 }
 
 private final class FakeDorydService: NSObject, DorydControlXPC {

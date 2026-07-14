@@ -745,6 +745,11 @@ final class DorydConfigurationTests: XCTestCase {
 
     func testNetworkingConfigurationIsOptInAndHighPortOnly() throws {
         XCTAssertNil(DorydEnvironment(values: [:], home: "/tmp/doryd-home", cwd: "/tmp").networkingConfiguration())
+        XCTAssertNil(DorydEnvironment(values: [
+            "DORYD_NETWORKING": "0",
+            "DORYD_DNS_PORT": "15353",
+            "DORYD_HTTP_PROXY_PORT": "18080",
+        ], home: "/tmp/doryd-home", cwd: "/tmp").networkingConfiguration())
 
         let env = DorydEnvironment(values: [
             "DORYD_NETWORKING": "1",

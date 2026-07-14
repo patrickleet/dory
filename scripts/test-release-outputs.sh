@@ -38,6 +38,15 @@ grep -Fq -- '--remove-owned-networking' Dory/Models/AppStore.swift \
   || { echo "test-release-outputs: app unregisters its privileged helper before owned networking cleanup" >&2; exit 1; }
 grep -Fq -- '--remove-owned-networking' dory-core-swift/Sources/dory-network-helper/main.swift \
   || { echo "test-release-outputs: bundled helper cannot request signed uninstall cleanup" >&2; exit 1; }
+grep -Fq -- '--remove-authorized-networking' Dory/Models/AppStore.swift \
+  || { echo "test-release-outputs: disabling local domains does not request signed authorization cleanup" >&2; exit 1; }
+grep -Fq -- '--remove-authorized-networking' dory-core-swift/Sources/dory-network-helper/main.swift \
+  || { echo "test-release-outputs: bundled helper cannot remove local-domain authorization independently" >&2; exit 1; }
+grep -Fq 'configuration.domainsEnabled ? "1" : "0"' Dory/Runtime/Doryd/DorydLaunchAgent.swift \
+  || { echo "test-release-outputs: launch agent forces local-domain networking on" >&2; exit 1; }
+grep -Fq 'guard bool("DORYD_NETWORKING", default: false) else { return nil }' \
+  dory-core-swift/Sources/DorydKit/DorydConfiguration.swift \
+  || { echo "test-release-outputs: doryd ignores an explicit local-domain disable" >&2; exit 1; }
 grep -Fq 'removeAuthorizedNetworking(clientUID: clientUID)' \
   dory-core-swift/Sources/DorydKit/SourcePreservingLANPrivilegedDaemon.swift \
   || { echo "test-release-outputs: privileged uninstall does not remove caller-owned system networking" >&2; exit 1; }

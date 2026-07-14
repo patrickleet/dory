@@ -23,6 +23,20 @@ if Array(CommandLine.arguments.dropFirst()) == ["--remove-owned-networking"] {
     }
 }
 
+if Array(CommandLine.arguments.dropFirst()) == ["--remove-authorized-networking"] {
+    do {
+        let removed = try AuthorizedNetworkingClient().removeAuthorizedNetworking()
+        let state = removed ? "removed" : "absent"
+        FileHandle.standardOutput.write(Data("network-authorization=\(state)\n".utf8))
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(
+            Data("dory-network-helper: networking authorization removal failed: \(error)\n".utf8)
+        )
+        exit(1)
+    }
+}
+
 struct HelperOptions {
     var planPath: String?
     var dryRun = false
@@ -35,6 +49,7 @@ func usage() -> String {
     """
     usage: dory-network-helper --plan-json <path|-> [--dry-run] [--remove] [--owner-uid <uid>] [--file-system-root <path>]
            dory-network-helper --remove-owned-networking
+           dory-network-helper --remove-authorized-networking
     """
 }
 
