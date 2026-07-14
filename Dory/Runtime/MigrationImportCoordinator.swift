@@ -26,6 +26,12 @@ struct MigrationImportExecutionEnvironment: Sendable {
     let hostArchitecture: String
 }
 
+private struct MigrationImportPreparation {
+    let prepared: PreparedMigrationExecution
+    let helper: MigrationTransferHelperAsset
+    let journalStore: DoryOperationJournalStore
+}
+
 /// The sole production entry point for competitor imports. Success is returned only after the
 /// immutable plan, transaction journal, object readbacks, and completion ledger all agree.
 enum MigrationImportCoordinator {
@@ -35,32 +41,36 @@ enum MigrationImportCoordinator {
         sharedHome: String = NSHomeDirectory(),
         progress: (@Sendable (String) -> Void)? = nil
     ) async throws -> MigrationSummary {
-        try Task.checkCancellation()
         progress?("Validating the exact source and Dory inventories…")
-        let helper = try MigrationTransferHelperAsset.bundled()
-        let availableHostBytes = try hostAvailableBytes(at: sharedHome)
-        let prepared = try await MigrationStrictInventoryCollector.collect(
+        let preparation = try await prepare(
             from: source,
             to: target,
-            availableHostBytes: availableHostBytes,
-            sharedHome: sharedHome,
-            transferHelper: MigrationTransferHelperContract(metadata: helper.metadata)
+            sharedHome: sharedHome
         )
-        let store = try DoryOperationJournalStore(home: sharedHome)
         return try await execute(
-            prepared: prepared,
+            prepared: preparation.prepared,
             environment: MigrationImportExecutionEnvironment(
                 source: source,
                 target: target,
-                journalStore: store,
+                journalStore: preparation.journalStore,
                 currentAvailableHostBytes: try hostAvailableBytes(at: sharedHome),
-                transferHelper: MigrationTransferHelperContract(metadata: helper.metadata),
-                transfers: MigrationImportLiveAssetTransfers(helperAsset: helper),
+                transferHelper: MigrationTransferHelperContract(
+                    metadata: preparation.helper.metadata
+                ),
+                transfers: MigrationImportLiveAssetTransfers(helperAsset: preparation.helper),
                 sharedHome: sharedHome,
                 hostArchitecture: productionHostArchitecture
             ),
             progress: progress
         )
+    }
+
+    static func preflight(
+        from source: any ContainerRuntime,
+        to target: any ContainerRuntime,
+        sharedHome: String = NSHomeDirectory()
+    ) async throws -> PreparedMigrationExecution {
+        try await prepare(from: source, to: target, sharedHome: sharedHome).prepared
     }
 
     static func execute(
@@ -136,6 +146,30 @@ enum MigrationImportCoordinator {
             throw MigrationImportCoordinatorError.hostStorageUnavailable
         }
         return bytes
+    }
+
+    private static func prepare(
+        from source: any ContainerRuntime,
+        to target: any ContainerRuntime,
+        sharedHome: String
+    ) async throws -> MigrationImportPreparation {
+        try Task.checkCancellation()
+        let journalStore = try DoryOperationJournalStore(home: sharedHome)
+        try MigrationImportTransaction.requireNoUnfinishedOperation(in: journalStore)
+        let helper = try MigrationTransferHelperAsset.bundled()
+        let prepared = try await MigrationStrictInventoryCollector.collect(
+            from: source,
+            to: target,
+            availableHostBytes: try hostAvailableBytes(at: sharedHome),
+            sharedHome: sharedHome,
+            transferHelper: MigrationTransferHelperContract(metadata: helper.metadata),
+            hostArchitecture: productionHostArchitecture
+        )
+        return MigrationImportPreparation(
+            prepared: prepared,
+            helper: helper,
+            journalStore: journalStore
+        )
     }
 
     private nonisolated static var productionHostArchitecture: String {

@@ -1,4 +1,5 @@
 import CryptoKit
+import DoryOperations
 import Foundation
 
 struct MigrationSummary: Sendable, Equatable {
@@ -55,6 +56,8 @@ struct MigrationInventory: Sendable, Equatable {
     var replaceableEmptyTargetVolumes: [String] = []
     var containersWithPublishedPorts: Int = 0
     var runningContainersWithPublishedPorts: Int = 0
+    var strictValidationPerformed = false
+    var strictValidationBlocker: String?
 
     var confidenceLabel: String {
         if isImportBlocked { return "Blocked" }
@@ -118,7 +121,9 @@ struct MigrationInventory: Sendable, Equatable {
     var isPortabilityBlocked: Bool { !portabilityBlockers.isEmpty }
     var isTargetCollisionBlocked: Bool { !targetCollisionBlockers.isEmpty }
     var isImportBlocked: Bool {
-        isHostDiskUnknown || isHostDiskInsufficient || isEngineDiskInsufficient || isVolumeSizeUnknown
+        if strictValidationPerformed { return strictValidationBlocker != nil }
+        return isHostDiskUnknown || isHostDiskInsufficient
+            || isEngineDiskInsufficient || isVolumeSizeUnknown
             || isContainerWritableSizeUnknown || isLiveWritableLayerSnapshotUnsafe
             || isVolumeHelperUnavailable || isTargetUsageUnknown || isLiveVolumeCopyUnsafe
             || isPortabilityBlocked || isTargetCollisionBlocked
@@ -152,6 +157,9 @@ struct MigrationInventory: Sendable, Equatable {
     }
 
     var attentionItems: [String] {
+        if let strictValidationBlocker {
+            return ["Exact import validation blocked before writes: \(strictValidationBlocker)"]
+        }
         var items: [String] = []
         if namedVolumeMounts > 0 || anonymousVolumeTargets > 0 || volumes > 0 {
             items.append("Named Docker volume data is copied through temporary helper containers; source volumes are mounted read-only.")
@@ -242,6 +250,45 @@ struct MigrationInventory: Sendable, Equatable {
             items.append("No obvious blockers found. The source engine stays read-only until you start the import.")
         }
         return items
+    }
+
+    mutating func acceptStrictValidation(_ prepared: PreparedMigrationExecution) {
+        strictValidationPerformed = true
+        strictValidationBlocker = nil
+        sourceName = prepared.sourceAuthority.product
+        let objects = prepared.operation.completenessPlan.objects
+        images = objects.count { $0.source.kind == .image }
+        containers = objects.count { $0.source.kind == .container }
+        volumes = objects.count { $0.source.kind == .volume }
+        volumeNames = objects.filter { $0.source.kind == .volume }
+            .map(\.normalizedTargetName)
+            .sorted()
+        networks = objects.count { $0.source.kind == .network }
+        estimatedImageBytes = prepared.source.snapshot.images.reduce(0) { $0 + $1.sizeBytes }
+        imagesAlreadyOnDory = objects.count {
+            $0.source.kind == .image && $0.collisionDecision == .reuseVerified
+        }
+        estimatedVolumeBytes = prepared.sourceVolumeBytes.values.reduce(0, +)
+        estimatedContainerWritableBytes = prepared.source.writableLayerSizes.values.reduce(0, +)
+        availableHostBytes = prepared.capacity.availableHostBytes
+        estimatedTargetDockerBytes = prepared.capacity.targetDockerBytes
+        hostDiskPreflightAvailable = true
+        volumeSizePreflightAvailable = true
+        unknownVolumeSizes = 0
+        containerWritableSizePreflightAvailable = true
+        unknownContainerWritableSizes = 0
+        targetUsagePreflightAvailable = true
+        volumeHelperImageAvailable = true
+        runningVolumeBackedContainers = []
+        runningWritableLayerContainers = []
+        portabilityBlockers = []
+        targetCollisionBlockers = []
+        replaceableEmptyTargetVolumes = []
+    }
+
+    mutating func rejectStrictValidation(_ error: Error) {
+        strictValidationPerformed = true
+        strictValidationBlocker = String(describing: error)
     }
 
     private var volumeReferenceCount: Int {

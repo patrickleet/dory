@@ -43,6 +43,20 @@ nonisolated struct MigrationImportTransactionEnvironment: Sendable {
 /// Publishes the immutable plan, reacquires every authority and inventory contract, then advances
 /// the operation to staging. This is the only entry point the semantic executor may use.
 nonisolated enum MigrationImportTransaction {
+    static func requireNoUnfinishedOperation(
+        in store: DoryOperationJournalStore
+    ) throws {
+        if let record = try store.list().first(where: {
+            $0.state.status != .completed && $0.state.status != .failed
+        }) {
+            throw MigrationImportTransactionError.unfinishedOperation(
+                record.plan.id,
+                record.state.phase,
+                record.state.status
+            )
+        }
+    }
+
     static func openStagingSession(
         prepared: PreparedMigrationExecution,
         environment: MigrationImportTransactionEnvironment
@@ -89,20 +103,6 @@ nonisolated enum MigrationImportTransaction {
 }
 
 private extension MigrationImportTransaction {
-    nonisolated static func requireNoUnfinishedOperation(
-        in store: DoryOperationJournalStore
-    ) throws {
-        if let record = try store.list().first(where: {
-            $0.state.status != .completed && $0.state.status != .failed
-        }) {
-            throw MigrationImportTransactionError.unfinishedOperation(
-                record.plan.id,
-                record.state.phase,
-                record.state.status
-            )
-        }
-    }
-
     nonisolated static func publishBaselines(
         _ prepared: PreparedMigrationExecution,
         lease: DoryOperationLease

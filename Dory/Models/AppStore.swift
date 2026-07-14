@@ -3145,8 +3145,21 @@ final class AppStore {
         } else {
             inventory.hostDiskPreflightAvailable = false
         }
+        if let preflightTarget {
+            do {
+                let prepared = try await MigrationImportCoordinator.preflight(
+                    from: source,
+                    to: preflightTarget
+                )
+                inventory.acceptStrictValidation(prepared)
+            } catch {
+                inventory.rejectStrictValidation(error)
+            }
+        }
         migrationInventory = inventory
-        if inventory.isHostDiskUnknown {
+        if let blocker = inventory.strictValidationBlocker {
+            migrationStatus = "Import blocked before writing: \(blocker)"
+        } else if inventory.isHostDiskUnknown {
             migrationStatus = "Import blocked before writing because macOS did not report available disk space."
         } else if inventory.isHostDiskInsufficient {
             migrationStatus = "Free at least \(inventory.additionalHostDiskDisplay) more before importing from \(inventory.sourceName): about \(inventory.requiredHostDiskDisplay) required, \(inventory.availableHostDiskDisplay) available. Restart Dory's engine first if data was recently pruned."

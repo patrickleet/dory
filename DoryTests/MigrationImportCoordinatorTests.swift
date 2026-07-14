@@ -47,4 +47,32 @@ struct MigrationImportCoordinatorTests: StrictInventoryTestCase {
         #expect(summary.networksCreated.count == 1)
         #expect(summary.containersMigrated.count == 1)
     }
+
+    @Test func exactPreflightOverridesLegacyHeuristicsAndSurfacesExactFailures() async throws {
+        let prepared = try await collect(makeFixture())
+        var inventory = MigrationInventory(
+            sourceName: "legacy",
+            images: 0,
+            containers: 0,
+            volumes: 1,
+            volumeNames: [],
+            volumeHelperImageAvailable: false
+        )
+
+        inventory.acceptStrictValidation(prepared)
+
+        #expect(!inventory.isImportBlocked)
+        #expect(inventory.sourceName == "OrbStack")
+        #expect(inventory.images == 1)
+        #expect(inventory.containers == 1)
+        #expect(inventory.volumeNames == ["db-data"])
+        #expect(inventory.volumeHelperImageAvailable)
+
+        inventory.rejectStrictValidation(MigrationStrictInventoryError.unsafe("source changed"))
+        #expect(inventory.isImportBlocked)
+        #expect(inventory.attentionItems == [
+            "Exact import validation blocked before writes: "
+                + "migration cannot start safely: source changed"
+        ])
+    }
 }
