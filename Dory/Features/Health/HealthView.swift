@@ -284,8 +284,8 @@ struct HealthView: View {
                 Text("No blockers — the engine is safe to sleep.")
                     .font(.system(size: 12)).foregroundStyle(p.text2)
             }
-            if let proxy = idle.proxyState, let state = proxy.state, state != "unknown" {
-                Text("Doryd idle: \(state)\(proxy.detail.map { " — \($0)" } ?? "")")
+            if let engine = idle.engineState, let state = engine.state {
+                Text("Engine: \(state)\(engine.detail.map { " — \($0)" } ?? "")")
                     .font(.system(size: 11)).foregroundStyle(p.text3).lineLimit(2)
             }
             if store.canRestartEngineForHealth {
@@ -344,7 +344,7 @@ struct HealthView: View {
                         Divider().overlay(p.border)
                     }
                     HStack(alignment: .top, spacing: 10) {
-                        Text(incident.type.replacingOccurrences(of: "-", with: " "))
+                        Text(incidentLabel(incident.type))
                             .font(.system(size: 11, weight: .bold)).foregroundStyle(incidentColor(incident.type))
                             .frame(width: 120, alignment: .leading)
                         VStack(alignment: .leading, spacing: 1) {
@@ -363,19 +363,27 @@ struct HealthView: View {
     }
 
     private func incidentColor(_ type: String) -> Color {
+        if type.hasSuffix("_failed") || type.hasSuffix(".failed") { return p.red }
+        if type.hasPrefix("repair.") { return p.accentText }
         switch type {
-        case "engine-start", "wake-recovery": p.green
-        case "engine-stop": p.text2
-        case "repair": p.accentText
-        default: p.amber
+        case "engine.start", "engine.wake": return p.green
+        case "engine.stop", "engine.sleep", "engine.idle_sleep": return p.text2
+        default: return p.amber
         }
+    }
+
+    private func incidentLabel(_ type: String) -> String {
+        type
+            .replacingOccurrences(of: ".", with: " ")
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
     }
 
     // MARK: History
 
     private func historySection(_ history: [IdleHistoryEntry]) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            groupLabel("RECENT AUTO-IDLE ACTIVITY")
+            groupLabel("RECENT ENGINE ACTIVITY")
             VStack(spacing: 0) {
                 ForEach(Array(history.enumerated()), id: \.offset) { index, entry in
                     if index > 0 {
@@ -489,6 +497,9 @@ struct HealthView: View {
 
     private func autoIdleSummary(_ idle: IdleStatus) -> String {
         if !idle.autoIdleEnabled {
+            if let state = idle.engineState?.state, state != "running" {
+                return "Auto-Idle is off (mode: \(idle.mode)). The engine is \(state)."
+            }
             return "Auto-Idle is off (mode: \(idle.mode)). The engine stays resident until stopped."
         }
         if idle.canSleep {

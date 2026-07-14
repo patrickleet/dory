@@ -41,7 +41,6 @@ DEFAULT_SOCK = HOME / ".dory" / "dory.sock"
 DEFAULT_ENGINE_SOCK = HOME / ".dory" / "engine.sock"
 DEFAULT_CONFIG = HOME / ".dory" / "config.json"
 DEFAULT_KUBECONFIG = HOME / ".kube" / "dory-config"
-DEFAULT_IDLE_STATE = HOME / ".dory" / "idle-state.json"
 DEFAULT_INCIDENTS = HOME / ".dory" / "incidents.jsonl"
 STATE_ROOT = HOME / ".dory"
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -74,10 +73,6 @@ def socket_path() -> Path:
 
 def config_path() -> Path:
     return Path(os.environ.get("DORY_CONFIG", str(DEFAULT_CONFIG))).expanduser()
-
-
-def idle_state_path() -> Path:
-    return Path(os.environ.get("DORY_IDLE_STATE", str(DEFAULT_IDLE_STATE))).expanduser()
 
 
 def incidents_path() -> Path:
@@ -215,10 +210,10 @@ def record_incident(kind: str, detail: str, **extra: Any) -> None:
         # Serialize append+trim against the Swift writer and other CLI processes via an exclusive
         # flock on a stable sibling lock file (the JSONL inode is swapped by the trim, so we cannot
         # lock the data file itself). O_APPEND keeps each write atomic even under the lock.
-        lock_fd = os.open(str(path) + ".lock", os.O_WRONLY | os.O_CREAT, 0o600)
+        lock_fd = open_private_regular(Path(str(path) + ".lock"), os.O_RDWR | os.O_CREAT)
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            fd = open_private_regular(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
             try:
                 os.write(fd, line.encode("utf-8"))
             finally:
@@ -233,14 +228,14 @@ def record_incident(kind: str, detail: str, **extra: Any) -> None:
 
 def _trim_incidents(path: Path, max_lines: int) -> None:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        lines = read_private_tail(path, 8 * 1024 * 1024).splitlines(keepends=True)
     except OSError:
         return
     if len(lines) <= max_lines:
         return
     tmp = path.with_suffix(f".{os.getpid()}.trim")
     try:
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = open_private_regular(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.writelines(lines[-max_lines:])
         os.replace(tmp, path)
@@ -259,16 +254,59 @@ def read_incidents(limit: int = 50) -> list[dict[str, Any]]:
         return []
     records: list[dict[str, Any]] = []
     try:
-        for line in path.read_text(encoding="utf-8").splitlines():
+        lock_fd = open_private_regular(Path(str(path) + ".lock"), os.O_RDWR | os.O_CREAT)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_SH)
+            content = read_private_tail(path, 8 * 1024 * 1024)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        for line in content.splitlines():
             line = line.strip()
-            if line:
-                try:
-                    records.append(json.loads(line))
-                except ValueError:
-                    continue
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except ValueError:
+                continue
     except OSError:
         return []
     return records[-limit:]
+
+
+def open_private_regular(path: Path, flags: int) -> int:
+    fd = os.open(path, flags | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid() or metadata.st_nlink != 1:
+            raise OSError(f"unsafe private file: {path}")
+        os.fchmod(fd, 0o600)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def read_private_tail(path: Path, maximum_bytes: int) -> str:
+    fd = open_private_regular(path, os.O_RDONLY)
+    try:
+        size = os.fstat(fd).st_size
+        offset = max(0, size - maximum_bytes)
+        os.lseek(fd, offset, os.SEEK_SET)
+        data = bytearray()
+        while len(data) < maximum_bytes:
+            chunk = os.read(fd, min(64 * 1024, maximum_bytes - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        raw = bytes(data)
+        if offset:
+            _, separator, raw = raw.partition(b"\n")
+            if not separator:
+                return ""
+        return raw.decode("utf-8", errors="replace")
+    finally:
+        os.close(fd)
 
 
 def last_good_path() -> Path:
@@ -490,7 +528,7 @@ class Doctor:
                 "socket.not_socket",
                 "Docker socket path is not a socket",
                 f"{path} exists but is not a unix socket",
-                "Run `dory repair socket` to move the stale path aside.",
+                "Run `dory repair socket --apply` to move the stale path aside and ask doryd to recreate the socket.",
             )
             return
         self.add("socket.exists", "pass", "socket.ok", "Docker socket exists", str(path))
@@ -506,7 +544,7 @@ class Doctor:
                 "socket.unreachable",
                 "Docker API is not reachable",
                 str(exc),
-                "Start Dory or run `dory repair socket` if the socket path is stale.",
+                "Open Dory, then run `dory repair socket --apply`; if Docker still fails, run `dory repair dockerd --apply`.",
             )
             return
         if status_code == 200 and text == "OK":
@@ -588,7 +626,7 @@ class Doctor:
             name = current.stdout.strip()
             status = "pass" if name == "dory" else "warn"
             code = "context.active" if name == "dory" else "context.not_active"
-            action = "" if name == "dory" else "Run `dory repair context` to create and activate the Dory context."
+            action = "" if name == "dory" else "Run `dory repair context --apply` to create and activate the Dory context."
             self.add("docker.context.current", status, code, "Active Docker context", name or "unknown", action)
         else:
             self.add("docker.context.current", "warn", "context.show_failed", "Could not read Docker context", compact(current.stderr))
@@ -606,7 +644,7 @@ class Doctor:
                 "context.missing",
                 "Dory Docker context missing",
                 compact(inspect.stderr or inspect.stdout),
-                "Run `dory repair context`.",
+                "Run `dory repair context --apply`.",
             )
             return
         host = inspect.stdout.strip().strip('"')
@@ -619,7 +657,7 @@ class Doctor:
                 "context.wrong_socket",
                 "Dory context targets another socket",
                 host,
-                "Run `dory repair context` to update it.",
+                "Run `dory repair context --apply` to update it.",
             )
 
     def check_proxy(self) -> None:
@@ -1280,7 +1318,7 @@ class Doctor:
         log_bytes = int(state.get("log_bytes", 0) or 0)
         state_status = "warn" if log_bytes > 100_000_000 else "pass"
         state_code = "disk.dory_logs_large" if state_status == "warn" else "disk.dory_state_ok"
-        state_action = "Run `dory cleanup --logs --apply` to trim old log data while preserving recent tails." if state_status == "warn" else ""
+        state_action = "Run `dory cleanup --apply` to trim old log data while preserving recent tails." if state_status == "warn" else ""
         self.add(
             "disk.dory_state",
             state_status,
@@ -1300,7 +1338,7 @@ class Doctor:
                 "disk.dory_log_uncapped",
                 "A Dory log exceeds the size cap",
                 f"{largest_log.get('path', 'a log')} is {format_bytes(largest_bytes)} (cap {format_bytes(LOG_HARD_MAX_BYTES)})",
-                "Run `dory cleanup --logs --apply`; automatic caps apply on the next engine start or while Auto-Idle runs.",
+                "Run `dory cleanup --apply`; automatic caps apply on the next engine start or while Auto-Idle runs.",
                 largest_log=largest_log,
             )
         else:
@@ -1440,7 +1478,7 @@ class Doctor:
                 "helpers.resolver_missing",
                 "Local domain resolver file missing",
                 str(resolver),
-                "Run `scripts/enable-networking.sh` if you want system-wide *.dory.local resolution.",
+                "Run `dory network authorize --apply` if you want system-wide *.dory.local resolution.",
                 **data,
             )
 
@@ -2541,6 +2579,10 @@ def route_table(sock: Path | None = None) -> dict[str, Any]:
 
 
 def idle_status(sock: Path | None = None) -> dict[str, Any]:
+    daemon = dorydctl_json(["idle", "status"], timeout=5)
+    if daemon.get("ok") and isinstance(daemon.get("body"), dict):
+        return daemon["body"]
+
     config = load_config()
     table = route_table(sock)
     blockers: list[dict[str, Any]] = []
@@ -2567,6 +2609,26 @@ def idle_status(sock: Path | None = None) -> dict[str, Any]:
         blockers.append({"type": "kubernetes-config", "path": str(DEFAULT_KUBECONFIG)})
     mode = config.get("runtimeMode", "manual")
     policy = config.get("idle") or {}
+    socket = sock or socket_path()
+    try:
+        status_code, _, body = unix_http(socket, "GET", "/_ping", timeout=2)
+        docker_reachable = status_code == 200 and body.strip() == b"OK"
+    except Exception:
+        docker_reachable = False
+    if docker_reachable:
+        engine_state = {
+            "available": True,
+            "owner": "docker-socket-probe",
+            "state": "running",
+            "detail": f"Docker API is available at {socket}; doryd control is unavailable",
+        }
+    else:
+        engine_state = {
+            "available": False,
+            "owner": "doryd",
+            "state": "unavailable",
+            "detail": daemon.get("error", "doryd control and Docker API are unavailable"),
+        }
     return {
         "generated_at": now_iso(),
         "mode": mode,
@@ -2574,32 +2636,9 @@ def idle_status(sock: Path | None = None) -> dict[str, Any]:
         "sleep_after_minutes": policy.get("sleepAfterMinutes"),
         "can_sleep": len(blockers) == 0,
         "blockers": blockers,
-        "proxy_state": read_idle_proxy_state(),
+        "engine_state": engine_state,
         "policy": policy,
     }
-
-
-def read_idle_proxy_state() -> dict[str, Any]:
-    path = idle_state_path()
-    if not path.exists():
-        return {
-            "available": False,
-            "path": str(path),
-            "state": "unknown",
-            "detail": "doryd has not written idle state yet",
-        }
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        return {
-            "available": False,
-            "path": str(path),
-            "state": "unknown",
-            "detail": f"could not read state: {exc}",
-        }
-    data["available"] = True
-    data.setdefault("path", str(path))
-    return data
 
 
 def load_config() -> dict[str, Any]:
@@ -3035,8 +3074,8 @@ def print_idle(status: dict[str, Any], as_json: bool) -> None:
     print(f"Mode: {status['mode']}")
     print(f"Auto-Idle enabled: {'yes' if status['auto_idle_enabled'] else 'no'}")
     print(f"Can sleep now: {'yes' if status['can_sleep'] else 'no'}")
-    proxy = status.get("proxy_state") or {}
-    print(f"Doryd idle state: {proxy.get('state', 'unknown')} ({proxy.get('detail', 'no state')})")
+    engine = status.get("engine_state") or {}
+    print(f"Engine: {engine.get('state', 'unknown')} ({engine.get('detail', 'no state')})")
     if status["blockers"]:
         print("Sleep blockers:")
         for blocker in status["blockers"]:
@@ -3656,7 +3695,14 @@ def cmd_repair(args: argparse.Namespace) -> int:
 def repair_socket(apply: bool) -> dict[str, Any]:
     sock = socket_path()
     if not sock.exists():
-        return {"target": "socket", "status": "pass", "detail": f"{sock} does not exist; no stale file to move"}
+        if not apply:
+            return {
+                "target": "socket",
+                "status": "warn",
+                "detail": f"{sock} does not exist",
+                "next": "would ask doryd to start the engine and recreate its owned socket",
+            }
+        return request_doryd_socket_recreation(sock)
     try:
         mode = sock.stat().st_mode
     except OSError as exc:
@@ -3666,8 +3712,37 @@ def repair_socket(apply: bool) -> dict[str, Any]:
     backup = sock.with_name(sock.name + f".stale-{int(time.time())}")
     if apply:
         os.replace(sock, backup)
-        return {"target": "socket", "status": "pass", "detail": f"moved stale socket path to {backup}"}
+        result = request_doryd_socket_recreation(sock)
+        if result.get("status") != "pass":
+            result["detail"] = f"moved stale path to {backup}; {result.get('detail', 'doryd did not recreate the socket')}"
+        return result
     return {"target": "socket", "status": "warn", "detail": f"{sock} is not a socket", "next": f"would move it to {backup}"}
+
+
+def request_doryd_socket_recreation(sock: Path) -> dict[str, Any]:
+    start = dorydctl_json(["engine", "start"], timeout=250)
+    if not start.get("ok"):
+        return {
+            "target": "socket",
+            "status": "fail",
+            "detail": f"doryd could not recreate {sock}: {start.get('error', 'engine start failed')}",
+            "next": "open Dory and retry; collect a support bundle if doryd remains unavailable",
+        }
+    try:
+        mode = sock.stat().st_mode
+    except OSError as exc:
+        return {
+            "target": "socket",
+            "status": "fail",
+            "detail": f"doryd reported engine start success but {sock} is unavailable: {exc}",
+        }
+    if not stat.S_ISSOCK(mode):
+        return {
+            "target": "socket",
+            "status": "fail",
+            "detail": f"doryd reported engine start success but {sock} is not a Unix socket",
+        }
+    return {"target": "socket", "status": "pass", "detail": f"doryd recreated {sock}"}
 
 
 def repair_context(apply: bool) -> dict[str, Any]:
@@ -3764,7 +3839,7 @@ def repair_dns(apply: bool) -> dict[str, Any]:
                 "target": "dns",
                 "status": "skip",
                 "detail": detail,
-                "next": "run scripts/enable-networking.sh to install the *.dory.local resolver; nothing to flush",
+                "next": "run `dory network authorize --apply` to install the *.dory.local resolver; nothing to flush",
             }
         return {
             "target": "dns",
@@ -3941,9 +4016,12 @@ def idle_set(key: str | None, value: str | None, as_json: bool) -> int:
         return 2
     if key in IDLE_INT_KEYS:
         try:
-            parsed: Any = max(0, int(value))
+            parsed = int(value)
         except ValueError:
-            print(f"{key} expects a non-negative integer", file=sys.stderr)
+            print(f"{key} expects a positive integer", file=sys.stderr)
+            return 2
+        if parsed <= 0:
+            print(f"{key} expects a positive integer", file=sys.stderr)
             return 2
     elif key in IDLE_BOOL_KEYS:
         parsed = parse_bool_arg(value)

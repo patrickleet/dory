@@ -1045,7 +1045,7 @@ struct DorydClientTests {
     }
 
     @MainActor
-    @Test func idleSettingsRollbackWhenRequiredDorydIsUnavailable() async throws {
+    @Test func idleSettingsDoNotPublishRejectedDorydState() async throws {
         let listener = NSXPCListener.anonymous()
         let service = FakeDorydService()
         service.setIdleAvailable(false)
@@ -1062,13 +1062,18 @@ struct DorydClientTests {
         store.idlePolicy = IdlePolicy(sleepAfterMinutes: 15)
 
         await store.setRuntimeMode("auto-idle")
+
+        #expect(store.runtimeMode == "manual")
+        #expect(store.settingsNotice?.kind == .failure)
+        #expect(store.settingsNotice?.message == "doryd did not apply the idle mode: idle unavailable")
+
         await store.setIdleSleepAfter(5)
 
         #expect(store.runtimeMode == "manual")
         #expect(store.idlePolicy.sleepAfterMinutes == 15)
         #expect(store.actionError == nil)
         #expect(store.settingsNotice?.kind == .failure)
-        #expect(store.settingsNotice?.message == "doryd is unavailable; idle policy was not changed.")
+        #expect(store.settingsNotice?.message == "doryd did not apply the idle policy: idle unavailable")
     }
 
     @MainActor
@@ -1894,9 +1899,10 @@ private final class FakeDorydService: NSObject, DorydControlXPC {
             "sleep_after_minutes": policy["sleepAfterMinutes"] ?? 15,
             "can_sleep": true,
             "blockers": [],
-            "proxy_state": [
-                "available": false,
-                "state": "unknown",
+            "engine_state": [
+                "available": true,
+                "owner": "doryd",
+                "state": "running",
             ],
             "policy": policy,
         ] as NSDictionary

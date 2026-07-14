@@ -322,7 +322,7 @@ public final class HealthReporter: @unchecked Sendable {
                 code: "socket.missing",
                 title: "Docker socket missing",
                 detail: "\(socketPath) does not exist",
-                action: "Start doryd or run engineStart over XPC."
+                action: "Open Dory or run `dory engine start`; if the socket stays missing, run `dory repair socket --apply`."
             )
         }
 
@@ -344,7 +344,7 @@ public final class HealthReporter: @unchecked Sendable {
                 code: "socket.not_socket",
                 title: "Docker socket path is not a socket",
                 detail: "\(socketPath) exists but is not a unix socket",
-                action: "Move the stale path aside and restart doryd."
+                action: "Run `dory repair socket --apply` to move the stale path aside and ask doryd to recreate the socket."
             )
         }
 
@@ -373,7 +373,8 @@ public final class HealthReporter: @unchecked Sendable {
                 status: .fail,
                 code: "socket.bad_ping",
                 title: "Docker API ping failed",
-                detail: "HTTP \(statusCode): \(String(body.prefix(120)))"
+                detail: "HTTP \(statusCode): \(String(body.prefix(120)))",
+                action: "Run `dory repair dockerd --apply`; any engine restart remains explicit and workload-disruptive."
             )
         case let .unreachable(detail):
             return HealthCheck(
@@ -382,7 +383,7 @@ public final class HealthReporter: @unchecked Sendable {
                 code: "socket.unreachable",
                 title: "Docker API is not reachable",
                 detail: detail,
-                action: "Start Dory or run `dory repair socket` if the socket path is stale."
+                action: "Open Dory, then run `dory repair socket --apply`; if the socket exists but Docker still fails, run `dory repair dockerd --apply`."
             )
         }
     }
@@ -542,7 +543,7 @@ public final class HealthReporter: @unchecked Sendable {
                 code: isDory ? "context.active" : "context.not_active",
                 title: "Active Docker context",
                 detail: name.isEmpty ? "unknown" : name,
-                action: isDory ? nil : "Run `dory repair context` to create and activate the Dory context."
+                action: isDory ? nil : "Run `dory repair context --apply` to create and activate the Dory context."
             ))
         } else {
             checks.append(HealthCheck(
@@ -567,7 +568,7 @@ public final class HealthReporter: @unchecked Sendable {
                 code: "context.missing",
                 title: "Dory Docker context missing",
                 detail: compact(inspect.stderr.isEmpty ? inspect.stdout : inspect.stderr),
-                action: "Run `dory repair context`."
+                action: "Run `dory repair context --apply`."
             ))
             return checks
         }
@@ -590,7 +591,7 @@ public final class HealthReporter: @unchecked Sendable {
                 code: "context.wrong_socket",
                 title: "Dory context targets another socket",
                 detail: host,
-                action: "Run `dory repair context` to update it."
+                action: "Run `dory repair context --apply` to update it."
             ))
         }
         return checks
@@ -962,7 +963,7 @@ public final class HealthReporter: @unchecked Sendable {
             code: "helpers.resolver_missing",
             title: "Local domain resolver file missing",
             detail: resolver,
-            action: "Run `scripts/enable-networking.sh` if you want system-wide *.dory.local resolution.",
+            action: "Run `dory network authorize --apply` if you want system-wide *.dory.local resolution.",
             data: ["resolver": resolver, "resolver_exists": "false"]
         )
     }
@@ -1013,7 +1014,7 @@ public final class HealthReporter: @unchecked Sendable {
                 code: "engine.stopped",
                 title: "Docker tier is stopped",
                 detail: "engineStart is required before docker traffic can be served",
-                action: "Start the engine, or set runtime mode to always-on so doryd starts it on launch.",
+                action: "Run `dory engine start`, or choose Always On so doryd starts it on launch.",
                 data: engineData(status)
             )
         case .failed:
@@ -1023,7 +1024,7 @@ public final class HealthReporter: @unchecked Sendable {
                 code: "engine.failed",
                 title: "Docker tier failed",
                 detail: status.lastError ?? "unknown docker-tier failure",
-                action: "Inspect the dory-hv log and restart the engine.",
+                action: "Run `dory repair dockerd --apply`; if it recommends a restart, use `dory repair engine --apply --restart-engine` after checking running workloads.",
                 data: engineData(status)
             )
         }
@@ -1278,7 +1279,7 @@ public final class HealthReporter: @unchecked Sendable {
             code: code,
             title: "Dory state disk usage estimated",
             detail: "state=\(formatBytes(Int64(usage.totalBytes))) logs=\(formatBytes(Int64(usage.logBytes))) vm=\(formatBytes(Int64(usage.vmDiskBytes)))",
-            action: status == .warn ? "Run `dory cleanup --logs --apply` to trim old log data while preserving recent tails." : nil,
+            action: status == .warn ? "Run `dory cleanup --apply` to trim old log data while preserving recent tails." : nil,
             data: [
                 "total_bytes": String(usage.totalBytes),
                 "log_bytes": String(usage.logBytes),
@@ -1403,7 +1404,7 @@ public final class HealthReporter: @unchecked Sendable {
                 code: "disk.dory_log_uncapped",
                 title: "A Dory log exceeds the size cap",
                 detail: "\(usage.largestLogPath ?? "a log") is \(formatBytes(Int64(usage.largestLogBytes))) (cap \(formatBytes(Int64(cap))))",
-                action: "Run `dory cleanup --logs --apply`; automatic caps apply on the next engine start or while Auto-Idle runs.",
+                action: "Run `dory cleanup --apply`; automatic caps apply on the next engine start or while Auto-Idle runs.",
                 data: [
                     "largest_log_path": usage.largestLogPath ?? "",
                     "largest_log_bytes": String(usage.largestLogBytes),

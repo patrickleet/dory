@@ -388,7 +388,11 @@ elif [ "$1" = "health" ]; then
 elif [ "$1" = "incidents" ]; then
   printf '[{"at":"2026-07-08T00:00:04Z","type":"engine.start","detail":"Authorization: Bearer secret-token"}]\n'
 elif [ "$1" = "idle" ] && [ "$2" = "status" ]; then
-  printf '{"mode":"auto-idle","state":"idle"}\n'
+  printf '{"mode":"auto-idle","engine_desired_state":"running","auto_idle_enabled":true,"can_sleep":true,"blockers":[],"engine_state":{"available":true,"owner":"doryd","state":"running"},"policy":{"sleepAfterMinutes":30,"keepPublishedPortsAwake":false,"keepKubernetesAwake":true,"keepPinnedProjectsAwake":true,"showWakeNotifications":true}}\n'
+elif [ "$1" = "idle" ] && [ "$2" = "mode" ]; then
+  printf '{"mode":"%s","engine_desired_state":"running","auto_idle_enabled":true,"can_sleep":true,"blockers":[],"engine_state":{"available":true,"owner":"doryd","state":"running"},"policy":{"sleepAfterMinutes":30,"keepPublishedPortsAwake":false,"keepKubernetesAwake":true,"keepPinnedProjectsAwake":true,"showWakeNotifications":true}}\n' "$3"
+elif [ "$1" = "idle" ] && [ "$2" = "set" ]; then
+  printf '{"mode":"auto-idle","engine_desired_state":"running","auto_idle_enabled":true,"can_sleep":true,"blockers":[],"engine_state":{"available":true,"owner":"doryd","state":"running"},"policy":{"sleepAfterMinutes":30,"keepPublishedPortsAwake":false,"keepKubernetesAwake":true,"keepPinnedProjectsAwake":true,"showWakeNotifications":true}}\n'
 elif [ "$1" = "idle" ] && [ "$2" = "history" ]; then
   printf '[{"at":"2026-07-08T00:00:05Z","state":"sleeping","detail":"idle policy"}]\n'
 elif [ "$1" = "docker" ] && [ "$2" = "ports" ]; then
@@ -643,8 +647,9 @@ assert data["mode"] == "auto-idle"
 assert data["auto_idle_enabled"] is True
 assert data["can_sleep"] is False
 assert data["blockers"]
-assert data["proxy_state"]["available"] is False
-assert data["proxy_state"]["state"] == "unknown"
+assert data["engine_state"]["available"] is False
+assert data["engine_state"]["owner"] == "doryd"
+assert data["engine_state"]["state"] == "unavailable"
 '
 
 cat > "$TMP_HOME/idle-state.json" <<'JSON'
@@ -660,9 +665,9 @@ JSON
 DORY_IDLE_STATE="$TMP_HOME/idle-state.json" scripts/dory-doctor idle status --json | python3 -c '
 import json, sys
 data = json.load(sys.stdin)
-assert data["proxy_state"]["available"] is True
-assert data["proxy_state"]["state"] == "idle-cooling-down"
-assert data["proxy_state"]["detail"] == "waiting 42s before sleep"
+assert data["engine_state"]["available"] is False
+assert data["engine_state"]["state"] == "unavailable"
+assert data["engine_state"]["state"] != "idle-cooling-down"
 '
 
 scripts/dory-doctor disk --json | python3 -c '
@@ -1166,14 +1171,13 @@ assert log_check[0]["code"] == "disk.dory_log_uncapped", log_check[0]
 '
 rm -f "$TMP_HOME/.dory/engine.log"
 
-# Auto-Idle policy CLI (Track 7): `dory idle set` writes idle.* keys, preserves runtimeMode, and
-# `idle status --json` echoes the full policy for the Settings UI. Isolated config so it does not
-# perturb the idle-proxy tests below.
+# Auto-Idle policy CLI: mutations go through dorydctl, status echoes the daemon-confirmed policy,
+# invalid input exits as usage, and a rejected daemon request cannot write the requested config.
 IDLE_CFG="$TMP_HOME/idle-policy-config.json"
-DORY_CONFIG="$IDLE_CFG" scripts/dory mode auto-idle >/dev/null
-DORY_CONFIG="$IDLE_CFG" scripts/dory idle set sleepAfterMinutes 30 >/dev/null
-DORY_CONFIG="$IDLE_CFG" scripts/dory idle set keepPublishedPortsAwake off >/dev/null
-DORY_CONFIG="$IDLE_CFG" scripts/dory idle status --json | python3 -c '
+DORYDCTL_BIN="$TMP_HOME/fake-dorydctl" DORY_CONFIG="$IDLE_CFG" scripts/dory mode auto-idle >/dev/null
+DORYDCTL_BIN="$TMP_HOME/fake-dorydctl" DORY_CONFIG="$IDLE_CFG" scripts/dory idle set sleepAfterMinutes 30 >/dev/null
+DORYDCTL_BIN="$TMP_HOME/fake-dorydctl" DORY_CONFIG="$IDLE_CFG" scripts/dory idle set keepPublishedPortsAwake off >/dev/null
+DORYDCTL_BIN="$TMP_HOME/fake-dorydctl" DORY_CONFIG="$IDLE_CFG" scripts/dory idle status --json | python3 -c '
 import json, sys
 data = json.load(sys.stdin)
 assert data["mode"] == "auto-idle", data["mode"]
@@ -1187,6 +1191,17 @@ DORY_CONFIG="$IDLE_CFG" scripts/dory idle set bogusKey 5 >/dev/null 2>&1
 idle_set_rc=$?
 set -e
 [ "$idle_set_rc" = "2" ] || { echo "unknown idle key should exit 2, got $idle_set_rc"; exit 1; }
+
+REJECTED_CFG="$TMP_HOME/rejected-idle-policy-config.json"
+set +e
+DORYDCTL_BIN=/usr/bin/false DORY_CONFIG="$REJECTED_CFG" scripts/dory mode always-on >/dev/null 2>&1
+mode_rejected_rc=$?
+DORYDCTL_BIN=/usr/bin/false DORY_CONFIG="$REJECTED_CFG" scripts/dory idle set sleepAfterMinutes 60 >/dev/null 2>&1
+policy_rejected_rc=$?
+set -e
+[ "$mode_rejected_rc" = "1" ] || { echo "rejected mode should exit 1, got $mode_rejected_rc"; exit 1; }
+[ "$policy_rejected_rc" = "1" ] || { echo "rejected policy should exit 1, got $policy_rejected_rc"; exit 1; }
+[ ! -e "$REJECTED_CFG" ] || { echo "rejected doryd settings must not write config"; exit 1; }
 
 # Proxy inspector (Track 2 P1): a host proxy that Docker is not configured to use warns with an
 # actionable fix, and proxy-URL credentials are redacted from the output.
@@ -1263,13 +1278,13 @@ DORY_INCIDENTS="$INC_LOG" scripts/dory incidents --json | python3 -c '
 import json, sys
 assert json.load(sys.stdin)["incidents"] == [], "expected empty incident timeline"
 '
-DORY_INCIDENTS="$INC_LOG" DORY_SOCK=/tmp/dory-no-such-sock.sock scripts/dory repair socket --apply >/dev/null 2>&1 || true
+DORY_INCIDENTS="$INC_LOG" DORY_DOCKER_BIN="$TMP_HOME/fake-bin/docker" scripts/dory repair context --apply >/dev/null
 DORY_INCIDENTS="$INC_LOG" scripts/dory incidents --json | python3 -c '
 import json, sys
 inc = json.load(sys.stdin)["incidents"]
 assert inc, "repair --apply should record an incident"
 assert inc[0]["type"] == "repair", inc[0]
-assert "socket" in (inc[0].get("detail") or ""), inc[0]
+assert "context" in (inc[0].get("detail") or ""), inc[0]
 '
 inc_perm="$(stat -f "%Lp" "$INC_LOG")"
 [ "$inc_perm" = "600" ] || { echo "incidents perms=$inc_perm (want 600)"; exit 1; }
@@ -1293,6 +1308,16 @@ lines = [line for line in open(path, encoding="utf-8").read().splitlines() if li
 assert len(lines) == 40, f"expected 40 incident lines, got {len(lines)}"
 for line in lines:
     json.loads(line)
+
+linked = os.path.join(tempfile.mkdtemp(), "incidents.jsonl")
+target = linked + ".target"
+with open(target, "w", encoding="utf-8") as handle:
+    handle.write("untouched")
+os.symlink(target, linked)
+os.environ["DORY_INCIDENTS"] = linked
+dd.record_incident("test", "must not follow")
+assert open(target, encoding="utf-8").read() == "untouched"
+assert dd.read_incidents(10) == []
 PY
 
 # Memory inspector + guest disk (Track 5 P1): footprint breaks host RSS into engine/app roles;

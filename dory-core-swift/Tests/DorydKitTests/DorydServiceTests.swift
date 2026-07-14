@@ -58,13 +58,13 @@ final class DorydServiceTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: home) }
         let doryDir = home.appendingPathComponent(".dory", isDirectory: true)
         try FileManager.default.createDirectory(at: doryDir, withIntermediateDirectories: true)
-        try """
-        {"at":"2026-07-07T00:00:00Z","state":"sleeping","detail":"idle"}
-        """.write(
-            to: doryDir.appendingPathComponent("idle-history.jsonl"),
-            atomically: true,
-            encoding: .utf8
+        let incidentWriter = IncidentWriter(path: doryDir.appendingPathComponent("incidents.jsonl").path)
+        incidentWriter.record(
+            type: "engine.lifecycle",
+            detail: "sleeping",
+            at: Date(timeIntervalSince1970: 1)
         )
+        incidentWriter.record(type: "network.routes", detail: "unrelated", at: Date(timeIntervalSince1970: 2))
 
         let store = IdlePolicyStore(home: home.path, environment: [:], dockerContainers: {
             .ok([
@@ -75,7 +75,11 @@ final class DorydServiceTests: XCTestCase {
                 ))
             ])
         })
-        let service = DorydService(socketPath: "/tmp/doryd-test.sock", idlePolicyStore: store)
+        let service = DorydService(
+            socketPath: "/tmp/doryd-test.sock",
+            idlePolicyStore: store,
+            incidentWriter: incidentWriter
+        )
         let listener = makeAnonymousListener(service: service)
         listener.resume()
         defer { listener.invalidate() }
@@ -100,6 +104,9 @@ final class DorydServiceTests: XCTestCase {
         XCTAssertEqual(status["auto_idle_enabled"] as? Bool, false)
         XCTAssertEqual(status["sleep_after_minutes"] as? Int, 15)
         XCTAssertEqual((status["blockers"] as? [NSDictionary])?.count, 2)
+        let engineState = try XCTUnwrap(status["engine_state"] as? NSDictionary)
+        XCTAssertEqual(engineState["owner"] as? String, "doryd")
+        XCTAssertEqual(engineState["state"] as? String, "unconfigured")
 
         let setReply = expectation(description: "set idle policy")
         var updated: NSDictionary = [:]

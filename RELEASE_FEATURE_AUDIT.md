@@ -88,8 +88,15 @@ of scope so each fix remains reviewable.
   Local source evidence: managed-drive and APFS identity gates passed; a real VM preserved a named
   volume across sparse 16 -> 128 -> 256 GiB growth, rejected live growth under the drive lease,
   forced an offline ext4 preen before resize, and published resize/trim evidence.
-- [ ] App/CLI status, health, repair, logs, and errors identify the failing owner and offer a bounded
+- [x] App/CLI status, health, repair, logs, and errors identify the failing owner and offer a bounded
   recovery action without reporting requested state as applied state.
+  Local source evidence: idle status now joins persisted policy to doryd's live DockerTier state and
+  lifecycle history comes only from confirmed engine transitions. App and CLI mutations publish only
+  the daemon-confirmed response, preserve the previous value on rejection, and surface its exact
+  error. Recovery instructions use installed commands; missing-socket repair fails until doryd
+  actually recreates it. Swift and CLI incident writers share a private cross-process lock, reject
+  linked files, bound reads, and retain the newest 500 records. The full 364-test core suite, 26
+  focused app tests, CLI diagnostics suite, and competitor-release gate passed.
 - [ ] Clean install, persistence, crash recovery, uninstall-preserves-data, and alternate-drive
   evidence is retained for the exact candidate.
 

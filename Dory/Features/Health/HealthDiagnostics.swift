@@ -54,10 +54,11 @@ struct DoctorReport: Decodable, Sendable {
     let results: [DoctorCheck]
 }
 
-nonisolated struct IdleProxyState: Decodable, Sendable, Hashable {
+nonisolated struct IdleEngineState: Decodable, Sendable, Hashable {
     let state: String?
     let detail: String?
     let available: Bool?
+    let owner: String?
 }
 
 nonisolated struct IdleBlocker: Decodable, Sendable, Hashable {
@@ -158,7 +159,7 @@ nonisolated struct IdleStatus: Decodable, Sendable {
     let sleepAfterMinutes: Int?
     let effectiveSleepAfterMinutes: Int?
     let blockers: [IdleBlocker]
-    let proxyState: IdleProxyState?
+    let engineState: IdleEngineState?
     let policy: IdlePolicy?
 
     enum CodingKeys: String, CodingKey {
@@ -167,7 +168,7 @@ nonisolated struct IdleStatus: Decodable, Sendable {
         case canSleep = "can_sleep"
         case sleepAfterMinutes = "sleep_after_minutes"
         case effectiveSleepAfterMinutes = "effective_sleep_after_minutes"
-        case proxyState = "proxy_state"
+        case engineState = "engine_state"
     }
 
     // Tolerant of a hand-edited ~/.dory/config: a null/float/string in any field must not throw and
@@ -180,7 +181,7 @@ nonisolated struct IdleStatus: Decodable, Sendable {
         sleepAfterMinutes = decodeFlexibleInt(container, .sleepAfterMinutes)
         effectiveSleepAfterMinutes = decodeFlexibleInt(container, .effectiveSleepAfterMinutes)
         blockers = (try? container.decode([IdleBlocker].self, forKey: .blockers)) ?? []
-        proxyState = try? container.decode(IdleProxyState.self, forKey: .proxyState)
+        engineState = try? container.decode(IdleEngineState.self, forKey: .engineState)
         policy = try? container.decode(IdlePolicy.self, forKey: .policy)
     }
 }

@@ -670,11 +670,28 @@ public final class DorydService: NSObject, DorydControl {
     }
 
     public func idleStatus(reply: @escaping (NSDictionary, String) -> Void) {
-        reply(idlePolicyStore.status(), "")
+        reply(idleStatusSnapshot(), "")
     }
 
     public func idleHistory(_ limit: Int, reply: @escaping (NSArray, String) -> Void) {
-        reply(idlePolicyStore.history(limit: limit), "")
+        guard limit > 0, let incidentWriter else {
+            reply([], "")
+            return
+        }
+        let rows = incidentWriter
+            .read(limit: limit, matchingTypes: ["engine.lifecycle"])
+            .reversed()
+            .compactMap { incident -> NSDictionary? in
+                guard let state = incident.detail,
+                      let at = incident.xpcDictionary["at"] as? String else {
+                    return nil
+                }
+                return [
+                    "at": at,
+                    "state": state,
+                ] as NSDictionary
+            }
+        reply(rows as NSArray, "")
     }
 
     public func idleSetMode(_ mode: String, reply: @escaping (Bool, NSDictionary, String) -> Void) {
@@ -691,7 +708,7 @@ public final class DorydService: NSObject, DorydControl {
                 }
                 try dockerTier.promoteToRunning()
             }
-            let status = idlePolicyStore.status()
+            let status = idleStatusSnapshot()
             incidentWriter?.record(type: "idle.mode", detail: appliedMode)
             reply(true, status, "")
         } catch {
@@ -704,12 +721,12 @@ public final class DorydService: NSObject, DorydControl {
                         type: "idle.mode_rollback_failed",
                         detail: "requested=\(mode) previous=\(previousMode): \(error)"
                     )
-                    reply(false, idlePolicyStore.status(), "idle mode failed and its previous value could not be restored: \(error)")
+                    reply(false, idleStatusSnapshot(), "idle mode failed and its previous value could not be restored: \(error)")
                     return
                 }
             }
             incidentWriter?.record(type: "idle.mode_failed", detail: "\(error)")
-            reply(false, idlePolicyStore.status(), "\(error)")
+            reply(false, idleStatusSnapshot(), "\(error)")
         }
     }
 
@@ -717,13 +734,13 @@ public final class DorydService: NSObject, DorydControl {
         runtimeModeLock.lock()
         defer { runtimeModeLock.unlock() }
         do {
-            let status = try idlePolicyStore.setPolicy(key: key, value: value)
+            _ = try idlePolicyStore.setPolicy(key: key, value: value)
             updateIdleSleepScheduler()
             incidentWriter?.record(type: "idle.policy", detail: "\(key)=\(value)")
-            reply(true, status, "")
+            reply(true, idleStatusSnapshot(), "")
         } catch {
             incidentWriter?.record(type: "idle.policy_failed", detail: "\(key): \(error)")
-            reply(false, [:], "\(error)")
+            reply(false, idleStatusSnapshot(), "\(error)")
         }
     }
 
@@ -773,6 +790,42 @@ public final class DorydService: NSObject, DorydControl {
         guard let idleSleepScheduler else { return }
         let configuration = idlePolicyStore.schedulerConfiguration(base: idleSleepScheduler.currentConfiguration)
         idleSleepScheduler.update(configuration: configuration)
+    }
+
+    private func idleStatusSnapshot() -> NSDictionary {
+        var snapshot = idlePolicyStore.status() as? [String: Any] ?? [:]
+        guard let dockerTier else {
+            snapshot["engine_state"] = [
+                "available": false,
+                "owner": "doryd",
+                "state": "unconfigured",
+                "detail": "doryd has no Docker tier configuration",
+            ] as NSDictionary
+            return snapshot as NSDictionary
+        }
+
+        let status = dockerTier.status()
+        let detail: String
+        switch status.state {
+        case .running:
+            detail = "Docker API is available at \(status.socketPath)"
+        case .sleeping:
+            detail = "doryd owns \(status.socketPath); the next Docker request will wake the engine"
+        case .starting:
+            detail = "doryd is starting the Docker engine"
+        case .stopped:
+            detail = "the Docker engine is stopped; start it or choose Always On"
+        case .failed:
+            detail = status.lastError ?? "the Docker engine failed without an attributed error"
+        }
+        snapshot["engine_state"] = [
+            "available": true,
+            "owner": "doryd",
+            "state": status.state.rawValue,
+            "detail": detail,
+            "socket_path": status.socketPath,
+        ] as NSDictionary
+        return snapshot as NSDictionary
     }
 
     private func promoteEngine(event: String, reply: @escaping (Bool, String) -> Void) {

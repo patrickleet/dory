@@ -2150,9 +2150,9 @@ idle_proxy_status_cmd() {
     set -e
     if [ "$rc" -eq 0 ] && [ -n "$out" ]; then
       if [ "$json" -eq 1 ]; then
-        printf '%s\n' "$out" | python3 -c 'import json,sys; print(json.dumps((json.load(sys.stdin).get("proxy_state") or {}), indent=2, sort_keys=True))'
+        printf '%s\n' "$out" | python3 -c 'import json,sys; print(json.dumps((json.load(sys.stdin).get("engine_state") or {}), indent=2, sort_keys=True))'
       else
-        printf '%s\n' "$out" | python3 -c 'import json,sys; data=json.load(sys.stdin).get("proxy_state") or {}; print(f"Doryd idle state: {data.get(\"state\", \"unknown\")} ({data.get(\"detail\", \"no state\")})")'
+        printf '%s\n' "$out" | python3 -c 'import json,sys; data=json.load(sys.stdin).get("engine_state") or {}; print(f"Dory engine: {data.get(\"state\", \"unknown\")} ({data.get(\"detail\", \"no state\")})")'
       fi
       return 0
     fi
@@ -2180,6 +2180,7 @@ print_idle_status_json() {
 import json, sys
 data = json.load(sys.stdin)
 print("Mode: {}".format(data.get("mode", "unknown")))
+print("Engine desired state: {}".format(data.get("engine_desired_state", "unknown")))
 print("Auto-Idle enabled: {}".format("yes" if data.get("auto_idle_enabled") else "no"))
 configured = data.get("sleep_after_minutes")
 effective = data.get("effective_sleep_after_minutes", configured)
@@ -2189,8 +2190,8 @@ if configured is not None:
     else:
         print("Sleep after idle: {} minutes".format(configured))
 print("Can sleep now: {}".format("yes" if data.get("can_sleep") else "no"))
-state = data.get("proxy_state") or {}
-print("Doryd idle state: {} ({})".format(state.get("state", "unknown"), state.get("detail", "no state")))
+state = data.get("engine_state") or {}
+print("Engine: {} ({})".format(state.get("state", "unknown"), state.get("detail", "no state")))
 blockers = data.get("blockers") or []
 if blockers:
     print("Sleep blockers:")
@@ -2213,9 +2214,9 @@ mode_cmd() {
   if ctl="$(dorydctl_bin 2>/dev/null)"; then
     set +e
     if [ "$mode" = "show" ]; then
-      out="$("$ctl" --timeout 5 idle status 2>/dev/null)"
+      out="$("$ctl" --timeout 5 idle status 2>&1)"
     else
-      out="$("$ctl" --timeout 250 idle mode "$mode" 2>/dev/null)"
+      out="$("$ctl" --timeout 250 idle mode "$mode" 2>&1)"
     fi
     rc=$?
     set -e
@@ -2223,6 +2224,14 @@ mode_cmd() {
       printf '%s\n' "$out" | print_idle_status_json "$json"
       return 0
     fi
+    if [ "$mode" != "show" ]; then
+      printf 'doryd did not apply runtime mode %s: %s\n' "$mode" "${out:-request failed}" >&2
+      return "$rc"
+    fi
+  fi
+  if [ "$mode" != "show" ]; then
+    echo "dorydctl is required to change runtime mode; no setting was changed" >&2
+    return 1
   fi
   args=("$mode")
   [ "$json" -eq 1 ] && args+=(--json)
@@ -2273,9 +2282,22 @@ idle_set_cmd() {
     esac
   done
   [ -n "$key" ] && [ -n "$value" ] || { echo "usage: dory idle set KEY VALUE [--json]" >&2; exit 2; }
+  case "$key" in
+    sleepAfterMinutes)
+      [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -gt 0 ] \
+        || { echo "sleepAfterMinutes expects a positive integer" >&2; return 2; }
+      ;;
+    keepPublishedPortsAwake|keepKubernetesAwake|keepPinnedProjectsAwake|showWakeNotifications)
+      case "$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on|0|false|no|off) ;;
+        *) echo "$key expects on/off (true/false)" >&2; return 2 ;;
+      esac
+      ;;
+    *) echo "unknown idle policy key: $key" >&2; return 2 ;;
+  esac
   if ctl="$(dorydctl_bin 2>/dev/null)"; then
     set +e
-    out="$("$ctl" --timeout 5 idle set "$key" "$value" 2>/dev/null)"
+    out="$("$ctl" --timeout 5 idle set "$key" "$value" 2>&1)"
     rc=$?
     set -e
     if [ "$rc" -eq 0 ] && [ -n "$out" ]; then
@@ -2297,10 +2319,11 @@ print("Keep Kubernetes awake: {}".format(policy.get("keepKubernetesAwake")))
       fi
       return 0
     fi
+    printf 'doryd did not apply idle policy %s: %s\n' "$key" "${out:-request failed}" >&2
+    return "$rc"
   fi
-  args=(set "$key" "$value")
-  [ "$json" -eq 1 ] && args+=(--json)
-  doctor_cmd idle "${args[@]}"
+  echo "dorydctl is required to change idle policy; no setting was changed" >&2
+  return 1
 }
 
 engine_cmd() {

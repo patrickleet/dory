@@ -97,8 +97,6 @@ public final class IdlePolicyStore: @unchecked Sendable {
 
     private let lock = NSLock()
     private let configPath: String
-    private let statePath: String
-    private let historyPath: String
     private let kubeconfigPath: String
     private let dockerContainers: @Sendable () -> DockerContainerList
 
@@ -108,11 +106,6 @@ public final class IdlePolicyStore: @unchecked Sendable {
         dockerContainers: @escaping @Sendable () -> DockerContainerList = { .ok([]) }
     ) {
         self.configPath = (environment["DORY_CONFIG"] ?? "\(home)/.dory/config.json").expandedTilde
-        self.statePath = (environment["DORY_IDLE_STATE"] ?? "\(home)/.dory/idle-state.json").expandedTilde
-        self.historyPath = URL(fileURLWithPath: statePath)
-            .deletingLastPathComponent()
-            .appendingPathComponent("idle-history.jsonl")
-            .path
         self.kubeconfigPath = (environment["DORY_KUBECONFIG"] ?? "\(home)/.kube/dory-config").expandedTilde
         self.dockerContainers = dockerContainers
     }
@@ -172,32 +165,12 @@ public final class IdlePolicyStore: @unchecked Sendable {
             ),
             "can_sleep": snapshot.blockers.isEmpty,
             "blockers": snapshot.blockers,
-            "proxy_state": readProxyState(),
             "policy": snapshot.policy.xpcDictionary,
         ] as NSDictionary
     }
 
     public func canSleepNow() -> Bool {
         currentSnapshot().blockers.isEmpty
-    }
-
-    public func history(limit: Int) -> NSArray {
-        let effectiveLimit = max(0, limit)
-        guard effectiveLimit > 0,
-              let text = try? String(contentsOfFile: historyPath, encoding: .utf8) else {
-            return []
-        }
-        let records = text
-            .split(whereSeparator: \.isNewline)
-            .compactMap { line -> NSDictionary? in
-                guard let data = String(line).data(using: .utf8),
-                      let object = try? JSONSerialization.jsonObject(with: data),
-                      let dictionary = Self.plistDictionary(object) else {
-                    return nil
-                }
-                return dictionary
-            }
-        return Array(records.suffix(effectiveLimit)) as NSArray
     }
 
     @discardableResult
@@ -412,32 +385,6 @@ public final class IdlePolicyStore: @unchecked Sendable {
 
     private func policy(from config: [String: Any]) -> DoryIdlePolicy {
         DoryIdlePolicy(dictionary: config["idle"] as? [String: Any] ?? defaultIdlePolicy())
-    }
-
-    private func readProxyState() -> NSDictionary {
-        guard FileManager.default.fileExists(atPath: statePath) else {
-            return [
-                "available": false,
-                "path": statePath,
-                "state": "unknown",
-                "detail": "doryd has not written idle state yet",
-            ] as NSDictionary
-        }
-        do {
-            let data = try Data(contentsOf: URL(fileURLWithPath: statePath))
-            let object = try JSONSerialization.jsonObject(with: data)
-            var dictionary = Self.plistDictionary(object) as? [String: Any] ?? [:]
-            dictionary["available"] = true
-            dictionary["path"] = dictionary["path"] ?? statePath
-            return dictionary as NSDictionary
-        } catch {
-            return [
-                "available": false,
-                "path": statePath,
-                "state": "unknown",
-                "detail": "could not read state: \(error)",
-            ] as NSDictionary
-        }
     }
 
     private func defaultConfig() -> [String: Any] {

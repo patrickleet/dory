@@ -2498,50 +2498,50 @@ final class AppStore {
         guard mode != runtimeMode, !idlePolicyBusy else { return }
         idlePolicyBusy = true
         defer { idlePolicyBusy = false }
-        let previousMode = runtimeMode
-        runtimeMode = mode
-        if let status = try? await dorydClient.idleSetMode(mode) {
+        do {
+            let status = try await dorydClient.idleSetMode(mode)
             applyIdleStatus(status)
-            await confirmRuntimeModeApplied(status.mode)
+            await confirmRuntimeModeApplied(status)
             return
-        }
-        guard !dorydEngineRequired else {
-            runtimeMode = previousMode
-            showSettingsFailure("doryd is unavailable; idle mode was not changed.")
-            await loadIdlePolicy()
-            return
+        } catch {
+            if dorydEngineRequired {
+                showSettingsFailure("doryd did not apply the idle mode: \(error)")
+                await loadIdlePolicy()
+                return
+            }
         }
         let result = await HealthDiagnostics.runControl(["idle", "mode", mode])
         if !result.ok {
-            runtimeMode = previousMode
             showSettingsFailure(result.output.isEmpty ? "Idle mode was not changed." : result.output)
             await loadIdlePolicy()
             return
         }
         await loadIdlePolicy()
-        await confirmRuntimeModeApplied(runtimeMode)
+        if let status = try? await dorydClient.idleStatus() {
+            await confirmRuntimeModeApplied(status)
+        } else {
+            showSettingsSuccess("\(Self.runtimeModeLabel(runtimeMode)) applied.")
+        }
     }
 
     func setIdleSleepAfter(_ minutes: Int) async {
         guard minutes != idlePolicy.sleepAfterMinutes, !idlePolicyBusy else { return }
         idlePolicyBusy = true
         defer { idlePolicyBusy = false }
-        let previousPolicy = idlePolicy
-        idlePolicy.sleepAfterMinutes = minutes
-        if let status = try? await dorydClient.idleSetPolicy(key: "sleepAfterMinutes", value: String(minutes)) {
+        do {
+            let status = try await dorydClient.idleSetPolicy(key: "sleepAfterMinutes", value: String(minutes))
             applyIdleStatus(status)
             showSettingsSuccess("Idle sleep now waits \(minutes) minute\(minutes == 1 ? "" : "s").")
             return
-        }
-        guard !dorydEngineRequired else {
-            idlePolicy = previousPolicy
-            showSettingsFailure("doryd is unavailable; idle policy was not changed.")
-            await loadIdlePolicy()
-            return
+        } catch {
+            if dorydEngineRequired {
+                showSettingsFailure("doryd did not apply the idle policy: \(error)")
+                await loadIdlePolicy()
+                return
+            }
         }
         let result = await HealthDiagnostics.runControl(["idle", "set", "sleepAfterMinutes", String(minutes)])
         if !result.ok {
-            idlePolicy = previousPolicy
             showSettingsFailure(result.output.isEmpty ? "Idle policy was not changed." : result.output)
             await loadIdlePolicy()
             return
@@ -2554,15 +2554,17 @@ final class AppStore {
         guard !idlePolicyBusy else { return }
         idlePolicyBusy = true
         defer { idlePolicyBusy = false }
-        if let status = try? await dorydClient.idleSetPolicy(key: key, value: on ? "on" : "off") {
+        do {
+            let status = try await dorydClient.idleSetPolicy(key: key, value: on ? "on" : "off")
             applyIdleStatus(status)
             showSettingsSuccess("\(Self.idlePolicyLabel(key)) \(on ? "enabled" : "disabled").")
             return
-        }
-        guard !dorydEngineRequired else {
-            showSettingsFailure("doryd is unavailable; idle policy was not changed.")
-            await loadIdlePolicy()
-            return
+        } catch {
+            if dorydEngineRequired {
+                showSettingsFailure("doryd did not apply the idle policy: \(error)")
+                await loadIdlePolicy()
+                return
+            }
         }
         let result = await HealthDiagnostics.runControl(["idle", "set", key, on ? "on" : "off"])
         if !result.ok {
@@ -2580,34 +2582,25 @@ final class AppStore {
         idlePolicyLoaded = true
     }
 
-    private func confirmRuntimeModeApplied(_ mode: String) async {
-        let label = Self.runtimeModeLabel(mode)
-        if let wakeFailure = await promoteDorydEngineIfNeeded(for: mode) {
-            showSettingsFailure("\(label) was saved, but \(wakeFailure)")
-            return
+    private func confirmRuntimeModeApplied(_ status: IdleStatus) async {
+        let label = Self.runtimeModeLabel(status.mode)
+        if runtimeOwnedByDoryd, Self.runtimeModeKeepsEngineAwake(status.mode) {
+            guard status.engineState?.state == "running" else {
+                let detail = status.engineState?.detail ?? "doryd did not return a confirmed engine state"
+                showSettingsFailure("\(label) was not confirmed: \(detail)")
+                return
+            }
+            engineSleeping = false
+            engineRunning = true
+            engineActivity.setSleeping(false)
+            await connectBackend()
+            guard loadState == .ready else {
+                let detail = sharedVMStatus.isEmpty ? "Docker did not answer after the engine started." : sharedVMStatus
+                showSettingsFailure("\(label) was saved, but Docker did not reconnect: \(detail)")
+                return
+            }
         }
         showSettingsSuccess("\(label) applied.")
-    }
-
-    private func promoteDorydEngineIfNeeded(for mode: String) async -> String? {
-        guard runtimeOwnedByDoryd, Self.runtimeModeKeepsEngineAwake(mode) else { return nil }
-        do {
-            let status = try await dorydClient.engineStatus()
-            guard status.state != "running" else {
-                engineSleeping = false
-                engineRunning = true
-                engineActivity.setSleeping(false)
-                return nil
-            }
-            let result = try await dorydClient.engineStart()
-            guard result.ok else {
-                return result.message.isEmpty ? "the engine could not be started." : result.message
-            }
-            await connectBackend()
-            return loadState == .ready ? nil : (sharedVMStatus.isEmpty ? "Docker did not answer after the engine started." : sharedVMStatus)
-        } catch {
-            return "the engine could not be started: \(error)"
-        }
     }
 
     private static func runtimeModeKeepsEngineAwake(_ mode: String) -> Bool {

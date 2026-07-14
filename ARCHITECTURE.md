@@ -56,6 +56,19 @@ Docker reachability is a product invariant, not a benchmark convenience.
 - The app-bundled `dory` command controls the engine only through `dorydctl`. The old app-owned
   socket fallback is not a recovery path; the headless archive uses its own `dory-engine` command.
 
+## Diagnostics and Recovery Contract
+
+- doryd idle status combines persisted policy with the live `DockerTier` owner and state. App and
+  primary CLI status must not infer engine health from standalone proxy files.
+- Engine lifecycle history comes from confirmed doryd transitions. Swift and CLI incident writers
+  share one cross-process lock, reject linked/foreign files, retain the newest 500 records, and read
+  only a bounded tail.
+- App and CLI mode/policy changes publish only doryd-confirmed state. A daemon rejection or timeout
+  must surface its attributed error and must not fall back to writing the requested value directly.
+- A recovery action succeeds only after its target is restored or verified. User-facing actions use
+  installed `dory` commands, preserve workloads by default, and require explicit consent for an
+  engine restart or other disruptive operation.
+
 ## Regression Guards
 
 Keep tests around these boundaries:

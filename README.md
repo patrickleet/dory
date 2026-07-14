@@ -103,13 +103,16 @@
   and oversized logs; it only changes state with `--apply`, and volume cleanup is opt-in.
 - `dory repair` offers non-destructive socket, context, DNS, route, domain, port, dockerd, engine,
   and guest-agent recovery actions before users reach for a full reset. `dory repair all --apply`
-  only touches subsystems that are actually unhealthy.
+  only touches subsystems that are actually unhealthy, and a repair cannot report success while
+  its target remains unavailable.
 - `dory support bundle` writes one redacted diagnostic zip and prints the path to attach to a
   GitHub issue; `dory logs collect` is the same support-safe collection flow for users who think
   in logs first.
 - `dory mode` and `dory idle status` control daemon-owned Auto-Idle. `doryd` keeps the Docker socket
   available while the heavy engine sleeps, coalesces concurrent wake requests, records blockers and
   every sleep/wake transition, and stops only after the configured policy proves the engine idle.
+  Status reports the live doryd-owned engine rather than a cached proxy file; rejected settings stay
+  unchanged in both the app and CLI.
 - The Health screen explains why Dory is awake, shows the incident timeline, and exposes bounded
   in-place repairs for DNS, domains, routes, published ports, and the guest agent. A workload-aware
   engine restart is separate and explicit.
