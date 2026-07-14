@@ -1724,6 +1724,8 @@ for required in (
     'args:       ["uninstall"]',
 ):
     assert required in cask, f"Homebrew cask omits lifecycle cleanup: {required}"
+assert 'Application Support/com.pythonxi.Dory' not in cask, \
+    "Homebrew cask retains an obsolete pre-release Application Support path"
 sparkle_step = "scripts/sparkle-install-relaunch-gate.sh"
 assert sparkle_step in release, "public release never exercises the real Sparkle installer"
 assert 'scripts/release-candidate-live-smoke.sh "${{ steps.sparkle_candidate.outputs.app }}"' not in release, \

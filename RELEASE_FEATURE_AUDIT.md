@@ -52,9 +52,9 @@ of scope so each fix remains reviewable.
 - [ ] Sparkle replaces and relaunches the prior app, preserves user data/settings, validates the
   complete installed tree, and uses a same-team atomic replacement with a verified fallback
   restoration path.
-- [ ] Ordinary uninstall removes the app/runtime integration but preserves the selected Dory drive;
+- [x] Ordinary uninstall removes the app/runtime integration but preserves the selected Dory drive;
   explicit zap/reset behavior is unambiguous and tested.
-- [ ] Packaging scripts, workflows, Homebrew tap, README, appcast, and release notes agree.
+- [x] Packaging scripts, workflows, Homebrew tap, README, appcast, and release notes agree.
 - [ ] Exact-candidate evidence is retained for both install paths and the real Sparkle path.
 
 ## 2. App onboarding, daemon lifecycle, and durable drive

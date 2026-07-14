@@ -32,7 +32,6 @@ cask "dory" do
   # data-drive authority, images, containers, volumes, networks, machines, or other workload data.
   zap trash: [
     "~/.dory",
-    "~/Library/Application Support/com.pythonxi.Dory",
     "~/Library/Preferences/com.pythonxi.Dory.plist",
   ]
 
