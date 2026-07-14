@@ -221,6 +221,26 @@ struct HostFSTests {
         #expect(file.attributes.isRegularFile)
     }
 
+    @Test func hiddenNamesCannotBeBypassedWithCaseVariants() throws {
+        let root = try TestHostFSRoot()
+        try FileManager.default.createDirectory(
+            at: root.url.appendingPathComponent(".SSH"),
+            withIntermediateDirectories: false
+        )
+        try root.write("PRIVATE KEY", to: ".SSH/id_rsa")
+        let fs = try HostFS(rootPath: root.url.path, hiddenNames: [".ssh"])
+
+        #expect(try fs.readdirplus(nodeID: HostFS.rootNodeID).isEmpty)
+        #expect(throws: HostFSError.notFound(".SSH")) {
+            _ = try fs.lookup(parent: HostFS.rootNodeID, name: ".SSH")
+        }
+        #expect(throws: HostFSError.notFound(".SsH")) {
+            _ = try fs.mkdir(parent: HostFS.rootNodeID, name: ".SsH")
+        }
+        #expect(fs.invalidationSnapshot(forHostPath: root.realPath + "/.SSH") == nil)
+        #expect(FileManager.default.fileExists(atPath: root.url.appendingPathComponent(".SSH/id_rsa").path))
+    }
+
     @Test func hiddenNamesRejectMutationsBeforeHostChanges() throws {
         let root = try TestHostFSRoot()
         try root.write("keep", to: ".env")

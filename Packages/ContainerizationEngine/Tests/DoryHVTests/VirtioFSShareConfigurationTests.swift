@@ -31,6 +31,18 @@ struct VirtioFSShareConfigurationTests {
         #expect(throws: (any Error).self) {
             _ = try VirtioFSShareConfiguration(argument: "empty=")
         }
+        for argument in [
+            "relative=project",
+            "root=/",
+            "traversal=/Users/example/../outside",
+            "trailing=/Users/example/",
+            "double=/Users//example",
+            "nul=/Users/example\0outside",
+        ] {
+            #expect(throws: (any Error).self) {
+                _ = try VirtioFSShareConfiguration(argument: argument)
+            }
+        }
     }
 
     @Test func defaultsToDaxDisabled() throws {
@@ -90,8 +102,39 @@ struct VirtioFSShareConfigurationTests {
     }
 
     @Test func rejectsRelativeGuestMountPoint() {
-        #expect(throws: (any Error).self) {
-            _ = try VirtioFSShareConfiguration(argument: "home=/Users/example:at=relative/path")
+        for mountPoint in [
+            "relative/path",
+            "/",
+            "/workspace/../etc",
+            "/workspace/",
+            "/workspace//src",
+            "/workspace\0outside",
+        ] {
+            #expect(throws: (any Error).self) {
+                _ = try VirtioFSShareConfiguration(
+                    argument: "home=/Users/example:at=\(mountPoint)"
+                )
+            }
+        }
+    }
+
+    @Test func rejectsInvalidHiddenNameComponents() {
+        for hiddenName in ["", ".", "..", "parent/child", "secret\0outside"] {
+            #expect(throws: (any Error).self) {
+                _ = try VirtioFSShareConfiguration(
+                    tag: "home",
+                    path: "/Users/example",
+                    hiddenNames: [hiddenName]
+                )
+            }
+        }
+
+        for option in ["hide=", "hide=.env,", "hide=,.env"] {
+            #expect(throws: (any Error).self) {
+                _ = try VirtioFSShareConfiguration(
+                    argument: "home=/Users/example:\(option)"
+                )
+            }
         }
     }
 

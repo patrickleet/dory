@@ -39,11 +39,21 @@ public struct VirtioFSShareConfiguration: Equatable, Sendable {
         guard tag.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "." || $0 == "_" || $0 == "-" }) else {
             throw VMError.invalidConfiguration("virtio-fs share tag must contain only letters, numbers, '.', '_', or '-'")
         }
-        guard !path.isEmpty else {
-            throw VMError.invalidConfiguration("virtio-fs share \(tag) has an empty host path")
+        guard Self.isCanonicalAbsolutePath(path), path != "/" else {
+            throw VMError.invalidConfiguration(
+                "virtio-fs share \(tag) host path must be a canonical absolute path below '/': \(path)"
+            )
         }
-        if let guestMountPoint, !guestMountPoint.hasPrefix("/") {
-            throw VMError.invalidConfiguration("virtio-fs share \(tag) guest mount point must be absolute: \(guestMountPoint)")
+        if let guestMountPoint,
+           (!Self.isCanonicalAbsolutePath(guestMountPoint) || guestMountPoint == "/") {
+            throw VMError.invalidConfiguration(
+                "virtio-fs share \(tag) guest mount point must be a canonical absolute path below '/': \(guestMountPoint)"
+            )
+        }
+        guard hiddenNames.allSatisfy(Self.isValidHiddenName) else {
+            throw VMError.invalidConfiguration(
+                "virtio-fs share \(tag) hidden names must be individual path components"
+            )
         }
         guard !dax else {
             throw VMError.invalidConfiguration(Self.daxUnsupportedReason)
@@ -78,7 +88,11 @@ public struct VirtioFSShareConfiguration: Equatable, Sendable {
             case let option where option.hasPrefix("at="):
                 guestMountPoint = String(option.dropFirst(3))
             case let option where option.hasPrefix("hide="):
-                hiddenNames.formUnion(option.dropFirst(5).split(separator: ",").map(String.init))
+                let names = option.dropFirst(5).split(separator: ",", omittingEmptySubsequences: false)
+                guard !names.isEmpty, names.allSatisfy({ !$0.isEmpty }) else {
+                    throw VMError.invalidConfiguration("virtio-fs share \(tag) hide option must name one or more path components")
+                }
+                hiddenNames.formUnion(names.map(String.init))
             default:
                 throw VMError.invalidConfiguration("unknown virtio-fs share option ':\(option)' (expected ro, rw, safe, hide=a,b, or at=/guest/path)")
             }
@@ -119,6 +133,17 @@ public struct VirtioFSShareConfiguration: Equatable, Sendable {
         let leftPrefix = left == "/" ? "/" : left + "/"
         let rightPrefix = right == "/" ? "/" : right + "/"
         return left.hasPrefix(rightPrefix) || right.hasPrefix(leftPrefix)
+    }
+
+    private static func isCanonicalAbsolutePath(_ path: String) -> Bool {
+        path.hasPrefix("/")
+            && !path.utf8.contains(0)
+            && URL(fileURLWithPath: path).standardizedFileURL.path == path
+    }
+
+    private static func isValidHiddenName(_ name: String) -> Bool {
+        !name.isEmpty && name != "." && name != ".."
+            && !name.contains("/") && !name.utf8.contains(0)
     }
 
     public func makeBackend(daxGuestBase _: UInt64? = nil, requestQueueCount: Int? = nil) throws -> VirtioFS {

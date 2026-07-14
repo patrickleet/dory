@@ -180,16 +180,29 @@ of scope so each fix remains reviewable.
 
 ## 5. Host filesystem sharing and bind mounts
 
-- [ ] Path lookup, replacement, symlinks, hard links, permissions, virtual UID/GID, read-only mounts,
+- [x] Path lookup, replacement, symlinks, hard links, permissions, virtual UID/GID, read-only mounts,
   nested binds, anonymous child volumes, special files, and unsupported mount options are correct.
-- [ ] Host-to-guest and guest-to-host coherence, inotify/FSEvents recovery, overflow, sleep/wake,
+- [x] Host-to-guest and guest-to-host coherence, inotify/FSEvents recovery, overflow, sleep/wake,
   atomic replacement, restrictive modes, and project-root observation are correct.
-- [ ] POSIX range locks and BSD `flock` implement independent-owner conflict, blocking, interrupt,
+- [x] POSIX range locks and BSD `flock` implement independent-owner conflict, blocking, interrupt,
   conversion, unlock, process-death, release, and connection-reset semantics.
-- [ ] No whole-home/whole-`/Volumes` watcher, descriptor leak, unbounded queue, blocking FIFO lookup,
+- [x] No whole-home/whole-`/Volumes` watcher, descriptor leak, unbounded queue, blocking FIFO lookup,
   DAX bypass, or stale response publication path remains.
-- [ ] Internal and physical external APFS drive behavior has focused coverage; physical disconnect,
+- [x] Internal and physical external APFS drive behavior has focused coverage; physical disconnect,
   reconnect, capacity, and endurance proof remains explicitly separate.
+  Local source evidence: HostFS uses contained non-following descriptor operations, pinned inode
+  identities, virtual ownership, bounded invalidation queues, fail-stop response publication, and
+  independent Darwin open descriptions for Linux locks. Share configuration now rejects relative,
+  root-overlay, non-canonical, NUL-containing, or malformed hidden-name inputs before backend
+  construction. The sensitive-name policy is case-insensitive across lookup, enumeration, mutation,
+  and host-event mapping, so case-insensitive APFS cannot resolve `.SSH` around a `.ssh` denylist.
+  Production arms only accessed top-level FSEvents roots, rejects DAX and blocking special files,
+  and preserves nested-bind and anonymous-volume precedence. The complete 505-test engine package,
+  82 focused HostFS/configuration tests, 9 guest watcher tests, offline live-hostshare harness, and
+  competitor release gate pass. Current-source live evidence already covers atomic replacement,
+  restrictive modes, inotify, hard links, nested mounts, FIFO fail-fast, and 10,000 operations with
+  no FD growth. A writable external APFS device is not attached to this Mac, so physical removal,
+  reconnection, ownership, and endurance remain an explicit external qualification gate.
 - [ ] Exact-candidate bind, lock, 10,000-operation FD, and long-soak evidence is retained.
 
 ## 6. Container networking, domains, ports, and recovery

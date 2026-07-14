@@ -228,7 +228,9 @@ public final class HostFS: @unchecked Sendable {
     /// Entry names hidden from the guest at any depth. A lookup of a hidden name fails as if the
     /// path does not exist, hidden entries are omitted from directory listings, and entry-creating
     /// or entry-removing operations reject hidden names before touching the host.
-    private let hiddenNames: Set<String>
+    /// Compare case-insensitively so the denylist cannot be bypassed through a case-insensitive
+    /// APFS lookup such as `.SSH` resolving the host's `.ssh` directory.
+    private let hiddenNameKeys: Set<String>
     private var nextNodeID: UInt64 = 2
     private var nodes: [UInt64: Node] = [:]
     private var idsByFileKey: [FileKey: Set<UInt64>] = [:]
@@ -287,7 +289,7 @@ public final class HostFS: @unchecked Sendable {
         self.guestUID = guestUID
         self.guestGID = guestGID
         self.readOnly = readOnly
-        self.hiddenNames = hiddenNames
+        self.hiddenNameKeys = Set(hiddenNames.map(Self.hiddenNameKey))
 
         var st = stat()
         guard fstat(fd, &st) == 0 else {
@@ -686,7 +688,7 @@ public final class HostFS: @unchecked Sendable {
         }
         guard let relativePath,
               !relativePath.split(separator: "/").contains(where: {
-                  hiddenNames.contains(String($0))
+                  isHiddenName(String($0))
               }) else {
             return nil
         }
@@ -1842,7 +1844,7 @@ public final class HostFS: @unchecked Sendable {
             let name = withUnsafeBytes(of: entry.pointee.d_name) { bytes in
                 String(decoding: bytes.prefix(length), as: UTF8.self)
             }
-            if name != ".", name != "..", !hiddenNames.contains(name) {
+            if name != ".", name != "..", !isHiddenName(name) {
                 names.append(name)
             }
             errno = 0
@@ -2042,9 +2044,17 @@ public final class HostFS: @unchecked Sendable {
     }
 
     private func requireVisible(_ name: String) throws {
-        guard !hiddenNames.contains(name) else {
+        guard !isHiddenName(name) else {
             throw HostFSError.notFound(name)
         }
+    }
+
+    private func isHiddenName(_ name: String) -> Bool {
+        hiddenNameKeys.contains(Self.hiddenNameKey(name))
+    }
+
+    private static func hiddenNameKey(_ name: String) -> String {
+        name.lowercased()
     }
 
     private func detach(
