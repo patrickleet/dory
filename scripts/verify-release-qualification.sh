@@ -109,6 +109,12 @@ grep -qx 'status=PASS' "$growth_summary" \
   && grep -qx 'discard_reclaim=PASS' "$growth_summary" \
   && grep -qx 'boot_trim_evidence=PASS' "$growth_summary" \
   && grep -qx 'named_volume_restart_persistence=PASS' "$growth_summary" \
+  && grep -qx 'capacity_api=PASS' "$growth_summary" \
+  && grep -qx 'running_growth_rejected=PASS' "$growth_summary" \
+  && grep -qx 'forced_offline_check=PASS' "$growth_summary" \
+  && grep -qx 'guest_resize_evidence=PASS' "$growth_summary" \
+  && grep -qx 'explicit_capacity_growth=PASS' "$growth_summary" \
+  && grep -qx 'explicit_growth_named_volume_persistence=PASS' "$growth_summary" \
   || die "retained data-disk growth evidence is not release qualifying"
 
 drive_summary="$(single_evidence_file managed-data-drive summary.txt)"

@@ -488,7 +488,10 @@ public enum DoryVZConfigurationBuilder {
             "        echo \"DORY: /dev/vdb ext4 already spans its block device\" >/var/log/dory-data-resize.log",
             "        DORY_DATA_GROW_STATUS=0",
             "      else",
-            "        e2fsck -p /dev/vdb >/var/log/dory-data-resize.log 2>&1",
+            // A clean flag alone is insufficient after ext4 has been mounted since its last check;
+            // resize2fs refuses growth until a forced offline preen completes.
+            "        echo e2fsck_mode=forced-preen >/var/log/dory-data-resize.log",
+            "        e2fsck -f -p /dev/vdb >>/var/log/dory-data-resize.log 2>&1",
             "        DORY_E2FSCK_STATUS=$?",
             "        if [ \"$DORY_E2FSCK_STATUS\" -gt 1 ] || ! resize2fs /dev/vdb >>/var/log/dory-data-resize.log 2>&1; then DORY_DATA_GROW_STATUS=2; else DORY_DATA_GROW_STATUS=0; fi",
             "      fi",

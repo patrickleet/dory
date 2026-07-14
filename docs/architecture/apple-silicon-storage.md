@@ -90,9 +90,14 @@ old and new drive identities, publishes the selection, restarts the same validat
 and confirms XPC readiness. A standalone engine holding either drive makes the switch fail closed.
 
 The Docker filesystem is a bounded sparse file, not an 8 TiB promise. The launch default is a
-128 GiB logical ceiling with explicit user-controlled growth/cap changes. Guest discard maps to
-APFS hole punching, and graceful shutdown runs sync, unmount, and trim before the VM exits. UI and
-doctor report physical allocation separately from logical capacity.
+128 GiB logical ceiling. Settings and `dory data grow GIB` can increase it monotonically to 2 TiB;
+out-of-range and shrink requests fail before the engine is interrupted. The CLI captures the exact
+running-container set, stops the engine, grows under the drive lease, restarts the engine, and
+starts only that captured set. Guest ext4 expands on the next boot. Guest discard maps to APFS hole
+punching. Before an actual resize, the unmounted filesystem receives a forced `e2fsck` preen;
+unsafe repair results fail boot, and the engine startup deadline bounds the check. Graceful shutdown
+runs sync, unmount, and trim before the VM exits. Settings and `dory data capacity` report physical
+allocation separately from logical capacity.
 
 Raw sparse images are an implementation detail, not the backup format. OrbStack currently warns
 users to delete or tar its 8 TiB image before Migration Assistant, and its tracker contains both a

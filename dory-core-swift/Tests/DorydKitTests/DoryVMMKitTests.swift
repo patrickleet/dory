@@ -212,7 +212,7 @@ final class DoryVMMKitTests: XCTestCase {
         XCTAssertTrue(bootScript.contains("dumpe2fs -h /dev/vdb"))
         XCTAssertTrue(bootScript.contains("ext4 already spans its block device"))
         XCTAssertTrue(bootScript.contains("DORY_DATA_FS_BYTES + DORY_DATA_FS_BLOCK_SIZE"))
-        XCTAssertTrue(bootScript.contains("e2fsck -p /dev/vdb"))
+        XCTAssertTrue(bootScript.contains("e2fsck -f -p /dev/vdb"))
         XCTAssertTrue(bootScript.contains("resize2fs /dev/vdb"))
         XCTAssertTrue(bootScript.contains("mkfs.ext4 -F"))
         XCTAssertTrue(bootScript.contains("DORY_ALLOW_DATA_FORMAT=0"))
@@ -347,6 +347,7 @@ final class DoryVMMKitTests: XCTestCase {
         ext4[1024 + 0x38] = 0x53
         ext4[1024 + 0x39] = 0xEF
         try ext4.write(to: URL(fileURLWithPath: dataDisk))
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: dataDisk)
 
         _ = try DoryVZConfigurationBuilder.makeConfiguration(
             spec: DoryVZMachineSpec(

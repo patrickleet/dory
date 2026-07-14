@@ -65,9 +65,12 @@ of scope so each fix remains reviewable.
   `ARCHITECTURE.md` with no competing lifecycle owner.
 - [ ] Always-on, manual, auto-idle, and battery-saver start/wake/sleep behavior is deterministic,
   including concurrent cold-wake clients, app quit/relaunch, daemon crash, and host restart.
-- [ ] The selected `.dorydrive` is the sole durable workload store; transient runtime replacement,
+- [x] The selected `.dorydrive` is the sole durable workload store; transient runtime replacement,
   lock contention, missing/replaced drives, permissions, capacity, grow, trim, and relocation fail
   safely without formatting or shadow data.
+  Local source evidence: managed-drive and APFS identity gates passed; a real VM preserved a named
+  volume across sparse 16 -> 128 -> 256 GiB growth, rejected live growth under the drive lease,
+  forced an offline ext4 preen before resize, and published resize/trim evidence.
 - [ ] App/CLI status, health, repair, logs, and errors identify the failing owner and offer a bounded
   recovery action without reporting requested state as applied state.
 - [ ] Clean install, persistence, crash recovery, uninstall-preserves-data, and alternate-drive

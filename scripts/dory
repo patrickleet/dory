@@ -130,6 +130,8 @@ dory — Dory CLI
                                Restore to a new verified drive without replacing existing data
   dory data use <target.dorydrive>
                                Select a restored drive with the same durable drive identity
+  dory data capacity [--json]  Show Docker disk logical capacity and physical allocation
+  dory data grow GIB [--json]  Grow Docker storage safely (128–2048 GiB; shrinking is refused)
   dory agent guide [--json|--text]
                                Emit a versioned CLI capability map for coding agents
   dory mcp serve [--read-only]
@@ -2437,7 +2439,7 @@ absolute_cli_path() {
 }
 
 data_cmd() {
-  local action="${1:-path}" helper source archive target output
+  local action="${1:-path}" helper source archive target capacity output json=0
   [ "$#" -eq 0 ] || shift
   helper="$(hv_helper || true)"
   [ -n "$helper" ] || {
@@ -2480,14 +2482,153 @@ data_cmd() {
       target="$(absolute_cli_path "$1")"
       select_data_drive "$helper" "$target"
       ;;
+    capacity)
+      if [ "${1:-}" = "--json" ]; then json=1; shift; fi
+      [ "$#" -eq 0 ] || { echo "usage: dory data capacity [--json]" >&2; exit 2; }
+      output="$("$helper" data-drive capacity)"
+      if [ "$json" -eq 1 ]; then printf '%s\n' "$output"; else format_data_drive_capacity "$output"; fi
+      ;;
+    grow)
+      [ "$#" -ge 1 ] || { echo "usage: dory data grow <capacity-gib> [--json]" >&2; exit 2; }
+      capacity="$1"
+      shift
+      if [ "${1:-}" = "--json" ]; then json=1; shift; fi
+      [ "$#" -eq 0 ] || { echo "usage: dory data grow <capacity-gib> [--json]" >&2; exit 2; }
+      output="$(grow_data_drive "$helper" "$capacity")"
+      if [ "$json" -eq 1 ]; then printf '%s\n' "$output"; else format_data_drive_capacity "$output"; fi
+      ;;
     -h|--help|help)
-      echo "usage: dory data path|backup|verify|restore|use ..."
+      echo "usage: dory data path|backup|verify|restore|use|capacity|grow ..."
       ;;
     *)
-      echo "usage: dory data path|backup|verify|restore|use ..." >&2
+      echo "usage: dory data path|backup|verify|restore|use|capacity|grow ..." >&2
       exit 2
       ;;
   esac
+}
+
+format_data_drive_capacity() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+usage = json.loads(sys.argv[1])
+state = "initialized" if usage["initialized"] else "default before first start"
+print(
+    f'Docker storage: {usage["capacityGiB"]} GiB logical capacity, '
+    f'{usage["allocatedBytes"] / (1024 ** 3):.2f} GiB physically allocated ({state}).'
+)
+print(
+    f'Supported growth range: {usage["minimumCapacityGiB"]}–'
+    f'{usage["maximumCapacityGiB"]} GiB. Shrinking is intentionally refused.'
+)
+PY
+}
+
+restart_after_data_grow() {
+  local ctl="$1" running_ids="$2" cid failures=""
+  if ! "$ctl" --timeout 250 engine start >/dev/null; then
+    echo "Dory could not restart the engine after changing Docker storage capacity." >&2
+    return 1
+  fi
+  while IFS= read -r cid; do
+    [ -n "$cid" ] || continue
+    case "$cid" in *[!0-9a-f]*) failures="$failures $cid"; continue ;; esac
+    "$DOCKER_BIN" -H "unix://$DORY_SOCK" start "$cid" >/dev/null 2>&1 \
+      || failures="$failures $cid"
+  done <<< "$running_ids"
+  if [ -n "$failures" ]; then
+    echo "These previously running containers did not restart after the engine came back:$failures" >&2
+    return 1
+  fi
+}
+
+grow_data_drive() {
+  local helper="$1" requested="$2" ctl="" status="" state="" running_ids=""
+  local current minimum maximum capacity_json
+  local stopped=0 output rc restart_rc=0
+  case "$requested" in ''|*[!0-9]*) echo "Docker storage capacity must be an integer GiB value." >&2; return 2 ;; esac
+
+  capacity_json="$("$helper" data-drive capacity)" || return $?
+  read -r current minimum maximum <<EOF
+$(python3 - "$capacity_json" <<'PY'
+import json
+import sys
+
+usage = json.loads(sys.argv[1])
+print(usage["capacityGiB"], usage["minimumCapacityGiB"], usage["maximumCapacityGiB"])
+PY
+)
+EOF
+  [ -n "$current" ] || return 1
+  if [ "$requested" -lt "$minimum" ] || [ "$requested" -gt "$maximum" ]; then
+    echo "Docker storage capacity must be between $minimum and $maximum GiB." >&2
+    return 2
+  fi
+  if [ "$requested" -lt "$current" ]; then
+    echo "Docker storage shrinking is not supported ($current GiB to $requested GiB). Back up and restore into a new drive instead." >&2
+    return 2
+  fi
+  if [ "$requested" -eq "$current" ]; then
+    printf '%s\n' "$capacity_json"
+    return 0
+  fi
+
+  if ctl="$(dorydctl_bin 2>/dev/null)" \
+      && status="$("$ctl" --timeout 5 engine status 2>/dev/null)"; then
+    state="$(python3 - "$status" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1]).get("state", ""))
+PY
+)" || return 1
+    case "$state" in
+      running)
+        running_ids="$("$DOCKER_BIN" -H "unix://$DORY_SOCK" ps -q)" || {
+          echo "Dory could not verify running containers, so Docker storage was not changed." >&2
+          return 1
+        }
+        ;;
+      stopped|sleeping|failed) ;;
+      starting)
+        echo "Dory's engine is still starting; wait for it to become ready before changing Docker storage." >&2
+        return 1
+        ;;
+      *)
+        echo "Dory reported an unrecognized engine state ('$state'), so Docker storage was not changed." >&2
+        return 1
+        ;;
+    esac
+    case "$state" in
+      running)
+        echo "Stopping Dory's Docker engine before growing its data disk…" >&2
+        "$ctl" --timeout 250 engine stop >/dev/null || {
+          echo "Dory could not stop the Docker engine safely; storage was not changed." >&2
+          return 1
+        }
+        stopped=1
+        ;;
+    esac
+  else
+    ctl=""
+  fi
+
+  set +e
+  output="$("$helper" data-drive grow "$requested" 2>&1)"
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    if [ "$stopped" -eq 1 ]; then
+      restart_after_data_grow "$ctl" "$running_ids" || restart_rc=$?
+    fi
+    printf '%s\n' "$output" >&2
+    [ "$restart_rc" -eq 0 ] || return "$restart_rc"
+    return "$rc"
+  fi
+
+  if [ "$stopped" -eq 1 ]; then
+    restart_after_data_grow "$ctl" "$running_ids" || return $?
+  fi
+  printf '%s\n' "$output"
 }
 
 select_data_drive() {

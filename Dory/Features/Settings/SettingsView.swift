@@ -634,6 +634,7 @@ struct SettingsView: View {
         let url: URL
         let title: String
         let isReady: Bool
+        let dockerUsage: DockerDataDiskUsage?
         let problem: String?
     }
 
@@ -647,6 +648,7 @@ struct SettingsView: View {
                     url: URL(fileURLWithPath: selected.root),
                     title: "Managed drive ready",
                     isReady: true,
+                    dockerUsage: try DockerDataDisk.usage(at: selected.engineDataDiskPath),
                     problem: nil
                 )
             }
@@ -657,6 +659,7 @@ struct SettingsView: View {
                     url: URL(fileURLWithPath: drive.root),
                     title: "Managed drive initializes on first start",
                     isReady: false,
+                    dockerUsage: nil,
                     problem: nil
                 )
             case .ready:
@@ -665,6 +668,7 @@ struct SettingsView: View {
                     url: URL(fileURLWithPath: drive.root),
                     title: "Managed drive needs explicit selection",
                     isReady: false,
+                    dockerUsage: nil,
                     problem: error.description
                 )
             }
@@ -676,6 +680,7 @@ struct SettingsView: View {
                 url: URL(fileURLWithPath: fallback).standardizedFileURL,
                 title: "Managed drive unavailable",
                 isReady: false,
+                dockerUsage: nil,
                 problem: String(describing: error)
             )
         }
@@ -717,6 +722,40 @@ struct SettingsView: View {
                     .foregroundStyle(p.red)
                     .textSelection(.enabled)
             }
+            if let usage = presentation.dockerUsage {
+                Divider().overlay(p.border)
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Docker storage")
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(p.text)
+                        Text("\(usage.capacityGiB) GiB capacity • \(physicalSize(usage.allocatedBytes)) on this Mac")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(p.text3)
+                            .monospacedDigit()
+                    }
+                    Spacer(minLength: 0)
+                    if growthOptions(after: usage.capacityGiB).isEmpty {
+                        Text("Maximum capacity")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundStyle(p.text3)
+                    } else {
+                        Menu("Grow…") {
+                            ForEach(growthOptions(after: usage.capacityGiB), id: \.self) { capacityGiB in
+                                Button("\(capacityGiB) GiB") {
+                                    Task { await store.growDockerDataDisk(toGiB: capacityGiB) }
+                                }
+                            }
+                        }
+                        .disabled(store.engineSettingChangeBusy || !store.dorydRuntimeActive)
+                        .accessibilityIdentifier("grow-docker-storage")
+                    }
+                }
+                Text("Capacity is a sparse logical ceiling, not reserved Mac storage. Dory allocates physical space only as data is written. Growth is safe and automatic; shrinking is intentionally refused.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(p.text3)
+                    .lineSpacing(3)
+            }
             Text("Images, containers, named volumes, machine disks, snapshots, and backups live together here. Runtime sockets and replaceable logs remain in ~/.dory.")
                 .font(.system(size: 11.5))
                 .foregroundStyle(p.text2)
@@ -726,6 +765,14 @@ struct SettingsView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(p.bgElevated, in: RoundedRectangle(cornerRadius: 11))
         .overlay(RoundedRectangle(cornerRadius: 11).strokeBorder(p.border))
+    }
+
+    private func growthOptions(after capacityGiB: Int) -> [Int] {
+        [256, 512, 1_024, 2_048].filter { $0 > capacityGiB }
+    }
+
+    private func physicalSize(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .binary)
     }
 
     private func resourceMeter(_ label: String, _ value: String, _ fraction: Double) -> some View {

@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 import XCTest
-@testable import DoryCore
+@testable import DoryOperations
 
 final class DockerDataDiskTests: XCTestCase {
     func testCreatesSparseBlankDiskOnFirstLaunch() throws {
@@ -32,7 +32,7 @@ final class DockerDataDiskTests: XCTestCase {
         defer { try? FileManager.default.removeItem(atPath: root) }
         let destination = root + "/docker-data.ext4"
         let original = Data(repeating: 0xA5, count: 4096)
-        try original.write(to: URL(fileURLWithPath: destination))
+        try writePrivate(original, to: destination)
 
         XCTAssertThrowsError(
             try DockerDataDisk.prepare(
@@ -53,6 +53,7 @@ final class DockerDataDiskTests: XCTestCase {
         defer { try? FileManager.default.removeItem(atPath: root) }
         let destination = root + "/docker-data.ext4"
         FileManager.default.createFile(atPath: destination, contents: nil)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination)
         let descriptor = open(destination, O_RDWR | O_CLOEXEC)
         XCTAssertGreaterThanOrEqual(descriptor, 0)
         XCTAssertEqual(ftruncate(descriptor, 8 * 1024 * 1024), 0)
@@ -74,7 +75,7 @@ final class DockerDataDiskTests: XCTestCase {
         defer { try? FileManager.default.removeItem(atPath: root) }
         let destination = root + "/docker-data.ext4"
         let invalid = ext4Fixture(fileBytes: 4096, declaredBlocks: 0, logBlockSize: 0)
-        try invalid.write(to: URL(fileURLWithPath: destination))
+        try writePrivate(invalid, to: destination)
 
         XCTAssertThrowsError(
             try DockerDataDisk.prepare(
@@ -91,8 +92,10 @@ final class DockerDataDiskTests: XCTestCase {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(atPath: root) }
         let destination = root + "/docker-data.ext4"
-        try ext4Fixture(fileBytes: 4 * 1024 * 1024, declaredBlocks: 4096, logBlockSize: 1)
-            .write(to: URL(fileURLWithPath: destination))
+        try writePrivate(
+            ext4Fixture(fileBytes: 4 * 1024 * 1024, declaredBlocks: 4096, logBlockSize: 1),
+            to: destination
+        )
 
         XCTAssertEqual(try DockerDataDisk.expectedExt4ImageBytes(at: destination), 8 * 1024 * 1024)
         XCTAssertThrowsError(
@@ -113,8 +116,10 @@ final class DockerDataDiskTests: XCTestCase {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(atPath: root) }
         let destination = root + "/docker-data.ext4"
-        try ext4Fixture(fileBytes: 8 * 1024 * 1024, declaredBlocks: 4096, logBlockSize: 1)
-            .write(to: URL(fileURLWithPath: destination))
+        try writePrivate(
+            ext4Fixture(fileBytes: 8 * 1024 * 1024, declaredBlocks: 4096, logBlockSize: 1),
+            to: destination
+        )
 
         XCTAssertEqual(
             try DockerDataDisk.prepare(
@@ -129,8 +134,10 @@ final class DockerDataDiskTests: XCTestCase {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(atPath: root) }
         let destination = root + "/docker-data.ext4"
-        try ext4Fixture(fileBytes: 8 * 1024 * 1024, declaredBlocks: 4096, logBlockSize: 1)
-            .write(to: URL(fileURLWithPath: destination))
+        try writePrivate(
+            ext4Fixture(fileBytes: 8 * 1024 * 1024, declaredBlocks: 4096, logBlockSize: 1),
+            to: destination
+        )
 
         XCTAssertEqual(
             try DockerDataDisk.prepare(
@@ -146,6 +153,104 @@ final class DockerDataDiskTests: XCTestCase {
 
     func testProductionBlankDiskUsesLargeSparseLogicalCapacity() {
         XCTAssertEqual(DockerDataDisk.blankDiskBytes, 128 * 1024 * 1024 * 1024)
+        XCTAssertEqual(DockerDataDisk.minimumCapacityGiB, 128)
+        XCTAssertEqual(DockerDataDisk.maximumCapacityGiB, 2_048)
+    }
+
+    func testUsageReportsDefaultWithoutCreatingDiskAndExplicitGrowthStaysSparse() throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let destination = root + "/state/docker-data.ext4"
+
+        XCTAssertEqual(
+            try DockerDataDisk.usage(at: destination),
+            DockerDataDiskUsage(
+                initialized: false,
+                logicalBytes: DockerDataDisk.blankDiskBytes,
+                allocatedBytes: 0,
+                capacityGiB: 128,
+                minimumCapacityGiB: 128,
+                maximumCapacityGiB: 2_048
+            )
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination))
+
+        let grown = try DockerDataDisk.grow(destination: destination, capacityGiB: 256)
+        XCTAssertTrue(grown.initialized)
+        XCTAssertEqual(grown.logicalBytes, 256 * DockerDataDisk.bytesPerGiB)
+        XCTAssertEqual(grown.capacityGiB, 256)
+        XCTAssertLessThan(grown.allocatedBytes, grown.logicalBytes)
+    }
+
+    func testExplicitGrowthRejectsShrinkAndOutOfBoundsCapacityWithoutMutation() throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let destination = root + "/docker-data.ext4"
+        _ = try DockerDataDisk.grow(destination: destination, capacityGiB: 256)
+
+        XCTAssertThrowsError(try DockerDataDisk.grow(destination: destination, capacityGiB: 128)) {
+            guard case .shrinkUnsupported = $0 as? DockerDataDiskError else {
+                return XCTFail("unexpected error: \($0)")
+            }
+        }
+        XCTAssertThrowsError(try DockerDataDisk.grow(destination: destination, capacityGiB: 4_096)) {
+            XCTAssertEqual(
+                $0 as? DockerDataDiskError,
+                .invalidCapacityGiB(requested: 4_096, minimum: 128, maximum: 2_048)
+            )
+        }
+        XCTAssertEqual(try DockerDataDisk.usage(at: destination).capacityGiB, 256)
+    }
+
+    func testRejectsSymlinkHardLinkAndPublicDiskFiles() throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let target = root + "/target"
+        try writePrivate(Data(), to: target)
+
+        let symlink = root + "/symlink.ext4"
+        try FileManager.default.createSymbolicLink(atPath: symlink, withDestinationPath: target)
+        XCTAssertThrowsError(try DockerDataDisk.usage(at: symlink)) {
+            XCTAssertEqual($0 as? DockerDataDiskError, .unsafeExistingDisk(symlink))
+        }
+
+        let hardLink = root + "/hardlink.ext4"
+        try FileManager.default.linkItem(atPath: target, toPath: hardLink)
+        XCTAssertThrowsError(try DockerDataDisk.usage(at: hardLink)) {
+            XCTAssertEqual($0 as? DockerDataDiskError, .unsafeExistingDisk(hardLink))
+        }
+
+        try FileManager.default.removeItem(atPath: hardLink)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: target)
+        XCTAssertThrowsError(try DockerDataDisk.usage(at: target)) {
+            XCTAssertEqual($0 as? DockerDataDiskError, .unsafeExistingDisk(target))
+        }
+    }
+
+    func testUsageRejectsAllocatedNonExt4AndTruncatedExt4Images() throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let invalid = root + "/invalid.ext4"
+        try writePrivate(Data(repeating: 0xA5, count: 4096), to: invalid)
+        XCTAssertThrowsError(try DockerDataDisk.usage(at: invalid)) {
+            XCTAssertEqual($0 as? DockerDataDiskError, .invalidExistingDisk(invalid))
+        }
+
+        let truncated = root + "/truncated.ext4"
+        try writePrivate(
+            ext4Fixture(fileBytes: 4 * 1024 * 1024, declaredBlocks: 4096, logBlockSize: 1),
+            to: truncated
+        )
+        XCTAssertThrowsError(try DockerDataDisk.usage(at: truncated)) {
+            XCTAssertEqual(
+                $0 as? DockerDataDiskError,
+                .truncatedDisk(
+                    path: truncated,
+                    actualBytes: 4 * 1024 * 1024,
+                    expectedBytes: 8 * 1024 * 1024
+                )
+            )
+        }
     }
 
     private func ext4Fixture(fileBytes: Int, declaredBlocks: UInt32, logBlockSize: UInt32) -> Data {
@@ -162,6 +267,11 @@ final class DockerDataDiskTests: XCTestCase {
         data[offset + 1] = UInt8(truncatingIfNeeded: value >> 8)
         data[offset + 2] = UInt8(truncatingIfNeeded: value >> 16)
         data[offset + 3] = UInt8(truncatingIfNeeded: value >> 24)
+    }
+
+    private func writePrivate(_ data: Data, to path: String) throws {
+        try data.write(to: URL(fileURLWithPath: path))
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
     }
 
     private func temporaryRoot() -> String {

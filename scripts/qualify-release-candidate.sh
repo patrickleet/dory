@@ -490,7 +490,7 @@ bounded 900 scripts/data-disk-growth-gate.sh \
   --image "$IMAGE" \
   --workroot "$WORKDIR/evidence/data-disk-growth" \
   > "$WORKDIR/evidence/data-disk-growth.log" 2>&1 \
-  || die "16→128 GiB growth/sparse-trim/persistence gate failed"
+  || die "16→128→256 GiB growth/sparse-trim/persistence gate failed"
 growth_summary="$(find "$WORKDIR/evidence/data-disk-growth" -name summary.txt -type f -print -quit)"
 [ -s "$growth_summary" ] || die "data-disk growth summary is missing"
 grep -qx 'status=PASS' "$growth_summary" || die "data-disk growth summary is not PASS"
@@ -500,6 +500,18 @@ grep -qx 'discard_reclaim=PASS' "$growth_summary" \
   || die "data-disk growth did not reclaim deleted blocks"
 grep -qx 'named_volume_restart_persistence=PASS' "$growth_summary" \
   || die "data-disk growth lost named-volume data across restart"
+grep -qx 'capacity_api=PASS' "$growth_summary" \
+  || die "data-disk growth did not expose truthful capacity metadata"
+grep -qx 'running_growth_rejected=PASS' "$growth_summary" \
+  || die "data-disk growth bypassed the running-drive lease"
+grep -qx 'forced_offline_check=PASS' "$growth_summary" \
+  || die "data-disk growth skipped the required offline filesystem check"
+grep -qx 'guest_resize_evidence=PASS' "$growth_summary" \
+  || die "data-disk growth did not retain guest resize evidence"
+grep -qx 'explicit_capacity_growth=PASS' "$growth_summary" \
+  || die "explicit Docker capacity growth failed"
+grep -qx 'explicit_growth_named_volume_persistence=PASS' "$growth_summary" \
+  || die "explicit Docker capacity growth lost named-volume data"
 
 ENGINE_STARTED=0
 MIGRATION_SOURCE_STARTED=0

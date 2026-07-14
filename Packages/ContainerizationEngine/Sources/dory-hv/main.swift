@@ -213,7 +213,7 @@ guard let command = arguments.first else {
 switch command {
 case "data-drive":
     guard arguments.count >= 2 else {
-        fail("usage: dory-hv data-drive <resolve|prepare|id|selected-path|select|bind-existing|recover-existing|backup|verify-backup|restore> [paths]")
+        fail("usage: dory-hv data-drive <resolve|prepare|id|selected-path|select|bind-existing|recover-existing|capacity|grow|backup|verify-backup|restore> [paths]")
     }
     let operation = arguments[1]
     do {
@@ -263,6 +263,34 @@ case "data-drive":
             let drive = try DoryDataDrive(home: home, overrideRoot: arguments[2])
             try drive.validateManifest()
             print(try drive.readManifest().id.uuidString.lowercased())
+        case "capacity", "grow":
+            let store = try DoryDataDriveSelectionStore(home: home)
+            guard let drive = try store.inspectSelection() else {
+                fail("no Dory data drive is selected")
+            }
+            let usage: DockerDataDiskUsage
+            if operation == "capacity" {
+                guard arguments.count == 2 else {
+                    fail("usage: dory-hv data-drive capacity")
+                }
+                usage = try DockerDataDisk.usage(at: drive.engineDataDiskPath)
+            } else {
+                guard arguments.count == 3, let capacityGiB = Int(arguments[2]) else {
+                    fail("usage: dory-hv data-drive grow <capacity-gib>")
+                }
+                let driveLock = try EngineStateDirectoryLock(
+                    stateDirectory: drive.root,
+                    lockFileName: "drive.lock"
+                )
+                defer { withExtendedLifetime(driveLock) {} }
+                usage = try DockerDataDisk.grow(
+                    destination: drive.engineDataDiskPath,
+                    capacityGiB: capacityGiB
+                )
+            }
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            print(String(decoding: try encoder.encode(usage), as: UTF8.self))
         case "backup":
             guard arguments.count == 4 else {
                 fail("usage: dory-hv data-drive backup <source.dorydrive> <archive.dorybackup>")
@@ -290,7 +318,7 @@ case "data-drive":
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             print(String(decoding: try encoder.encode(result), as: UTF8.self))
         default:
-            fail("usage: dory-hv data-drive <resolve|prepare|id|selected-path|select|bind-existing|recover-existing|backup|verify-backup|restore> [paths]")
+            fail("usage: dory-hv data-drive <resolve|prepare|id|selected-path|select|bind-existing|recover-existing|capacity|grow|backup|verify-backup|restore> [paths]")
         }
     } catch {
         fail("data-drive \(operation) failed: \(error)")

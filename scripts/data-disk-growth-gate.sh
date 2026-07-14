@@ -121,6 +121,7 @@ HOME="$RUNTIME_HOME" "$RUNTIME/bin/dory-hv" data-drive select "$DATA_DRIVE" \
   >"$EVIDENCE/data-drive-select.txt"
 dd if=/dev/zero of="$DISK" bs=1m count=1024 >/dev/null 2>&1
 truncate -s 16g "$DISK"
+chmod 600 "$DISK"
 "$MKE2FS" -q -F -t ext4 -E nodiscard "$DISK"
 BEFORE_LOGICAL="$(stat -f '%z' "$DISK")"
 BEFORE_ALLOCATED="$(( $(stat -f '%b' "$DISK") * 512 ))"
@@ -187,6 +188,83 @@ MIN_LOGICAL=$((128 * 1024 * 1024 * 1024))
   echo "data-disk growth gate: boot-time fstrim did not reclaim the preallocated seed ($BEFORE_ALLOCATED -> $AFTER_ALLOCATED)" >&2
   exit 1
 }
+
+# Exercise the public capacity control after proving default growth and trim. Inspection is safe
+# while the VM owns the drive, but mutation must fail until that attachment releases its lease.
+HOME="$RUNTIME_HOME" "$RUNTIME/bin/dory-hv" data-drive capacity \
+  >"$EVIDENCE/capacity-running.json"
+if HOME="$RUNTIME_HOME" "$RUNTIME/bin/dory-hv" data-drive grow 256 \
+  >"$EVIDENCE/running-growth.out" 2>"$EVIDENCE/running-growth.err"; then
+  echo "data-disk growth gate: helper grew a disk still attached to the running VM" >&2
+  exit 1
+fi
+HOME="$RUNTIME_HOME" "$RUNTIME/dory-engine" stop >"$EVIDENCE/user-growth-stop.log" 2>&1
+HOME="$RUNTIME_HOME" "$RUNTIME/bin/dory-hv" data-drive capacity \
+  >"$EVIDENCE/capacity-before.json"
+HOME="$RUNTIME_HOME" "$RUNTIME/bin/dory-hv" data-drive grow 256 \
+  >"$EVIDENCE/capacity-grown.json"
+python3 - "$EVIDENCE/capacity-before.json" "$EVIDENCE/capacity-grown.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    before = json.load(handle)
+with open(sys.argv[2], encoding="utf-8") as handle:
+    grown = json.load(handle)
+assert before["capacityGiB"] == 128
+assert before["initialized"] is True
+assert grown["capacityGiB"] == 256
+assert grown["logicalBytes"] == 256 * 1024**3
+assert grown["allocatedBytes"] < grown["logicalBytes"]
+assert grown["minimumCapacityGiB"] == 128
+assert grown["maximumCapacityGiB"] == 2048
+PY
+USER_START_BEGIN="$(date +%s)"
+HOME="$RUNTIME_HOME" "$RUNTIME/dory-engine" start --data-drive "$DATA_DRIVE" \
+  >"$EVIDENCE/user-growth-start.log" 2>&1
+USER_START_SECONDS=$(( $(date +%s) - USER_START_BEGIN ))
+[ "$USER_START_SECONDS" -le 60 ] || {
+  echo "data-disk growth gate: explicit 256 GiB growth boot took $USER_START_SECONDS seconds" >&2
+  exit 1
+}
+RESIZE_LOG="$STATE/hv/guest-logs/data-resize.log"
+[ -s "$RESIZE_LOG" ] || {
+  echo "data-disk growth gate: guest did not publish explicit growth evidence" >&2
+  exit 1
+}
+cp "$RESIZE_LOG" "$EVIDENCE/data-resize.log"
+grep -qx 'e2fsck_mode=forced-preen' "$RESIZE_LOG" || {
+  echo "data-disk growth gate: explicit growth did not use a forced offline preen" >&2
+  exit 1
+}
+grep -Fq 'resize2fs' "$RESIZE_LOG" || {
+  echo "data-disk growth gate: explicit growth log does not contain resize2fs evidence" >&2
+  exit 1
+}
+USER_GUEST_KIB="$(DOCKER_HOST="unix://$SOCKET" "$DOCKER" run --rm --privileged -v /:/host "$IMAGE" \
+  sh -c "df -Pk /host/var/lib/docker | awk 'NR==2 {print \$2}'")"
+case "$USER_GUEST_KIB" in *[!0-9]*|'') echo "data-disk growth gate: unreadable 256 GiB guest capacity: $USER_GUEST_KIB" >&2; exit 1 ;; esac
+USER_GUEST_BYTES="$((USER_GUEST_KIB * 1024))"
+USER_MIN_BYTES=$((240 * 1024 * 1024 * 1024))
+[ "$USER_GUEST_BYTES" -ge "$USER_MIN_BYTES" ] || {
+  echo "data-disk growth gate: grown guest ext4 capacity is $USER_GUEST_BYTES, expected at least $USER_MIN_BYTES" >&2
+  exit 1
+}
+USER_PERSISTED="$(DOCKER_HOST="unix://$SOCKET" "$DOCKER" run --name "$NAME" --rm -v "$NAME:/data" "$IMAGE" cat /data/marker)"
+[ "$USER_PERSISTED" = "$MARKER" ] || {
+  echo "data-disk growth gate: named-volume marker changed after explicit capacity growth" >&2
+  exit 1
+}
+USER_LOGICAL="$(stat -f '%z' "$DISK")"
+USER_ALLOCATED="$(( $(stat -f '%b' "$DISK") * 512 ))"
+[ "$USER_LOGICAL" -eq $((256 * 1024 * 1024 * 1024)) ] || {
+  echo "data-disk growth gate: host disk is $USER_LOGICAL bytes after explicit growth" >&2
+  exit 1
+}
+[ "$USER_ALLOCATED" -lt "$USER_LOGICAL" ] || {
+  echo "data-disk growth gate: explicit growth eagerly allocated $USER_ALLOCATED of $USER_LOGICAL bytes" >&2
+  exit 1
+}
 cat >"$EVIDENCE/summary.txt" <<EOF
 status=PASS
 runtime=$RUNTIME
@@ -204,5 +282,16 @@ boot_trim_evidence=PASS
 guest_ext4_bytes=$GUEST_BYTES
 minimum_guest_bytes=$MIN_BYTES
 named_volume_restart_persistence=PASS
+capacity_api=PASS
+running_growth_rejected=PASS
+forced_offline_check=PASS
+guest_resize_evidence=PASS
+explicit_capacity_growth=PASS
+explicit_growth_start_seconds=$USER_START_SECONDS
+explicit_growth_logical_bytes=$USER_LOGICAL
+explicit_growth_allocated_bytes=$USER_ALLOCATED
+explicit_growth_guest_ext4_bytes=$USER_GUEST_BYTES
+explicit_growth_minimum_guest_bytes=$USER_MIN_BYTES
+explicit_growth_named_volume_persistence=PASS
 EOF
 echo "data-disk growth gate: PASS ($EVIDENCE/summary.txt)"

@@ -80,6 +80,11 @@ if ! bash scripts/test-data-drive-backup.sh; then
   exit 1
 fi
 
+if ! bash scripts/test-data-drive-capacity.sh; then
+  echo "ci-test: data-drive capacity lifecycle tests failed" >&2
+  exit 1
+fi
+
 if ! bash scripts/test-competitor-release-gates.sh; then
   echo "ci-test: competitor-derived release gate tests failed" >&2
   exit 1

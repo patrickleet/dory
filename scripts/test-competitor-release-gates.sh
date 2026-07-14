@@ -544,11 +544,11 @@ for required_recipe in \
   grep -F -- "$required_recipe" MACHINE_IMAGE_CONTRACT.md >/dev/null \
     || fail "the public supported machine-image recipe lost: $required_recipe"
 done
-grep -F '128 * 1024 * 1024 * 1024' dory-core-swift/Sources/DoryCore/DockerDataDisk.swift >/dev/null \
+grep -F '128 * 1024 * 1024 * 1024' dory-core-swift/Sources/DoryOperations/DockerDataDisk.swift >/dev/null \
   || fail "the shared Docker data disk regressed below the sparse 128 GiB release capacity"
-grep -F 'invalidExistingDisk' dory-core-swift/Sources/DoryCore/DockerDataDisk.swift >/dev/null \
+grep -F 'invalidExistingDisk' dory-core-swift/Sources/DoryOperations/DockerDataDisk.swift >/dev/null \
   || fail "an existing allocated non-ext4 Docker disk can reach first-boot formatting instead of failing closed"
-grep -F 'expectedExt4ImageBytes(at: destination) != nil' dory-core-swift/Sources/DoryCore/DockerDataDisk.swift >/dev/null \
+grep -F 'expectedExt4ImageBytes(at: destination) != nil' dory-core-swift/Sources/DoryOperations/DockerDataDisk.swift >/dev/null \
   || fail "an ext4-magic file with invalid geometry can be enlarged before corruption is rejected"
 grep -F 'engineDiskUsableBytes: Int64 = 120 * 1024 * 1024 * 1024' Dory/Runtime/MigrationAssistant.swift >/dev/null \
   || fail "migration admission trusts sparse logical length instead of the guest-proven ext4 capacity"
@@ -598,6 +598,8 @@ for resize_source in \
   guest/initfs/init; do
   grep -F 'blockdev --getsize64 /dev/vdb' "$resize_source" >/dev/null \
     || fail "Docker data resize still runs without a device/filesystem geometry guard in $resize_source"
+  grep -F 'e2fsck -f -p /dev/vdb' "$resize_source" >/dev/null \
+    || fail "Docker data resize can run without the forced offline preen required after prior mounts in $resize_source"
 done
 grep -F 'sparse_allocation=PASS' scripts/data-disk-growth-gate.sh >/dev/null \
   || fail "the data-disk growth gate does not prove 128 GiB remains sparsely allocated on the host"
@@ -609,6 +611,12 @@ grep -F 'home="$HOME/.dcs-$$-$cycle"' scripts/headless-cold-start-soak.sh >/dev/
   || fail "the cold-start gate can exceed the macOS Unix socket path limit"
 grep -F 'discard_reclaim=PASS' scripts/data-disk-growth-gate.sh >/dev/null \
   || fail "the data-disk growth gate does not prove deleted ext4 blocks are returned to the host"
+grep -F 'explicit_capacity_growth=PASS' scripts/data-disk-growth-gate.sh >/dev/null \
+  || fail "the data-disk growth gate does not prove the user-controlled 256 GiB path"
+grep -F 'data-drive grow 256' scripts/data-disk-growth-gate.sh >/dev/null \
+  || fail "the data-disk growth gate bypasses the public capacity helper"
+grep -F 'running_growth_rejected=PASS' scripts/data-disk-growth-gate.sh >/dev/null \
+  || fail "the data-disk growth gate does not prove running-drive mutation is rejected"
 grep -F 'guard discardEnabled else { return .unsupported }' Packages/ContainerizationEngine/Sources/DoryHV/VirtioBlk.swift >/dev/null \
   || fail "virtio-blk accepts discard/write-zeroes requests while the feature is disabled"
 grep -F 'segmentEntries <= Int(Discard.maxSegments) - entryCount' Packages/ContainerizationEngine/Sources/DoryHV/VirtioBlk.swift >/dev/null \

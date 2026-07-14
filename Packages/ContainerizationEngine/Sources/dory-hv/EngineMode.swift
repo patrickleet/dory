@@ -848,12 +848,16 @@ enum EngineMode {
             "  DORY_DATA_FS_BYTES=$((DORY_DATA_FS_BLOCKS * DORY_DATA_FS_BLOCK_SIZE))",
             "  [ \"$DORY_DATA_FS_BYTES\" -le \"$DORY_DATA_DEVICE_BYTES\" ] || { echo ext4 geometry exceeds block device >/var/log/dory-data-resize.log; return 2; }",
             "  if [ $((DORY_DATA_FS_BYTES + DORY_DATA_FS_BLOCK_SIZE)) -gt \"$DORY_DATA_DEVICE_BYTES\" ]; then echo ext4 already spans block device >/var/log/dory-data-resize.log; return 0; fi",
-            "  e2fsck -p /dev/vdb >/var/log/dory-data-resize.log 2>&1",
+            // resize2fs requires a forced offline check after the filesystem has been mounted since
+            // its previous check. Preen still limits repairs to changes e2fsck considers safe.
+            "  echo e2fsck_mode=forced-preen >/var/log/dory-data-resize.log",
+            "  e2fsck -f -p /dev/vdb >>/var/log/dory-data-resize.log 2>&1",
             "  DORY_E2FSCK_STATUS=$?; [ $DORY_E2FSCK_STATUS -le 1 ] || return $DORY_E2FSCK_STATUS",
             "  resize2fs /dev/vdb >>/var/log/dory-data-resize.log 2>&1",
             "}",
             "if blkid /dev/vdb 2>/dev/null | grep -q 'TYPE=\"ext4\"'; then",
             "  dory_grow_docker_data || { echo DATA-DISK-RESIZE-FAILED; cat /var/log/dory-data-resize.log 2>/dev/null; sync; poweroff -f; exit 1; }",
+            "  cp /var/log/dory-data-resize.log /mnt/dory-logs/data-resize.log 2>/dev/null || true",
             "  dory_mount_docker_data || { echo DATA-DISK-MOUNT-FAILED-EXISTING-EXT4; sync; poweroff -f; exit 1; }",
             "elif [ \"$DORY_ALLOW_DATA_FORMAT\" -eq 1 ]; then",
             "  echo DATA-DISK-FORMAT-PROVEN-BLANK",

@@ -53,6 +53,9 @@
   Dory remembers the selected drive outside that cache and binds external drives to their APFS
   volume UUID, so a renamed volume is rediscovered while a missing or same-name replacement volume
   fails closed instead of producing a fresh empty Docker store.
+  Docker storage starts at a sparse 128 GiB logical capacity and can grow safely to 2 TiB from
+  Settings or with `dory data grow GIB`; `dory data capacity` reports logical capacity separately
+  from physical Mac storage. Dory refuses shrinking instead of risking an ext4 truncation.
   Homebrew uninstall and `--zap` also preserve the data drive, so removing the app is never an
   implicit request to erase containers or volumes. To move `DORY_DATA_DRIVE` outside Dory's
   Application Support directory, it must be a `.dorydrive` on mounted local APFS storage under
@@ -168,8 +171,9 @@
   failed adoption restores the original empty volume metadata. Non-empty or attached conflicts
   remain blocked. Dory never pauses source workloads implicitly: a running container with writable
   volume or container-layer changes must be stopped or paused by the user before its data is copied,
-  preventing torn database and filesystem snapshots. Sparse engine disks grow to 128 GiB and use virtio
-  discard at boot/shutdown to return deleted ext4 blocks to macOS before capacity admission.
+  preventing torn database and filesystem snapshots. Sparse engine disks default to 128 GiB, can
+  grow explicitly to 2 TiB, and use virtio discard at boot/shutdown to return deleted ext4 blocks
+  to macOS before capacity admission.
 - **Managed settings** exposes local, MDM-friendly defaults for engine route, domains, DNS/proxy
   ports, Auto-Idle, file sharing, scoped mounts, credential-store hiding, env allow-list, and
   telemetry mode `none`.

@@ -89,7 +89,10 @@ if [ -b /dev/vdb ]; then
         if [ "$DORY_DATA_FS_BYTES" -gt "$DORY_DATA_DEVICE_BYTES" ]; then
           DORY_DATA_GROW_STATUS=2
         elif [ $((DORY_DATA_FS_BYTES + DORY_DATA_FS_BLOCK_SIZE)) -le "$DORY_DATA_DEVICE_BYTES" ]; then
-          e2fsck -p /dev/vdb >/var/log/dory-data-resize.log 2>&1
+          # resize2fs requires a forced offline check after this ext4 filesystem has been mounted.
+          # Preen still refuses repairs that require operator judgment.
+          echo 'e2fsck_mode=forced-preen' >/var/log/dory-data-resize.log
+          e2fsck -f -p /dev/vdb >>/var/log/dory-data-resize.log 2>&1
           status=$?
           if [ "$status" -gt 1 ] || ! resize2fs /dev/vdb >>/var/log/dory-data-resize.log 2>&1; then
             DORY_DATA_GROW_STATUS=2

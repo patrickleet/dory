@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 
 public enum DoryDataDriveSelectionError: Error, Sendable, Equatable, CustomStringConvertible {
+    case noSelection(String)
     case invalidRecord(String)
     case uninitializedDrive(String)
     case unselectedExistingDrive(String)
@@ -13,6 +14,8 @@ public enum DoryDataDriveSelectionError: Error, Sendable, Equatable, CustomStrin
 
     public var description: String {
         switch self {
+        case let .noSelection(path):
+            return "no Dory data drive is selected (selection record: \(path))"
         case let .invalidRecord(path):
             return "Dory selected-drive record is invalid: \(path)"
         case let .uninitializedDrive(path):

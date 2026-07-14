@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import DoryOperations
 import Observation
 import ServiceManagement
 import UniformTypeIdentifiers
@@ -158,6 +159,7 @@ final class AppStore {
     @ObservationIgnored private var runtimeOwnedByDoryd = false
     @ObservationIgnored private var daemonSocketPath: String?
     @ObservationIgnored private var engineSettingChangeInFlight = false
+    var engineSettingChangeBusy: Bool { engineSettingChangeInFlight }
     var runtimeKind: RuntimeKind { runtime.kind }
 
     init(
@@ -950,6 +952,103 @@ final class AppStore {
         await connectBackend()
     }
 
+    /// Grows Dory's sparse Docker data disk while the daemon is stopped, then restores exactly the
+    /// containers that were running. Capacity inspection and rejected/no-op requests never stop the
+    /// engine, and shrinking is refused because safely shrinking ext4 requires a separate workflow.
+    func growDockerDataDisk(toGiB capacityGiB: Int) async {
+        guard !engineSettingChangeInFlight else {
+            showSettingsFailure("Another engine change is still being applied.")
+            return
+        }
+        guard dorydEngineEnabled, enginePreference == .dory else {
+            showSettingsFailure("Switch to Dory's daemon engine before changing its Docker storage capacity.")
+            return
+        }
+        engineSettingChangeInFlight = true
+        defer { engineSettingChangeInFlight = false }
+
+        let home = environment["HOME"] ?? NSHomeDirectory()
+        let current: DockerDataDiskUsage
+        do {
+            current = try await Task.detached {
+                try Self.selectedDockerDataDiskUsage(home: home)
+            }.value
+        } catch {
+            showSettingsFailure("Docker storage could not be inspected safely: \(error)")
+            return
+        }
+        guard (current.minimumCapacityGiB...current.maximumCapacityGiB).contains(capacityGiB) else {
+            showSettingsFailure(
+                "Docker storage must be between \(current.minimumCapacityGiB) and \(current.maximumCapacityGiB) GiB."
+            )
+            return
+        }
+        guard capacityGiB >= current.capacityGiB else {
+            showSettingsFailure(
+                "Docker storage cannot be shrunk from \(current.capacityGiB) to \(capacityGiB) GiB. Back up and restore into a new drive instead."
+            )
+            return
+        }
+        guard capacityGiB != current.capacityGiB else {
+            showSettingsSuccess("Docker storage is already \(capacityGiB) GiB.")
+            return
+        }
+        guard runtimeOwnedByDoryd, loadState == .ready else {
+            showSettingsFailure("Dory's daemon engine must be ready so running containers can be preserved before growth.")
+            return
+        }
+
+        let runningWorkloads: [EngineSettingWorkload]
+        do {
+            runningWorkloads = try await captureRunningWorkloads()
+        } catch {
+            showSettingsFailure("Docker storage was not changed because running containers could not be verified: \(error)")
+            return
+        }
+        do {
+            let stopped = try await dorydClient.engineStop()
+            guard stopped.ok else {
+                let detail = stopped.message.isEmpty ? "doryd refused to stop the engine safely." : stopped.message
+                let recovery = await recoverDorydRuntimeAndWorkloads(runningWorkloads)
+                showSettingsFailure("Docker storage was not changed: \(detail) \(recovery)")
+                return
+            }
+        } catch {
+            let recovery = await recoverDorydRuntimeAndWorkloads(runningWorkloads)
+            showSettingsFailure("Docker storage was not changed safely: \(error) \(recovery)")
+            return
+        }
+
+        let grown: DockerDataDiskUsage
+        do {
+            grown = try await Task.detached {
+                try Self.growSelectedDockerDataDisk(home: home, capacityGiB: capacityGiB)
+            }.value
+        } catch {
+            let recovery = await recoverDorydRuntimeAndWorkloads(runningWorkloads)
+            showSettingsFailure("Docker storage was not changed: \(error) \(recovery)")
+            return
+        }
+
+        prepareForDorydReconnect()
+        await connectBackend()
+        guard runtimeOwnedByDoryd, loadState == .ready else {
+            showSettingsFailure(
+                "Docker storage grew to \(grown.capacityGiB) GiB, but the engine did not reconnect. No additional containers were started."
+            )
+            return
+        }
+        let failures = await restartCapturedWorkloads(runningWorkloads)
+        if failures.isEmpty {
+            showSettingsSuccess("Docker storage grew to \(grown.capacityGiB) GiB and prior workloads were restored.")
+        } else {
+            showSettingsFailure(
+                "Docker storage grew to \(grown.capacityGiB) GiB, but some prior workloads did not restart: "
+                    + Self.workloadFailureSummary(failures)
+            )
+        }
+    }
+
     /// Toggles the FEX x86/amd64 path and restarts the shared engine so the new mode takes effect.
     func setRosettaX86(_ on: Bool) async {
         guard on != rosettaX86Enabled else { return }
@@ -1133,6 +1232,47 @@ final class AppStore {
         }
         return "The previous setting was restored, but some prior workloads did not restart: "
             + Self.workloadFailureSummary(failures)
+    }
+
+    private func recoverDorydRuntimeAndWorkloads(_ workloads: [EngineSettingWorkload]) async -> String {
+        prepareForDorydReconnect()
+        await connectBackend()
+        guard runtimeOwnedByDoryd, loadState == .ready else {
+            return "The engine still needs recovery."
+        }
+        let failures = await restartCapturedWorkloads(workloads)
+        if failures.isEmpty {
+            return "The engine reconnected and prior workloads were restored."
+        }
+        return "The engine reconnected, but some prior workloads did not restart: "
+            + Self.workloadFailureSummary(failures)
+    }
+
+    private nonisolated static func selectedDockerDataDiskUsage(home: String) throws -> DockerDataDiskUsage {
+        let selectionStore = try DoryDataDriveSelectionStore(home: home)
+        guard let drive = try selectionStore.inspectSelection() else {
+            throw DoryDataDriveSelectionError.noSelection(selectionStore.path)
+        }
+        return try DockerDataDisk.usage(at: drive.engineDataDiskPath)
+    }
+
+    private nonisolated static func growSelectedDockerDataDisk(
+        home: String,
+        capacityGiB: Int
+    ) throws -> DockerDataDiskUsage {
+        let selectionStore = try DoryDataDriveSelectionStore(home: home)
+        guard let drive = try selectionStore.inspectSelection() else {
+            throw DoryDataDriveSelectionError.noSelection(selectionStore.path)
+        }
+        let lock = try EngineStateDirectoryLock(
+            stateDirectory: drive.root,
+            lockFileName: "drive.lock"
+        )
+        defer { withExtendedLifetime(lock) {} }
+        return try DockerDataDisk.grow(
+            destination: drive.engineDataDiskPath,
+            capacityGiB: capacityGiB
+        )
     }
 
     /// Docker accepts start for an already-running container (304), so issuing start for every
