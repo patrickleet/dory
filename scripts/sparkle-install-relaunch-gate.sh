@@ -47,8 +47,9 @@ Full execution also requires DORY_RELEASE_CLEAN_USER=1, physical Apple Silicon, 
 assessments enabled, and an account with no Dory process, state, preferences, service, or Docker
 context. The gate creates a lower-build Developer-ID-signed fixture from the exact candidate,
 serves the byte-identical signed archive on loopback, installs it through Sparkle 2.9.4's official
-CLI, proves termination and relaunch with a different PID, verifies the exact SBOM tree and
-Gatekeeper result, restores the fixture, and returns the release account to its initial empty state.
+CLI signed by the candidate's Developer ID team, proves atomic replacement and relaunch with a
+different PID, verifies the exact SBOM tree and Gatekeeper result, restores the qualification
+fixture, and returns the release account to its initial empty state.
 EOF
 }
 
@@ -139,6 +140,10 @@ EXPECTED_APP_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' \
   "$CANDIDATE_APP/Contents/Info.plist")"
 [ "$EXPECTED_APP_VERSION" = "$VERSION" ] || die "candidate marketing version mismatch"
 [ "$EXPECTED_APP_BUILD" = "$BUILD" ] || die "candidate build mismatch"
+if /usr/libexec/PlistBuddy -c 'Print :NSUpdateSecurityPolicy' \
+  "$CANDIDATE_APP/Contents/Info.plist" >/dev/null 2>&1; then
+  die "candidate custom update security policy disables Sparkle's safe atomic replacement"
+fi
 python3 - "$RELEASE_MANIFEST" "$UPDATE_ZIP" "$APPCAST" "$SBOM" \
   "$VERSION" "$BUILD" "$SOURCE_COMMIT" <<'PY'
 import hashlib, json, os, pathlib, sys
@@ -250,6 +255,60 @@ fi
 security find-identity -v -p codesigning \
   | grep -F "$SIGNING_IDENTITY" >/dev/null \
   || die "Developer ID signing identity is unavailable: $SIGNING_IDENTITY"
+CANDIDATE_TEAM="$(codesign -dv --verbose=4 "$CANDIDATE_APP" 2>&1 \
+  | sed -n 's/^TeamIdentifier=//p')"
+[ -n "$CANDIDATE_TEAM" ] || die "candidate app has no Developer ID team identifier"
+"$ROOT/scripts/sign-sparkle-for-distribution.sh" \
+  "$SPARKLE_CLI_APP" "$SIGNING_IDENTITY" \
+  > "$EVIDENCE/sparkle-cli-signing.out" 2> "$EVIDENCE/sparkle-cli-signing.err" \
+  || die "could not sign the Sparkle qualification CLI's nested code"
+codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" \
+  "$SPARKLE_CLI_APP" \
+  >> "$EVIDENCE/sparkle-cli-signing.out" 2>> "$EVIDENCE/sparkle-cli-signing.err" \
+  || die "could not sign the Sparkle qualification CLI"
+"$ROOT/scripts/verify-distribution-signatures.sh" \
+  "$SPARKLE_CLI_APP" "$CANDIDATE_TEAM" \
+  > "$EVIDENCE/sparkle-cli-signature-verification.txt" \
+  || die "Sparkle qualification CLI is not signed entirely by the candidate team"
+SPARKLE_AUTOUPDATE="$SPARKLE_CLI_APP/Contents/Frameworks/Sparkle.framework/Versions/Current/Autoupdate"
+[ -x "$SPARKLE_AUTOUPDATE" ] || die "signed Sparkle Autoupdate helper is missing"
+SPARKLE_CLI_TEAM="$(codesign -dv --verbose=4 "$SPARKLE_CLI_APP" 2>&1 \
+  | sed -n 's/^TeamIdentifier=//p')"
+SPARKLE_AUTOUPDATE_TEAM="$(codesign -dv --verbose=4 "$SPARKLE_AUTOUPDATE" 2>&1 \
+  | sed -n 's/^TeamIdentifier=//p')"
+[ "$SPARKLE_CLI_TEAM" = "$CANDIDATE_TEAM" ] \
+  || die "Sparkle qualification CLI team differs from the candidate team"
+[ "$SPARKLE_AUTOUPDATE_TEAM" = "$CANDIDATE_TEAM" ] \
+  || die "Sparkle Autoupdate team differs from the candidate team"
+SPARKLE_CLI_SHA="$(shasum -a 256 "$SPARKLE_CLI" | awk '{print $1}')"
+SPARKLE_FRAMEWORK_SHA="$(shasum -a 256 \
+  "$SPARKLE_CLI_APP/Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle" | awk '{print $1}')"
+python3 - \
+  "$SPARKLE_SOURCE/Autoupdate/SUPlainInstaller.m" \
+  "$SPARKLE_SOURCE/Sparkle/SUFileManager.m" \
+  "$SPARKLE_SOURCE/Configurations/ConfigCommon.xcconfig" \
+  > "$EVIDENCE/sparkle-install-safety.txt" <<'PY'
+import pathlib
+import sys
+
+installer = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+file_manager = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+configuration = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
+required_installer = (
+    "_canPerformSafeAtomicSwap = (bundleTeamIdentifier == nil || (installerTeamIdentifier != nil && [installerTeamIdentifier isEqualToString:bundleTeamIdentifier]));",
+    "swappedApp = [fileManager swapItemAtURL:installationURL withItemAtURL:newFinalURL error:&swapError];",
+    "[fileManager moveItemAtURL:oldTempURL toURL:oldURL error:NULL];",
+)
+for fragment in required_installer:
+    if fragment not in installer:
+        raise SystemExit(f"pinned Sparkle installer safety contract is absent: {fragment}")
+if "renamex_np(newPath, originalPath, RENAME_SWAP)" not in file_manager:
+    raise SystemExit("pinned Sparkle file manager no longer uses an atomic filesystem swap")
+if "SPARKLE_NORMALIZE_INSTALLED_APPLICATION_NAME = 0" not in configuration:
+    raise SystemExit("pinned Sparkle build unexpectedly normalizes installed application names")
+print("atomic_swap_implementation=PASS")
+print("fallback_restoration_implementation=PASS")
+PY
 
 STATE="$HOME/.dory"
 APP_SUPPORT="$HOME/Library/Application Support/Dory"
@@ -359,8 +418,6 @@ codesign --verify --strict --deep "$INSTALL_APP" \
 [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' \
   "$INSTALL_APP/Contents/Info.plist")" = "$PREVIOUS_BUILD" ] \
   || die "lower-build fixture version did not change"
-CANDIDATE_TEAM="$(codesign -dv --verbose=4 "$CANDIDATE_APP" 2>&1 \
-  | sed -n 's/^TeamIdentifier=//p')"
 PREVIOUS_TEAM="$(codesign -dv --verbose=4 "$INSTALL_APP" 2>&1 \
   | sed -n 's/^TeamIdentifier=//p')"
 [ -n "$CANDIDATE_TEAM" ] && [ "$PREVIOUS_TEAM" = "$CANDIDATE_TEAM" ] \
@@ -425,6 +482,7 @@ kill -0 "$OLD_PID" 2>/dev/null || die "lower-build fixture exited before the upd
 printf '%s\n' "$OLD_PID" > "$EVIDENCE/previous.pid"
 ps -ww -p "$OLD_PID" -o command= > "$EVIDENCE/previous-command.txt"
 
+SPARKLE_LOG_START="$(date -u '+%Y-%m-%d %H:%M:%S+0000')"
 "$SPARKLE_CLI" \
   --application "$INSTALL_APP" \
   --feed-url "$LOCAL_FEED_URL" \
@@ -494,6 +552,14 @@ for message in 'Downloading Update' 'Extracting Update' 'Installing Update' 'Ins
   grep -F "$message" "$EVIDENCE/sparkle-install.err" >/dev/null \
     || die "Sparkle CLI did not report required phase: $message"
 done
+/usr/bin/log show --start "$SPARKLE_LOG_START" --style compact \
+  --predicate 'subsystem == "org.sparkle-project.Sparkle"' \
+  > "$EVIDENCE/sparkle-unified.log" \
+  || die "could not read Sparkle's unified installer log"
+if grep -Eq 'Skipping atomic rename/swap|Invoking fallback from failing to replace original item' \
+  "$EVIDENCE/sparkle-unified.log"; then
+  die "Sparkle did not use the same-team atomic replacement path"
+fi
 
 stop_pid "$NEW_PID"
 NEW_PID=""
@@ -504,10 +570,10 @@ mkdir -p "$(dirname "$UPDATED_BACKUP")"
 mv "$INSTALL_APP" "$UPDATED_BACKUP"
 ditto "$PREVIOUS_BACKUP" "$INSTALL_APP"
 codesign --verify --strict --deep "$INSTALL_APP" \
-  || die "rollback fixture signature is invalid"
+  || die "restored qualification fixture signature is invalid"
 [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' \
   "$INSTALL_APP/Contents/Info.plist")" = "$PREVIOUS_BUILD" ] \
-  || die "rollback did not restore the lower-build fixture"
+  || die "qualification cleanup did not restore the lower-build fixture"
 rm -rf "$INSTALL_ROOT" "$RUN_ROOT/previous" "$RUN_ROOT/updated"
 [ ! -e "$STATE" ] && [ ! -e "$APP_SUPPORT" ] && [ ! -e "$PLIST" ] \
   || die "clean release-user Dory state survived cleanup"
@@ -525,6 +591,8 @@ CLEAN_USER_ARMED=0
   echo status=PASS
   echo release_qualifying=true
   echo "run_id=$RUN_ID"
+  echo "workflow_run_id=${GITHUB_RUN_ID:-local}"
+  echo "workflow_run_attempt=${GITHUB_RUN_ATTEMPT:-local}"
   echo "source_commit=$SOURCE_COMMIT"
   echo "candidate_version=$VERSION"
   echo "candidate_build=$BUILD"
@@ -539,6 +607,9 @@ CLEAN_USER_ARMED=0
   echo "sparkle_revision=$SPARKLE_REVISION"
   echo "sparkle_cli_sha256=$SPARKLE_CLI_SHA"
   echo "sparkle_framework_sha256=$SPARKLE_FRAMEWORK_SHA"
+  echo "candidate_team=$CANDIDATE_TEAM"
+  echo "sparkle_cli_team=$SPARKLE_CLI_TEAM"
+  echo "sparkle_autoupdate_team=$SPARKLE_AUTOUPDATE_TEAM"
   echo "old_pid=$(cat "$EVIDENCE/previous.pid")"
   echo "relaunched_pid=$(cat "$EVIDENCE/relaunched.pid")"
   echo old_process_terminated=PASS
@@ -551,7 +622,9 @@ CLEAN_USER_ARMED=0
   echo installed_gatekeeper=PASS
   echo application_support_preserved=PASS
   echo preferences_preserved=PASS
-  echo rollback_fixture_restored=PASS
+  echo atomic_install_swap=PASS
+  echo sparkle_fallback_restoration_verified=PASS
+  echo qualification_fixture_restored=PASS
   echo initial_clean_user_state_restored=PASS
   echo "completed_epoch=$(date +%s)"
 } > "$EVIDENCE/manifest.txt"

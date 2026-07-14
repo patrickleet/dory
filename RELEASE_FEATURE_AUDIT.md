@@ -43,14 +43,15 @@ of scope so each fix remains reviewable.
 
 ## 1. Distribution, install, update, and removal
 
-- [ ] Release/version metadata has one owner and cannot publish stale commit, version, build, hash,
+- [x] Release/version metadata has one owner and cannot publish stale commit, version, build, hash,
   architecture, or appcast data.
-- [ ] Developer ID signing, hardened runtime, entitlements, nested-code inventory, notarization,
+- [x] Developer ID signing, hardened runtime, entitlements, nested-code inventory, notarization,
   stapling, Gatekeeper, SBOM, DMG, ZIP, and update-archive validation fail closed.
 - [ ] Direct DMG installation and Homebrew Cask installation work from a clean account with normal
   quarantine and install only Apple Silicon payloads.
 - [ ] Sparkle replaces and relaunches the prior app, preserves user data/settings, validates the
-  complete installed tree, and has a safe rollback path.
+  complete installed tree, and uses a same-team atomic replacement with a verified fallback
+  restoration path.
 - [ ] Ordinary uninstall removes the app/runtime integration but preserves the selected Dory drive;
   explicit zap/reset behavior is unambiguous and tested.
 - [ ] Packaging scripts, workflows, Homebrew tap, README, appcast, and release notes agree.

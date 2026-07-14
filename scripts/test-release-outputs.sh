@@ -1633,6 +1633,8 @@ assert "name: Verify physical sleep/wake evidence binding" in release, \
     "publication does not semantically verify physical sleep/wake evidence"
 assert "name: Verify direct DMG install evidence binding" in release, \
     "publication does not semantically verify the direct DMG installation"
+assert "name: Verify Sparkle install evidence binding" in release, \
+    "publication does not semantically verify the real Sparkle installation"
 direct_dmg = open("scripts/direct-dmg-install-gate.sh", encoding="utf-8").read()
 for required in (
     'hdiutil attach -readonly -nobrowse -plist "$DMG"',
@@ -1766,10 +1768,31 @@ for required in (
     'echo "release_manifest_sha256=$RELEASE_MANIFEST_SHA"',
     'echo "sbom_sha256=$SBOM_SHA"',
     'echo "gate_script_sha256=$GATE_SCRIPT_SHA"',
-    "rollback_fixture_restored=PASS",
+    'sign-sparkle-for-distribution.sh"',
+    'SPARKLE_AUTOUPDATE_TEAM" = "$CANDIDATE_TEAM"',
+    "custom update security policy disables Sparkle's safe atomic replacement",
+    '/usr/bin/log show --start "$SPARKLE_LOG_START"',
+    '"$EVIDENCE/sparkle-unified.log"',
+    "atomic_install_swap=PASS",
+    "sparkle_fallback_restoration_verified=PASS",
+    "qualification_fixture_restored=PASS",
     "initial_clean_user_state_restored=PASS",
 ):
     assert required in sparkle_install, f"real Sparkle installer gate omits: {required}"
+for forbidden in ("rollback_fixture_restored=PASS", "rollback did not restore"):
+    assert forbidden not in sparkle_install, f"Sparkle gate overclaims manual fixture cleanup: {forbidden}"
+sparkle_publication = release.split("name: Verify Sparkle install evidence binding", 1)[1].split(
+    "name: Verify direct DMG install evidence binding", 1
+)[0]
+for required in (
+    "scripts/verify-sparkle-install-evidence.py",
+    '--app-update "release-build/Dory-$VERSION-app-update.zip"',
+    '--source-commit "$GITHUB_SHA"',
+    '--run-id "$GITHUB_RUN_ID"',
+    '--run-attempt "$GITHUB_RUN_ATTEMPT"',
+    '--candidate-team "$candidate_team"',
+):
+    assert required in sparkle_publication, f"Sparkle publication evidence omits: {required}"
 sparkle_verify = open("scripts/verify-sparkle-update.sh", encoding="utf-8").read()
 for required in ("--verify --ed-key-file -", "SUPublicEDKey", "Curve25519.Signing.PrivateKey",
                  "Curve25519.Signing.PublicKey", "isValidSignature", "secret.count == 96"):

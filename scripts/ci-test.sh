@@ -55,6 +55,11 @@ if ! bash scripts/test-sparkle-distribution-signing.sh; then
   exit 1
 fi
 
+if ! bash scripts/test-sparkle-install-evidence.sh; then
+  echo "ci-test: Sparkle install evidence tests failed" >&2
+  exit 1
+fi
+
 if ! bash scripts/test-clean-release-source.sh; then
   echo "ci-test: clean public-release source tests failed" >&2
   exit 1

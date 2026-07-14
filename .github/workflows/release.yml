@@ -1033,6 +1033,34 @@ jobs:
           if values != expected:
               raise SystemExit(f"Homebrew install evidence mismatch: {values!r} != {expected!r}")
           PY
+      - name: Verify Sparkle install evidence binding
+        env:
+          VERSION: ${{ needs.release_candidate.outputs.version }}
+          BUILD: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          manifests="$(find live-release-evidence -path '*/dory-release-live-sparkle/*/evidence/manifest.txt' -type f -print)"
+          test "$(printf '%s\n' "$manifests" | awk 'NF { count++ } END { print count + 0 }')" = 1
+          manifest="$(printf '%s\n' "$manifests" | awk 'NF { print; exit }')"
+          candidate_root="$RUNNER_TEMP/dory-sparkle-evidence-candidate"
+          rm -rf "$candidate_root"
+          mkdir -p "$candidate_root"
+          ditto -x -k "release-build/Dory-$VERSION-app-update.zip" "$candidate_root"
+          candidate_team="$(codesign -dv --verbose=4 "$candidate_root/Dory.app" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+          scripts/verify-sparkle-install-evidence.py \
+            --manifest "$manifest" \
+            --app-update "release-build/Dory-$VERSION-app-update.zip" \
+            --appcast release-build/appcast.xml \
+            --release-manifest release-build/release-manifest.json \
+            --sbom "release-build/Dory-$VERSION.cdx.json" \
+            --gate-script scripts/sparkle-install-relaunch-gate.sh \
+            --package-resolved Dory.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved \
+            --candidate-team "$candidate_team" \
+            --source-commit "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --version "$VERSION" \
+            --build "$BUILD"
       - name: Verify direct DMG install evidence binding
         env:
           VERSION: ${{ needs.release_candidate.outputs.version }}
