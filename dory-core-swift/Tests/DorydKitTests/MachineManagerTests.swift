@@ -542,6 +542,111 @@ final class MachineManagerTests: XCTestCase {
         XCTAssertEqual(running.handoffFDCount, 0)
     }
 
+    func testMaximumLengthMachineIDUsesBoundedTransientSocketPath() throws {
+        let durable = "/tmp/dory-machine-durable-\(getpid())-\(String(repeating: "x", count: 70))"
+        let runtime = "/tmp/dory-machine-runtime-\(getpid())"
+        let id = String(repeating: "m", count: 63)
+        let manager = MachineManager(configuration: MachineManagerConfiguration(
+            vmmExecutablePath: "/bin/sleep",
+            stateDirectory: durable,
+            runtimeDirectory: runtime,
+            baseArguments: ["30"],
+            passMachineArguments: false,
+            requiresReadyHandoff: true
+        ))
+        defer {
+            try? manager.delete(id: id)
+            try? FileManager.default.removeItem(atPath: durable)
+            try? FileManager.default.removeItem(atPath: runtime)
+        }
+
+        _ = try manager.create(DoryMachineConfiguration(
+            id: id,
+            kernelPath: "/tmp/kernel",
+            rootfsPath: "/tmp/rootfs"
+        ))
+        let starting = try manager.start(id: id)
+        let handoffPath = try XCTUnwrap(starting.handoffSocketPath)
+        XCTAssertTrue(handoffPath.hasPrefix(runtime + "/"))
+        XCTAssertLessThan(handoffPath.utf8.count, 104)
+        XCTAssertFalse(handoffPath.contains(id))
+
+        try sendVmmHandoff(
+            path: handoffPath,
+            ready: VmmReadyMessage(machineID: id),
+            fileDescriptors: []
+        )
+        _ = try waitForMachineState(manager, id: id, state: .running)
+        _ = try manager.stop(id: id)
+    }
+
+    func testMachineIDRejectsMoreThanSixtyThreeBytes() throws {
+        let base = "/tmp/dory-machine-id-limit-\(getpid())"
+        let manager = MachineManager(configuration: MachineManagerConfiguration(
+            vmmExecutablePath: "/usr/bin/true",
+            stateDirectory: base
+        ))
+        defer { try? FileManager.default.removeItem(atPath: base) }
+        let id = String(repeating: "m", count: 64)
+
+        XCTAssertThrowsError(try manager.create(DoryMachineConfiguration(
+            id: id,
+            kernelPath: "/tmp/kernel",
+            rootfsPath: "/tmp/rootfs"
+        ))) { error in
+            XCTAssertEqual(error as? MachineManagerError, .invalidID(id))
+        }
+    }
+
+    func testProcessArgumentsSeparateDurableStateFromTransientSockets() throws {
+        let base = "/tmp/dory-machine-socket-args-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        let durable = base + "/durable"
+        let runtime = base + "/runtime"
+        let capture = base + "/arguments.txt"
+        let helper = base + "/helper.sh"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        try "#!/bin/sh\nprintf '%s\\n' \"$@\" > '\(capture)'\nsleep 30\n".write(
+            toFile: helper,
+            atomically: true,
+            encoding: .utf8
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: helper)
+        let manager = MachineManager(configuration: MachineManagerConfiguration(
+            vmmExecutablePath: helper,
+            stateDirectory: durable,
+            runtimeDirectory: runtime,
+            requiresReadyHandoff: false
+        ))
+        defer {
+            try? manager.delete(id: "dev")
+            try? FileManager.default.removeItem(atPath: base)
+        }
+
+        _ = try manager.create(DoryMachineConfiguration(
+            id: "dev",
+            kernelPath: "/tmp/kernel",
+            rootfsPath: "/tmp/rootfs"
+        ))
+        _ = try manager.start(id: "dev")
+        for _ in 0..<100 where !FileManager.default.fileExists(atPath: capture) {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        let arguments = try String(contentsOfFile: capture, encoding: .utf8)
+            .split(separator: "\n").map(String.init)
+        func value(after flag: String) throws -> String {
+            let index = try XCTUnwrap(arguments.firstIndex(of: flag))
+            return arguments[index + 1]
+        }
+
+        XCTAssertEqual(try value(after: "--state-dir"), durable + "/dev")
+        for flag in ["--dockerd-sock", "--agent-sock", "--shell-sock", "--control-sock"] {
+            let path = try value(after: flag)
+            XCTAssertTrue(path.hasPrefix(runtime + "/"), "\(flag) should use transient runtime storage")
+            XCTAssertLessThan(path.utf8.count, 104)
+        }
+        _ = try manager.stop(id: "dev")
+    }
+
     func testWakeClockSyncsRunningMachineAgents() throws {
         let base = "/tmp/dory-machine-clock-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
         let connector = RecordingMachineAgentConnector()

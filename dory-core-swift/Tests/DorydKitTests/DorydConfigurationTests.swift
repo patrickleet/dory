@@ -711,6 +711,7 @@ final class DorydConfigurationTests: XCTestCase {
         XCTAssertEqual(env.machineManagerConfiguration(), MachineManagerConfiguration(
             vmmExecutablePath: helper,
             stateDirectory: directory + "/machines",
+            runtimeDirectory: directory + "/home/.dory/machines",
             baseArguments: ["--foreground", "--verbose"],
             passMachineArguments: false,
             logDirectory: directory + "/logs",
@@ -730,6 +731,7 @@ final class DorydConfigurationTests: XCTestCase {
 
         let config = try XCTUnwrap(env.machineManagerConfiguration())
         XCTAssertEqual(config.vmmExecutablePath, helper)
+        XCTAssertEqual(config.runtimeDirectory, directory + "/home/.dory/machines")
         XCTAssertEqual(
             config.stateDirectory,
             directory + "/home/Library/Application Support/Dory/Dory.dorydrive/machines"

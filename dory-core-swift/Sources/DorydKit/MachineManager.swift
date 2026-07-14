@@ -1,9 +1,11 @@
+import CryptoKit
 import DoryCore
 import Foundation
 
 public struct MachineManagerConfiguration: Sendable, Equatable {
     public var vmmExecutablePath: String
     public var stateDirectory: String
+    public var runtimeDirectory: String
     public var baseArguments: [String]
     public var passMachineArguments: Bool
     public var logDirectory: String
@@ -12,6 +14,7 @@ public struct MachineManagerConfiguration: Sendable, Equatable {
     public init(
         vmmExecutablePath: String,
         stateDirectory: String,
+        runtimeDirectory: String? = nil,
         baseArguments: [String] = [],
         passMachineArguments: Bool = true,
         logDirectory: String? = nil,
@@ -19,6 +22,7 @@ public struct MachineManagerConfiguration: Sendable, Equatable {
     ) {
         self.vmmExecutablePath = vmmExecutablePath
         self.stateDirectory = stateDirectory
+        self.runtimeDirectory = runtimeDirectory ?? stateDirectory
         self.baseArguments = baseArguments
         self.passMachineArguments = passMachineArguments
         self.logDirectory = logDirectory ?? "\(stateDirectory)/logs"
@@ -500,6 +504,7 @@ public final class MachineManager: @unchecked Sendable {
         entry.handoffServer?.stop()
         entry.process?.stop()
         try? FileManager.default.removeItem(atPath: machineStateDirectory(id: id))
+        try? FileManager.default.removeItem(atPath: machineRuntimeDirectory(id: id))
     }
 
     public func update(
@@ -813,6 +818,10 @@ public final class MachineManager: @unchecked Sendable {
         var arguments = configuration.baseArguments + [
             "--machine-id", machine.id,
             "--state-dir", machineStateDirectory(id: machine.id),
+            "--dockerd-sock", "\(machineRuntimeDirectory(id: machine.id))/d.sock",
+            "--agent-sock", "\(machineRuntimeDirectory(id: machine.id))/a.sock",
+            "--shell-sock", "\(machineRuntimeDirectory(id: machine.id))/s.sock",
+            "--control-sock", "\(machineRuntimeDirectory(id: machine.id))/c.sock",
             "--kernel", machine.kernelPath,
             "--rootfs", machine.rootfsPath,
             "--memory-mb", String(machine.memoryMB),
@@ -834,8 +843,16 @@ public final class MachineManager: @unchecked Sendable {
         "\(configuration.stateDirectory)/\(id)"
     }
 
+    private func machineRuntimeDirectory(id: String) -> String {
+        let material = Data("\(configuration.stateDirectory)\0\(id)".utf8)
+        let token = SHA256.hash(data: material).prefix(12).map {
+            String(format: "%02x", $0)
+        }.joined()
+        return "\(configuration.runtimeDirectory)/\(token)"
+    }
+
     private func handoffSocketPath(id: String) -> String {
-        "\(machineStateDirectory(id: id))/handoff.sock"
+        "\(machineRuntimeDirectory(id: id))/h.sock"
     }
 
     public func agentInfo(id: String) throws -> DoryAgentInfo {
@@ -1077,14 +1094,7 @@ public final class MachineManager: @unchecked Sendable {
     }
 
     private static func isValidID(_ id: String) -> Bool {
-        guard !id.isEmpty else { return false }
-        // Reject all-dot ids (".", "..", ...) so an id can never traverse out of the
-        // machines directory when interpolated into a filesystem path. The charset below
-        // already blocks "/", so a valid id stays a single path component.
-        guard id.contains(where: { $0 != "." }) else { return false }
-        return id.allSatisfy { character in
-            character.isLetter || character.isNumber || character == "-" || character == "_" || character == "."
-        }
+        id.wholeMatch(of: /[A-Za-z0-9][A-Za-z0-9_.-]{0,62}/) != nil
     }
 
     private static func normalizedAddress(_ raw: String?) throws -> String? {

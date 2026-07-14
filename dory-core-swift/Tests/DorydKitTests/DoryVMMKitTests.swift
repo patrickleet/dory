@@ -64,8 +64,10 @@ final class DoryVMMKitTests: XCTestCase {
             "--memory-mb", "3072",
             "--cpus", "4",
             "--handoff-sock", "/tmp/handoff.sock",
+            "--dockerd-sock", "/tmp/dockerd.sock",
             "--agent-sock", "/tmp/agent.sock",
             "--shell-sock", "/tmp/shell.sock",
+            "--control-sock", "/tmp/control.sock",
             "--share", "src=/tmp/src:/workspace/src:ro",
             "--env", "APP_ENV=dev",
         ])
@@ -84,8 +86,10 @@ final class DoryVMMKitTests: XCTestCase {
         XCTAssertEqual(arguments.memoryMB, 3072)
         XCTAssertEqual(arguments.cpuCount, 4)
         XCTAssertEqual(arguments.handoffSocketPath, "/tmp/handoff.sock")
+        XCTAssertEqual(arguments.dockerdSocketPath, "/tmp/dockerd.sock")
         XCTAssertEqual(arguments.agentSocketPath, "/tmp/agent.sock")
         XCTAssertEqual(arguments.shellSocketPath, "/tmp/shell.sock")
+        XCTAssertEqual(arguments.controlSocketPath, "/tmp/control.sock")
         XCTAssertEqual(arguments.shares, [
             DoryMachineShareConfiguration(tag: "src", hostPath: "/tmp/src", guestPath: "/workspace/src", readOnly: true),
         ])

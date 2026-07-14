@@ -253,6 +253,7 @@ public struct DorydEnvironment: Sendable {
         return MachineManagerConfiguration(
             vmmExecutablePath: helper,
             stateDirectory: stateDirectory,
+            runtimeDirectory: string("DORYD_MACHINE_RUNTIME_DIR") ?? "\(home)/.dory/machines",
             baseArguments: splitArguments(string("DORYD_VMM_ARGS") ?? ""),
             passMachineArguments: bool("DORYD_VMM_PASS_MACHINE_ARGS", default: true),
             logDirectory: string("DORYD_MACHINE_LOG_DIR") ?? "\(stateDirectory)/logs",

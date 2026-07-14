@@ -622,6 +622,10 @@ public enum DoryVMMMain {
                 kernelPath: kernelPath,
                 rootfsPath: rootfsPath,
                 handoffSocketPath: handoffSocketPath,
+                dockerdSocketPath: arguments.dockerdSocketPath ?? "\(stateDirectory)/dockerd.sock",
+                agentSocketPath: arguments.agentSocketPath ?? "\(stateDirectory)/agent.sock",
+                shellSocketPath: arguments.shellSocketPath ?? "\(stateDirectory)/shell.sock",
+                controlSocketPath: arguments.controlSocketPath ?? "\(stateDirectory)/control.sock",
                 memoryMB: arguments.memoryMB,
                 cpuCount: arguments.cpuCount,
                 kernelCommandLine: arguments.kernelCommandLine,
@@ -686,6 +690,10 @@ public enum DoryVMMMain {
         kernelPath: String,
         rootfsPath: String,
         handoffSocketPath: String,
+        dockerdSocketPath: String,
+        agentSocketPath: String,
+        shellSocketPath: String,
+        controlSocketPath: String,
         memoryMB: UInt64,
         cpuCount: Int,
         kernelCommandLine: String?,
@@ -699,6 +707,12 @@ public enum DoryVMMMain {
         onRuntimeCreated: (DoryVMMRuntime) -> Void
     ) throws -> DoryVMMRuntime {
         try FileManager.default.createDirectory(atPath: stateDirectory, withIntermediateDirectories: true)
+        for socketPath in [dockerdSocketPath, agentSocketPath, shellSocketPath, controlSocketPath] {
+            try FileManager.default.createDirectory(
+                atPath: (socketPath as NSString).deletingLastPathComponent,
+                withIntermediateDirectories: true
+            )
+        }
         let serialLog = try openAppendLog("\(stateDirectory)/serial.log")
         let dataDrive: DoryDataDrive?
         if let dataDriveRoot, machineID == "docker" {
@@ -781,10 +795,6 @@ public enum DoryVMMMain {
             sshAgentBridge = nil
         }
 
-        let dockerdSocketPath = "\(stateDirectory)/dockerd.sock"
-        let agentSocketPath = "\(stateDirectory)/agent.sock"
-        let shellSocketPath = "\(stateDirectory)/shell.sock"
-        let controlSocketPath = "\(stateDirectory)/control.sock"
         let controlServer = try DoryVMMControlServer(machine: machine, localSocketPath: controlSocketPath)
         let dockerdProxy = try DoryVZPortUnixProxy(
             machine: machine,
