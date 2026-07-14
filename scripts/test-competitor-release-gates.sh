@@ -666,6 +666,15 @@ grep -F 'service.machineDeleteSnapshotCount == 2' DoryTests/DorydClientTests.swi
   || fail "machine clone no longer proves its temporary snapshot is removed"
 grep -F 'fixture disk is busy' DoryTests/DorydClientTests.swift >/dev/null \
   || fail "machine deletion no longer proves failed daemon deletion preserves the UI definition"
+grep -F 'deletionQuarantinePrefix = ".dory-machine-delete-"' \
+  dory-core-swift/Sources/DorydKit/MachineManager.swift >/dev/null \
+  || fail "daemon machine deletion can report success before the persisted definition is durably removed"
+grep -F 'testDeleteFailurePreservesPersistedStoppedMachine' \
+  dory-core-swift/Tests/DorydKitTests/MachineManagerTests.swift >/dev/null \
+  || fail "daemon machine deletion no longer proves a failed atomic removal preserves the definition"
+grep -F 'testManagerRemovesInterruptedDeletionQuarantinesOnStartup' \
+  dory-core-swift/Tests/DorydKitTests/MachineManagerTests.swift >/dev/null \
+  || fail "interrupted daemon machine deletions can accumulate hidden data-drive storage"
 for required_recipe in \
   'guest/kernel/build.sh arm64' \
   'guest/initfs/build.sh arm64' \

@@ -303,6 +303,7 @@ public final class MachineManager: @unchecked Sendable {
     public typealias AgentConnector = @Sendable (String) throws -> any AgentControlClient
 
     private static let handoffReadyTimeoutSeconds: TimeInterval = 60
+    private static let deletionQuarantinePrefix = ".dory-machine-delete-"
     /// Public Apple-Silicon machine resource contract. These match the app's steppers; enforcing
     /// them again in doryd prevents CLI/XPC callers from persisting values that the VMM would later
     /// clamp silently, which would make status disagree with the running guest.
@@ -316,6 +317,7 @@ public final class MachineManager: @unchecked Sendable {
     private let balloonController: any MachineBalloonControlling
     private let lock = NSLock()
     private var machines: [String: MachineEntry] = [:]
+    private var deletingMachineIDs: Set<String> = []
 
     public init(
         configuration: MachineManagerConfiguration,
@@ -332,6 +334,7 @@ public final class MachineManager: @unchecked Sendable {
             stateDirectory: configuration.stateDirectory,
             includeDescendants: true
         )
+        Self.removeStaleDeletionQuarantines(stateDirectory: configuration.stateDirectory)
         self.machines = Self.loadPersistedMachines(configuration: configuration)
     }
 
@@ -346,7 +349,7 @@ public final class MachineManager: @unchecked Sendable {
         try Self.validateShares(machine.shares)
         try Self.validateEnvironment(machine.environment)
         lock.lock()
-        let exists = machines[machine.id] != nil
+        let exists = machines[machine.id] != nil || deletingMachineIDs.contains(machine.id)
         lock.unlock()
         guard !exists else {
             throw MachineManagerError.duplicateMachine(machine.id)
@@ -354,7 +357,7 @@ public final class MachineManager: @unchecked Sendable {
         let preparedMachine = try prepareMachineDisk(machine)
         lock.lock()
         defer { lock.unlock() }
-        guard machines[machine.id] == nil else {
+        guard machines[machine.id] == nil, !deletingMachineIDs.contains(machine.id) else {
             throw MachineManagerError.duplicateMachine(machine.id)
         }
         try persist(preparedMachine)
@@ -499,12 +502,46 @@ public final class MachineManager: @unchecked Sendable {
             lock.unlock()
             throw MachineManagerError.unknownMachine(id)
         }
+        deletingMachineIDs.insert(id)
         lock.unlock()
 
         entry.handoffServer?.stop()
         entry.process?.stop()
-        try? FileManager.default.removeItem(atPath: machineStateDirectory(id: id))
+
+        let fileManager = FileManager.default
+        let statePath = machineStateDirectory(id: id)
+        var quarantinePath: String?
+        if fileManager.fileExists(atPath: statePath) {
+            let quarantine = "\(configuration.stateDirectory)/\(Self.deletionQuarantinePrefix)\(id)-\(UUID().uuidString)"
+            do {
+                try fileManager.moveItem(atPath: statePath, toPath: quarantine)
+                quarantinePath = quarantine
+            } catch {
+                var restored = entry
+                restored.process = nil
+                restored.handoffServer = nil
+                restored.handoff = nil
+                restored.currentBalloonTargetMB = nil
+                restored.state = .stopped
+                restored.lastError = "delete failed: \(error)"
+                lock.lock()
+                deletingMachineIDs.remove(id)
+                if machines[id] == nil {
+                    machines[id] = restored
+                }
+                lock.unlock()
+                throw MachineManagerError.persistence("could not delete \(id): \(error)")
+            }
+        }
+
+        lock.lock()
+        deletingMachineIDs.remove(id)
+        lock.unlock()
+
         try? FileManager.default.removeItem(atPath: machineRuntimeDirectory(id: id))
+        if let quarantinePath {
+            try? fileManager.removeItem(atPath: quarantinePath)
+        }
     }
 
     public func update(
@@ -1212,6 +1249,16 @@ public final class MachineManager: @unchecked Sendable {
             loaded[id] = MachineEntry(configuration: machine, state: .stopped)
         }
         return loaded
+    }
+
+    private static func removeStaleDeletionQuarantines(stateDirectory: String) {
+        let fileManager = FileManager.default
+        guard let entries = try? fileManager.contentsOfDirectory(atPath: stateDirectory) else {
+            return
+        }
+        for entry in entries where entry.hasPrefix(deletionQuarantinePrefix) {
+            try? fileManager.removeItem(atPath: "\(stateDirectory)/\(entry)")
+        }
     }
 
     deinit {

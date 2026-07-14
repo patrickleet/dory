@@ -37,6 +37,59 @@ final class MachineManagerTests: XCTestCase {
         XCTAssertTrue(manager.list().isEmpty)
     }
 
+    func testDeleteFailurePreservesPersistedStoppedMachine() throws {
+        let base = "/tmp/dory-machine-delete-failure-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        let configuration = MachineManagerConfiguration(
+            vmmExecutablePath: "/bin/sleep",
+            stateDirectory: base,
+            baseArguments: ["30"],
+            passMachineArguments: false,
+            requiresReadyHandoff: false
+        )
+        let manager = MachineManager(configuration: configuration)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: base)
+            try? FileManager.default.removeItem(atPath: base)
+        }
+
+        _ = try manager.create(DoryMachineConfiguration(
+            id: "dev",
+            kernelPath: "/tmp/kernel",
+            rootfsPath: "/tmp/rootfs"
+        ))
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: base)
+
+        XCTAssertThrowsError(try manager.delete(id: "dev")) { error in
+            guard case let MachineManagerError.persistence(message) = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+            XCTAssertTrue(message.contains("could not delete dev"))
+        }
+        XCTAssertEqual(manager.status(id: "dev")?.state, .stopped)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: "\(base)/dev/machine.json"))
+
+        let reloaded = MachineManager(configuration: configuration)
+        XCTAssertEqual(reloaded.list().map(\.id), ["dev"])
+    }
+
+    func testManagerRemovesInterruptedDeletionQuarantinesOnStartup() throws {
+        let base = "/tmp/dory-machine-delete-quarantine-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        let quarantine = "\(base)/.dory-machine-delete-dev-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: quarantine, withIntermediateDirectories: true)
+        try Data("stale".utf8).write(to: URL(fileURLWithPath: "\(quarantine)/rootfs.ext4"))
+        defer { try? FileManager.default.removeItem(atPath: base) }
+
+        _ = MachineManager(configuration: MachineManagerConfiguration(
+            vmmExecutablePath: "/bin/sleep",
+            stateDirectory: base,
+            baseArguments: ["30"],
+            passMachineArguments: false,
+            requiresReadyHandoff: false
+        ))
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: quarantine))
+    }
+
     func testRejectsDuplicateAndInvalidMachineIDs() throws {
         let base = "/tmp/dory-machine-manager-invalid-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
         defer { try? FileManager.default.removeItem(atPath: base) }
