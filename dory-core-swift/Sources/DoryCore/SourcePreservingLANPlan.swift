@@ -82,25 +82,28 @@ public enum SourcePreservingLANOperation: String, Sendable, Codable {
 }
 
 public struct SourcePreservingLANRequest: Sendable, Equatable, Codable {
-    public static let schemaVersion = 1
+    public static let schemaVersion = 2
 
     public var version: Int
     public var operation: SourcePreservingLANOperation
     public var sessionID: String
     public var gvproxySocketPath: String?
     public var bindings: Set<PublishedPortBinding>
+    public var mtu: Int
 
     public init(
         operation: SourcePreservingLANOperation,
         sessionID: String,
         gvproxySocketPath: String? = nil,
-        bindings: Set<PublishedPortBinding> = []
+        bindings: Set<PublishedPortBinding> = [],
+        mtu: Int = DoryNetworkMTU.resolved()
     ) {
         self.version = Self.schemaVersion
         self.operation = operation
         self.sessionID = sessionID
         self.gvproxySocketPath = gvproxySocketPath
         self.bindings = bindings
+        self.mtu = mtu
     }
 }
 

@@ -5,6 +5,7 @@ import Foundation
 public enum SourcePreservingLANPrivilegedError: Error, Sendable, Equatable, CustomStringConvertible {
     case rootRequired
     case unsupportedVersion(Int)
+    case invalidMTU(Int)
     case invalidSessionID
     case invalidSocketPath
     case socketUnavailable(String)
@@ -20,6 +21,7 @@ public enum SourcePreservingLANPrivilegedError: Error, Sendable, Equatable, Cust
         switch self {
         case .rootRequired: "source-preserving LAN helper must run as root"
         case .unsupportedVersion(let value): "unsupported source-preserving LAN request version: \(value)"
+        case .invalidMTU(let value): "invalid source-preserving LAN MTU: \(value)"
         case .invalidSessionID: "invalid source-preserving LAN session identifier"
         case .invalidSocketPath: "invalid gvproxy socket path"
         case .socketUnavailable(let path): "gvproxy socket is unavailable: \(path)"
@@ -233,7 +235,7 @@ public final class SourcePreservingLANPrivilegedController: @unchecked Sendable 
             _ = try runCommand([
                 "/sbin/ifconfig", interfaceName, "inet",
                 "192.168.215.253", SourcePreservingLANPlan.guestIngressIPv4,
-                "netmask", "255.255.255.255", "mtu", "1500", "up",
+                "netmask", "255.255.255.255", "mtu", String(request.mtu), "up",
             ])
             _ = try? runCommand([
                 "/sbin/route", "-n", "delete", "-host", SourcePreservingLANPlan.guestIngressIPv4,
@@ -714,6 +716,9 @@ public final class SourcePreservingLANPrivilegedController: @unchecked Sendable 
     private static func validateCommon(_ request: SourcePreservingLANRequest) throws {
         guard request.version == SourcePreservingLANRequest.schemaVersion else {
             throw SourcePreservingLANPrivilegedError.unsupportedVersion(request.version)
+        }
+        guard (DoryNetworkMTU.safeDefault...DoryNetworkMTU.maximum).contains(request.mtu) else {
+            throw SourcePreservingLANPrivilegedError.invalidMTU(request.mtu)
         }
         guard request.sessionID.wholeMatch(of: /[A-Za-z0-9][A-Za-z0-9.-]{0,63}/) != nil,
               !request.sessionID.contains(".."),

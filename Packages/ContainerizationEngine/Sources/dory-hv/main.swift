@@ -402,7 +402,7 @@ case "boot":
             let process = Process()
             process.executableURL = URL(fileURLWithPath: gvproxyPath)
             process.arguments = [
-                "-mtu", "1500",
+                "-mtu", String(DoryNetworkMTU.resolved()),
                 "-listen-vfkit", "unixgram://\(datapathSocket)",
                 "-listen", "unix://\(apiSocket)",
             ]

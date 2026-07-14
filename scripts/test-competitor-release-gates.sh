@@ -1022,6 +1022,24 @@ for proof in lan_tcp_udp_source_preserved tailscale_tcp_udp_source_preserved \
   grep -F "$proof" scripts/vz-native-ipv6-gate.sh >/dev/null \
     || fail "Sonoma VZ source-preservation certification does not prove $proof"
 done
+grep -F 'public static let safeDefault = 1_280' \
+  dory-core-swift/Sources/DoryCore/DoryNetworkMTU.swift >/dev/null \
+  || fail "Dory networking no longer defaults to the IPv6/VPN-safe MTU"
+for launcher in Packages/ContainerizationEngine/Sources/dory-hv/main.swift \
+  Packages/ContainerizationEngine/Sources/dory-hv/EngineMode.swift \
+  dory-core-swift/Sources/DoryVMMKit/DoryVMMGVProxyNetwork.swift; do
+  grep -F 'DoryNetworkMTU.resolved()' "$launcher" >/dev/null \
+    || fail "engine launcher bypasses the shared VPN-safe MTU contract: $launcher"
+done
+grep -F '"mtu", String(request.mtu)' \
+  dory-core-swift/Sources/DorydKit/SourcePreservingLANPrivilegedController.swift >/dev/null \
+  || fail "source-preserving LAN does not use the engine-requested MTU"
+grep -F 'VPN-safe guest MTU' scripts/network-contract-gate.sh >/dev/null \
+  || fail "physical network qualification does not verify the live guest MTU"
+if rg -q -- '"-mtu", "1500"' Packages/ContainerizationEngine/Sources \
+  dory-core-swift/Sources scripts/gvproxy-qemu-switch-gate.py; then
+  fail "a production or qualification gvproxy path still hard-codes the VPN-hostile 1500-byte MTU"
+fi
 grep -F 'memory_pressure_mib=$PRESSURE_MIB' scripts/source-preserving-lan-gate.sh >/dev/null \
   && grep -F 'memory_pressure_rounds=$PRESSURE_ROUNDS' scripts/source-preserving-lan-gate.sh >/dev/null \
   && grep -F 'source_memory_pressure_mib="$SOURCE_PRESSURE_MIB"' scripts/vz-native-ipv6-gate.sh >/dev/null \

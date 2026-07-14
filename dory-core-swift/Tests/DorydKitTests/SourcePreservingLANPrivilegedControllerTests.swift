@@ -48,7 +48,8 @@ final class SourcePreservingLANPrivilegedControllerTests: XCTestCase {
             bindings: [
                 PublishedPortBinding(protocol: .tcp, port: 8080),
                 PublishedPortBinding(protocol: .tcp, port: 9000, hostIP: "127.0.0.1"),
-            ]
+            ],
+            mtu: 1_400
         )
 
         let response = try controller.apply(request, clientUID: getuid())
@@ -62,7 +63,7 @@ final class SourcePreservingLANPrivilegedControllerTests: XCTestCase {
         XCTAssertTrue(bridge.started)
         XCTAssertTrue(recorder.commands.contains([
             "/sbin/ifconfig", "utun42", "inet", "192.168.215.253", "192.168.215.254",
-            "netmask", "255.255.255.255", "mtu", "1500", "up",
+            "netmask", "255.255.255.255", "mtu", "1400", "up",
         ]))
         XCTAssertTrue(recorder.commands.contains([
             "/sbin/route", "-n", "add", "-host", "192.168.215.254", "-interface", "utun42",
@@ -76,6 +77,20 @@ final class SourcePreservingLANPrivilegedControllerTests: XCTestCase {
         XCTAssertEqual(recorder.commands.last, ["/sbin/pfctl", "-E"])
         XCTAssertTrue(recorder.anchors.last?.contains("to self port 8080 -> 192.168.215.254 port 8080") == true)
         XCTAssertFalse(recorder.anchors.last?.contains("9000") == true)
+    }
+
+    func testRejectsMTUOutsideTheGuestAndGVProxyContract() throws {
+        let controller = SourcePreservingLANPrivilegedController(enforceRoot: false)
+
+        for mtu in [1_279, 9_001] {
+            XCTAssertThrowsError(try controller.apply(SourcePreservingLANRequest(
+                operation: .activate,
+                sessionID: "invalid-mtu",
+                mtu: mtu
+            ), clientUID: getuid())) { error in
+                XCTAssertEqual(error as? SourcePreservingLANPrivilegedError, .invalidMTU(mtu))
+            }
+        }
     }
 
     func testRefreshAndDeactivateAreBoundToTheActiveSession() throws {

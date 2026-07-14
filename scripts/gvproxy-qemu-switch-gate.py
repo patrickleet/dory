@@ -128,7 +128,7 @@ def main() -> None:
         process = subprocess.Popen(
             [
                 str(binary),
-                "-mtu", "1500",
+                "-mtu", os.environ.get("DORY_NETWORK_MTU", "1280"),
                 "-listen-vfkit", f"unixgram://{vfkit_path}",
                 "-listen-qemu", f"unix://{qemu_path}",
                 "-listen", f"unix://{api_path}",

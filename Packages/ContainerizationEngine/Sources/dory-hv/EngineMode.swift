@@ -497,7 +497,7 @@ enum EngineMode {
         let gvproxy = Process()
         gvproxy.executableURL = URL(fileURLWithPath: configuration.gvproxyPath)
         gvproxy.arguments = [
-            "-mtu", "1500",
+            "-mtu", String(DoryNetworkMTU.resolved()),
             "-listen-vfkit", "unixgram://\(datapathSocket)",
             "-listen", "unix://\(apiSocket)",
         ]

@@ -64,7 +64,8 @@ final class SourcePreservingLANPlanTests: XCTestCase {
             operation: .activate,
             sessionID: "session-1",
             gvproxySocketPath: "/tmp/gvproxy.sock",
-            bindings: [PublishedPortBinding(protocol: .tcp, port: 8080, hostIP: "0.0.0.0")]
+            bindings: [PublishedPortBinding(protocol: .tcp, port: 8080, hostIP: "0.0.0.0")],
+            mtu: 1_400
         )
         let decoded = try JSONDecoder().decode(
             SourcePreservingLANRequest.self,
@@ -72,5 +73,6 @@ final class SourcePreservingLANPlanTests: XCTestCase {
         )
         XCTAssertEqual(decoded, request)
         XCTAssertEqual(decoded.version, SourcePreservingLANRequest.schemaVersion)
+        XCTAssertEqual(decoded.mtu, 1_400)
     }
 }

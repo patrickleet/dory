@@ -1,4 +1,5 @@
 import Darwin
+import DoryCore
 import Foundation
 @preconcurrency import Virtualization
 
@@ -79,7 +80,7 @@ final class DoryVMMGVProxyNetwork: @unchecked Sendable {
         let child = Process()
         child.executableURL = URL(fileURLWithPath: gvproxyPath)
         child.arguments = [
-            "-mtu", "1500",
+            "-mtu", String(DoryNetworkMTU.resolved()),
             "-listen-vfkit", "unixgram://\(datapathSocketPath)",
             "-listen", "unix://\(apiSocketPath)",
             "-config", configurationPath,

@@ -122,6 +122,21 @@ else
   record_skip "active VPN detected" "rerun with --require-vpn on the real corporate/VPN path"
 fi
 
+expected_mtu="${DORY_NETWORK_MTU:-1280}"
+case "$expected_mtu" in
+  ''|*[!0-9]*) record_fail "VPN-safe guest MTU" "invalid expected MTU: $expected_mtu"; exit 1 ;;
+esac
+if [ "$expected_mtu" -lt 1280 ] || [ "$expected_mtu" -gt 9000 ]; then
+  record_fail "VPN-safe guest MTU" "expected MTU is outside Dory's 1280-9000 contract"; exit 1
+fi
+guest_mtu="$(docker_e run --rm --network host --label "dev.dory.network-contract=$OWNER" \
+  "$ALPINE_IMAGE" cat /sys/class/net/eth0/mtu 2> "$WORKDIR/guest-mtu.err" || true)"
+if [ "$guest_mtu" = "$expected_mtu" ]; then
+  record_pass "VPN-safe guest MTU" "guest eth0 uses $guest_mtu bytes"
+else
+  record_fail "VPN-safe guest MTU" "expected $expected_mtu, guest eth0 reported ${guest_mtu:-unavailable}"; exit 1
+fi
+
 if [ -z "$CUSTOM_DNS" ]; then
   CUSTOM_DNS="$(awk '/nameserver\[[0-9]+\]/{print $3; exit}' "$BEFORE/dns.txt")"
 fi
