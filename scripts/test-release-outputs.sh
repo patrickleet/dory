@@ -34,6 +34,13 @@ grep -Fq -- '--unregister-network-helper' Dory/App/AppDelegate.swift \
   || { echo "test-release-outputs: app cannot unregister its privileged helper" >&2; exit 1; }
 grep -Fq -- '--unregister-network-helper' scripts/dory \
   || { echo "test-release-outputs: ordinary uninstall leaves the privileged helper registered" >&2; exit 1; }
+grep -Fq -- '--remove-owned-networking' Dory/Models/AppStore.swift \
+  || { echo "test-release-outputs: app unregisters its privileged helper before owned networking cleanup" >&2; exit 1; }
+grep -Fq -- '--remove-owned-networking' dory-core-swift/Sources/dory-network-helper/main.swift \
+  || { echo "test-release-outputs: bundled helper cannot request signed uninstall cleanup" >&2; exit 1; }
+grep -Fq 'removeAuthorizedNetworking(clientUID: clientUID)' \
+  dory-core-swift/Sources/DorydKit/SourcePreservingLANPrivilegedDaemon.swift \
+  || { echo "test-release-outputs: privileged uninstall does not remove caller-owned system networking" >&2; exit 1; }
 if rg -q 'dory\.autoUpdate|automaticallyChecksForUpdates' Dory; then
   echo "test-release-outputs: app code overrides Sparkle automatic-check consent" >&2
   exit 1

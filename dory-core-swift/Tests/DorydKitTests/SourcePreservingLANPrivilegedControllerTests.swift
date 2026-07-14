@@ -392,6 +392,55 @@ final class SourcePreservingLANPrivilegedControllerTests: XCTestCase {
         XCTAssertFalse(second.stopped)
     }
 
+    func testSessionMutationAndUninstallCleanupCannotCrossUsers() throws {
+        let socketPath = try makeDatagramSocket()
+        defer { unlink(socketPath) }
+        let runtime = temporaryRuntime("owner-bound")
+        defer { try? FileManager.default.removeItem(atPath: runtime) }
+        let recorder = Recorder()
+        let bridge = FakeBridge(interfaceName: "utun46")
+        let controller = SourcePreservingLANPrivilegedController(
+            enforceRoot: false,
+            runtimeDirectory: runtime,
+            bridgeFactory: { _ in bridge },
+            runCommand: { command in try recorder.run(command) },
+            writeAnchor: { recorder.anchors.append($0) },
+            removeAnchor: { recorder.anchorRemoved = true }
+        )
+        let owner = getuid()
+        let other = owner + 1
+        _ = try controller.apply(SourcePreservingLANRequest(
+            operation: .activate,
+            sessionID: "owner-bound",
+            gvproxySocketPath: socketPath
+        ), clientUID: owner)
+
+        XCTAssertThrowsError(try controller.apply(SourcePreservingLANRequest(
+            operation: .refresh,
+            sessionID: "owner-bound"
+        ), clientUID: other)) { error in
+            XCTAssertEqual(
+                error as? SourcePreservingLANPrivilegedError,
+                .sessionOwnerMismatch(expected: owner, actual: other)
+            )
+        }
+        XCTAssertThrowsError(try controller.removeOwnedState(clientUID: other))
+        XCTAssertFalse(bridge.stopped)
+
+        try controller.removeOwnedState(clientUID: owner)
+        XCTAssertTrue(bridge.stopped)
+        XCTAssertTrue(recorder.anchorRemoved)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: runtime + "/pf-enable-token"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: runtime + "/ipv4-forwarding-owner"))
+        XCTAssertThrowsError(try controller.apply(SourcePreservingLANRequest(
+            operation: .activate,
+            sessionID: "owner-bound-next",
+            gvproxySocketPath: socketPath
+        ), clientUID: owner)) { error in
+            XCTAssertEqual(error as? SourcePreservingLANPrivilegedError, .decommissioned)
+        }
+    }
+
     func testForwardingEnableFailureUsesPersistedOwnershipToRestoreHost() throws {
         let socketPath = try makeDatagramSocket()
         defer { unlink(socketPath) }
@@ -504,6 +553,7 @@ private final class Recorder: @unchecked Sendable {
     var configuration: DirectIPBridgeConfiguration?
     var commands = [[String]]()
     var anchors = [String]()
+    var anchorRemoved = false
     var bridgeCreations = 0
     var forwardingValue = "0"
     private var failingCommand: [String]?

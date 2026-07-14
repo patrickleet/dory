@@ -278,6 +278,38 @@ final class NetworkingAuthorizationApplierTests: XCTestCase {
         }
     }
 
+    func testUninstallRemovalUsesPersistedPlanAndCannotCrossUsers() throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let plan = try NetworkingAuthorizationPlan.make(configuration: NetworkingConfiguration(
+            suffix: "owned.dory.local",
+            dnsPort: 15354,
+            localCACertificatePath: nil
+        ))
+        let recorder = CommandRecorder()
+        _ = try NetworkingAuthorizationApplier(
+            fileSystemRoot: root,
+            ownerUID: 501,
+            runCommand: recorder.run
+        ).apply(plan)
+        let maintenance = NetworkingAuthorizationApplier(
+            fileSystemRoot: root,
+            runCommand: recorder.run
+        )
+
+        XCTAssertThrowsError(try maintenance.removeAuthorizedNetworking(clientUID: 502)) { error in
+            XCTAssertEqual(
+                error as? NetworkingAuthorizationApplyError,
+                .ownerMismatch(expected: 501, actual: 502)
+            )
+        }
+        XCTAssertTrue(try maintenance.removeAuthorizedNetworking(clientUID: 501))
+        XCTAssertFalse(try maintenance.removeAuthorizedNetworking(clientUID: 501))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: root + "/etc/resolver/owned.dory.local"
+        ))
+    }
+
     func testPersistsExactCAForRemovalAfterUserCopyDisappears() throws {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(atPath: root) }

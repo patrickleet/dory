@@ -9,7 +9,9 @@ public enum SourcePreservingLANPrivilegedError: Error, Sendable, Equatable, Cust
     case invalidSocketPath
     case socketUnavailable(String)
     case socketOwnerMismatch(expected: uid_t, actual: uid_t)
+    case sessionOwnerMismatch(expected: uid_t, actual: uid_t)
     case sessionConflict
+    case decommissioned
     case noActiveSession
     case interfaceUnavailable
     case commandFailed(String)
@@ -23,7 +25,10 @@ public enum SourcePreservingLANPrivilegedError: Error, Sendable, Equatable, Cust
         case .socketUnavailable(let path): "gvproxy socket is unavailable: \(path)"
         case .socketOwnerMismatch(let expected, let actual):
             "gvproxy socket owner mismatch (expected uid \(expected), found \(actual))"
+        case .sessionOwnerMismatch(let expected, let actual):
+            "source-preserving LAN session belongs to uid \(expected), not uid \(actual)"
         case .sessionConflict: "another source-preserving LAN session is already active"
+        case .decommissioned: "source-preserving LAN service is being removed"
         case .noActiveSession: "source-preserving LAN session is not active"
         case .interfaceUnavailable: "privileged UTUN did not report an interface name"
         case .commandFailed(let message): "source-preserving LAN privileged command failed: \(message)"
@@ -48,6 +53,7 @@ public final class SourcePreservingLANPrivilegedController: @unchecked Sendable 
     public typealias BridgeFactory = @Sendable (DirectIPBridgeConfiguration) throws -> any SourcePreservingLANBridgeSession
     public typealias CommandRunner = @Sendable ([String]) throws -> String
     public typealias AnchorWriter = @Sendable (String) throws -> Void
+    public typealias AnchorRemover = @Sendable () throws -> Void
 
     public static let anchorName = "com.apple/dev.dory.lan"
     public static let anchorPath = "/etc/pf.anchors/dev.dory.lan"
@@ -58,9 +64,12 @@ public final class SourcePreservingLANPrivilegedController: @unchecked Sendable 
     private let bridgeFactory: BridgeFactory
     private let runCommand: CommandRunner
     private let writeAnchor: AnchorWriter
+    private let removeAnchor: AnchorRemover
     private let enforceRoot: Bool
     private let runtimeDirectory: String
+    private var acceptingSessions = true
     private var activeSessionID: String?
+    private var activeClientUID: uid_t?
     private var activeBridge: (any SourcePreservingLANBridgeSession)?
     private var activeInterfaceName: String?
     private var activePFToken: String?
@@ -70,7 +79,8 @@ public final class SourcePreservingLANPrivilegedController: @unchecked Sendable 
         runtimeDirectory: String = SourcePreservingLANPrivilegedController.runtimeDirectory,
         bridgeFactory: BridgeFactory? = nil,
         runCommand: CommandRunner? = nil,
-        writeAnchor: AnchorWriter? = nil
+        writeAnchor: AnchorWriter? = nil,
+        removeAnchor: AnchorRemover? = nil
     ) {
         self.enforceRoot = enforceRoot
         self.runtimeDirectory = runtimeDirectory
@@ -79,6 +89,7 @@ public final class SourcePreservingLANPrivilegedController: @unchecked Sendable 
         }
         self.runCommand = runCommand ?? Self.runCommand
         self.writeAnchor = writeAnchor ?? Self.writeAnchor
+        self.removeAnchor = removeAnchor ?? Self.removeAnchor
     }
 
     deinit {
@@ -93,13 +104,16 @@ public final class SourcePreservingLANPrivilegedController: @unchecked Sendable 
         defer { operationLock.unlock() }
         if enforceRoot, geteuid() != 0 { throw SourcePreservingLANPrivilegedError.rootRequired }
         try Self.validateCommon(request)
+        guard acceptingSessions else {
+            throw SourcePreservingLANPrivilegedError.decommissioned
+        }
         switch request.operation {
         case .activate:
             return try activate(request, clientUID: clientUID)
         case .refresh:
-            return try refresh(request)
+            return try refresh(request, clientUID: clientUID)
         case .deactivate:
-            return try deactivate(request)
+            return try deactivate(request, clientUID: clientUID)
         }
     }
 
@@ -110,6 +124,39 @@ public final class SourcePreservingLANPrivilegedController: @unchecked Sendable 
         defer { operationLock.unlock() }
         try ensureRuntimeDirectory()
         try cleanPersistentNetworkState()
+    }
+
+    /// Removes any live LAN bridge owned by the signed caller, then verifies that no Dory LAN PF
+    /// reference or forwarding marker remains. Uninstall uses this before unregistering the root
+    /// daemon so a running or recently failed engine cannot leave host networking behind.
+    public func removeOwnedState(clientUID: uid_t) throws {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        lock.lock()
+        let sessionID = activeSessionID
+        let sessionOwner = activeClientUID
+        let hasBridge = activeBridge != nil
+        lock.unlock()
+        if let sessionID, hasBridge {
+            guard sessionOwner == clientUID else {
+                throw SourcePreservingLANPrivilegedError.sessionOwnerMismatch(
+                    expected: sessionOwner ?? 0,
+                    actual: clientUID
+                )
+            }
+            acceptingSessions = false
+            _ = try cleanupActiveSession(
+                expectedSessionID: sessionID,
+                expectedClientUID: clientUID
+            )
+        } else if sessionID != nil || sessionOwner != nil || hasBridge {
+            throw SourcePreservingLANPrivilegedError.sessionConflict
+        } else {
+            acceptingSessions = false
+        }
+        try ensureRuntimeDirectory()
+        try cleanPersistentNetworkState()
+        try removeAnchor()
     }
 
     private func activate(
@@ -123,10 +170,17 @@ public final class SourcePreservingLANPrivilegedController: @unchecked Sendable 
 
         lock.lock()
         let existingSessionID = activeSessionID
+        let existingClientUID = activeClientUID
         let existingBridge = activeBridge
         let existingInterfaceName = activeInterfaceName
         lock.unlock()
         if let existingSessionID, let existingBridge {
+            guard existingClientUID == clientUID else {
+                throw SourcePreservingLANPrivilegedError.sessionOwnerMismatch(
+                    expected: existingClientUID ?? 0,
+                    actual: clientUID
+                )
+            }
             if existingBridge.isHealthy {
                 guard existingSessionID == request.sessionID else {
                     throw SourcePreservingLANPrivilegedError.sessionConflict
@@ -135,7 +189,7 @@ public final class SourcePreservingLANPrivilegedController: @unchecked Sendable 
                 return response(request, interfaceName: existingInterfaceName)
             }
             _ = try cleanupActiveSession(expectedSessionID: existingSessionID)
-        } else if existingSessionID != nil || existingBridge != nil {
+        } else if existingSessionID != nil || existingClientUID != nil || existingBridge != nil {
             throw SourcePreservingLANPrivilegedError.sessionConflict
         }
 
@@ -164,6 +218,7 @@ public final class SourcePreservingLANPrivilegedController: @unchecked Sendable 
             throw SourcePreservingLANPrivilegedError.sessionConflict
         }
         activeSessionID = request.sessionID
+        activeClientUID = clientUID
         activeBridge = bridge
         activeInterfaceName = nil
         activePFToken = nil
@@ -240,18 +295,34 @@ public final class SourcePreservingLANPrivilegedController: @unchecked Sendable 
         }
     }
 
-    private func refresh(_ request: SourcePreservingLANRequest) throws -> SourcePreservingLANResponse {
+    private func refresh(
+        _ request: SourcePreservingLANRequest,
+        clientUID: uid_t
+    ) throws -> SourcePreservingLANResponse {
         lock.lock()
         let matches = activeSessionID == request.sessionID && activeBridge != nil
+        let sessionOwner = activeClientUID
         let interfaceName = activeInterfaceName
         lock.unlock()
         guard matches else { throw SourcePreservingLANPrivilegedError.noActiveSession }
+        guard sessionOwner == clientUID else {
+            throw SourcePreservingLANPrivilegedError.sessionOwnerMismatch(
+                expected: sessionOwner ?? 0,
+                actual: clientUID
+            )
+        }
         _ = try applyPF(bindings: request.bindings, enable: false)
         return response(request, interfaceName: interfaceName)
     }
 
-    private func deactivate(_ request: SourcePreservingLANRequest) throws -> SourcePreservingLANResponse {
-        let interfaceName = try cleanupActiveSession(expectedSessionID: request.sessionID)
+    private func deactivate(
+        _ request: SourcePreservingLANRequest,
+        clientUID: uid_t
+    ) throws -> SourcePreservingLANResponse {
+        let interfaceName = try cleanupActiveSession(
+            expectedSessionID: request.sessionID,
+            expectedClientUID: clientUID
+        )
         return SourcePreservingLANResponse(
             status: "stopped",
             sessionID: request.sessionID,
@@ -265,12 +336,21 @@ public final class SourcePreservingLANPrivilegedController: @unchecked Sendable 
     /// PF reference or losing the knowledge required to restore host forwarding.
     private func cleanupActiveSession(
         expectedSessionID: String,
+        expectedClientUID: uid_t? = nil,
         expectedBridgeID: ObjectIdentifier? = nil
     ) throws -> String? {
         lock.lock()
         guard activeSessionID == expectedSessionID, let bridge = activeBridge else {
             lock.unlock()
             throw SourcePreservingLANPrivilegedError.noActiveSession
+        }
+        if let expectedClientUID, activeClientUID != expectedClientUID {
+            let sessionOwner = activeClientUID ?? 0
+            lock.unlock()
+            throw SourcePreservingLANPrivilegedError.sessionOwnerMismatch(
+                expected: sessionOwner,
+                actual: expectedClientUID
+            )
         }
         if let expectedBridgeID, ObjectIdentifier(bridge) != expectedBridgeID {
             lock.unlock()
@@ -333,6 +413,7 @@ public final class SourcePreservingLANPrivilegedController: @unchecked Sendable 
             throw SourcePreservingLANPrivilegedError.noActiveSession
         }
         activeSessionID = nil
+        activeClientUID = nil
         activeBridge = nil
         activeInterfaceName = nil
         activePFToken = nil
@@ -771,6 +852,73 @@ public final class SourcePreservingLANPrivilegedController: @unchecked Sendable 
                 "rename \(temporary): \(String(cString: strerror(errno)))"
             )
         }
+        let directoryDescriptor = open(directory, O_RDONLY | O_CLOEXEC)
+        guard directoryDescriptor >= 0 else {
+            throw SourcePreservingLANPrivilegedError.commandFailed(
+                "open \(directory): \(String(cString: strerror(errno)))"
+            )
+        }
+        defer { close(directoryDescriptor) }
+        guard fsync(directoryDescriptor) == 0 else {
+            throw SourcePreservingLANPrivilegedError.commandFailed(
+                "fsync \(directory): \(String(cString: strerror(errno)))"
+            )
+        }
+    }
+
+    private static func removeAnchor() throws {
+        let marker = Data("# Managed by Dory. Do not edit.\n".utf8)
+        let descriptor = open(anchorPath, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        if descriptor < 0, errno == ENOENT { return }
+        guard descriptor >= 0 else {
+            throw SourcePreservingLANPrivilegedError.commandFailed(
+                "open \(anchorPath): \(String(cString: strerror(errno)))"
+            )
+        }
+        defer { close(descriptor) }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0,
+              info.st_mode & S_IFMT == S_IFREG,
+              info.st_nlink == 1,
+              info.st_uid == 0,
+              info.st_size == marker.count else {
+            throw SourcePreservingLANPrivilegedError.commandFailed(
+                "refusing to remove an unsafe or active PF anchor: \(anchorPath)"
+            )
+        }
+        var contents = [UInt8](repeating: 0, count: marker.count)
+        var offset = 0
+        while offset < contents.count {
+            let remaining = contents.count - offset
+            let count = contents.withUnsafeMutableBytes { raw in
+                while true {
+                    let result = Darwin.read(
+                        descriptor,
+                        raw.baseAddress?.advanced(by: offset),
+                        remaining
+                    )
+                    if result < 0, errno == EINTR { continue }
+                    return result
+                }
+            }
+            guard count > 0 else {
+                throw SourcePreservingLANPrivilegedError.commandFailed(
+                    "read \(anchorPath): \(String(cString: strerror(errno)))"
+                )
+            }
+            offset += count
+        }
+        guard Data(contents) == marker else {
+            throw SourcePreservingLANPrivilegedError.commandFailed(
+                "refusing to remove a PF anchor not owned by Dory"
+            )
+        }
+        guard unlink(anchorPath) == 0 else {
+            throw SourcePreservingLANPrivilegedError.commandFailed(
+                "unlink \(anchorPath): \(String(cString: strerror(errno)))"
+            )
+        }
+        let directory = (anchorPath as NSString).deletingLastPathComponent
         let directoryDescriptor = open(directory, O_RDONLY | O_CLOEXEC)
         guard directoryDescriptor >= 0 else {
             throw SourcePreservingLANPrivilegedError.commandFailed(

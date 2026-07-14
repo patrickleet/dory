@@ -10,6 +10,10 @@ import Foundation
         _ request: NSData,
         withReply reply: @escaping (Bool, NSString?) -> Void
     )
+
+    func removeOwnedNetworking(
+        withReply reply: @escaping (Bool, NSString?) -> Void
+    )
 }
 
 public enum DoryPrivilegedNetworkXPC {
@@ -18,7 +22,7 @@ public enum DoryPrivilegedNetworkXPC {
     private static let teamRequirement =
         "anchor apple generic and certificate leaf[subject.OU] = \"\(teamID)\""
     public static let productionClientRequirement =
-        "\(teamRequirement) and (identifier \"doryd\" or identifier \"dory-vmm\" or identifier \"dory-hv\")"
+        "\(teamRequirement) and (identifier \"doryd\" or identifier \"dory-vmm\" or identifier \"dory-hv\" or identifier \"dory-network-helper\")"
     public static let productionHelperRequirement =
         "\(teamRequirement) and identifier \"dory-network-helper\""
 }

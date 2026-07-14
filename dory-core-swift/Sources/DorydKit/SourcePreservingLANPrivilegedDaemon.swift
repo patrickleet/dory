@@ -85,4 +85,17 @@ private final class SourcePreservingLANPrivilegedService: NSObject, DoryPrivileg
             reply(false, "\(error)" as NSString)
         }
     }
+
+    func removeOwnedNetworking(
+        withReply reply: @escaping (Bool, NSString?) -> Void
+    ) {
+        do {
+            try controller.removeOwnedState(clientUID: clientUID)
+            let removed = try NetworkingAuthorizationApplier()
+                .removeAuthorizedNetworking(clientUID: clientUID)
+            reply(removed, nil)
+        } catch {
+            reply(false, "\(error)" as NSString)
+        }
+    }
 }

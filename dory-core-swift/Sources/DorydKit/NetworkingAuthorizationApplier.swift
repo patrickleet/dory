@@ -245,11 +245,40 @@ public struct NetworkingAuthorizationApplier: Sendable {
     public func remove(_ plan: NetworkingAuthorizationPlan) throws -> [NetworkingAuthorizationApplyResult] {
         let expected = try expectedPlan(for: plan)
         try validate(plan: plan, expected: expected)
-        let mutationLock: Int32? = dryRun ? nil : try acquireMutationLock()
-        defer {
-            if let mutationLock { releaseMutationLock(mutationLock) }
+        guard !dryRun else {
+            return try plan.requests.reversed().map { try result(for: $0, removing: true) }
         }
-        let installedState = dryRun ? nil : try readAuthorizationState()
+        let mutationLock = try acquireMutationLock()
+        defer { releaseMutationLock(mutationLock) }
+        return try removeLocked(
+            submittedPlan: plan,
+            installedState: try readAuthorizationState()
+        )
+    }
+
+    /// Removes the exact persisted authorization for a signed client without requiring doryd to
+    /// still be running to reproduce the plan. This is the uninstall path and cannot cross users.
+    @discardableResult
+    public func removeAuthorizedNetworking(clientUID: uid_t) throws -> Bool {
+        guard !dryRun else {
+            throw NetworkingAuthorizationApplyError.unsafeRequest("remove-authorized-dry-run")
+        }
+        let mutationLock = try acquireMutationLock()
+        defer { releaseMutationLock(mutationLock) }
+        guard let installedState = try readAuthorizationState() else { return false }
+        var constrained = self
+        constrained.ownerUID = clientUID
+        _ = try constrained.removeLocked(
+            submittedPlan: installedState.plan,
+            installedState: installedState
+        )
+        return true
+    }
+
+    private func removeLocked(
+        submittedPlan plan: NetworkingAuthorizationPlan,
+        installedState: NetworkingAuthorizationState?
+    ) throws -> [NetworkingAuthorizationApplyResult] {
         if let installedState {
             try validateStoredState(installedState)
             if let ownerUID, ownerUID != installedState.ownerUID {
@@ -261,9 +290,6 @@ public struct NetworkingAuthorizationApplier: Sendable {
         }
         let installedPlan = installedState?.plan ?? plan
         try preflightRemoval(installedPlan.requests)
-        guard !dryRun else {
-            return try installedPlan.requests.reversed().map { try result(for: $0, removing: true) }
-        }
 
         let persistedCertificate = try readSafeRegularFile(
             path: Self.trustedCASnapshotPath,

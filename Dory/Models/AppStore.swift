@@ -1784,7 +1784,22 @@ final class AppStore {
     nonisolated static func unregisterPrivilegedNetworkDaemon() async throws {
         let service = SMAppService.daemon(plistName: "dev.dory.network-helper.plist")
         switch service.status {
-        case .enabled, .requiresApproval:
+        case .enabled:
+            try await removeOwnedNetworkingWithBundledHelper()
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                service.unregister { error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume()
+                    }
+                }
+            }
+        case .requiresApproval:
+            guard !privilegedNetworkingStateExists() else {
+                SMAppService.openSystemSettingsLoginItems()
+                throw NetworkingAuthorizationUIError.daemonApprovalRequired
+            }
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 service.unregister { error in
                     if let error {
@@ -1795,10 +1810,51 @@ final class AppStore {
                 }
             }
         case .notRegistered, .notFound:
+            guard !privilegedNetworkingStateExists() else {
+                throw NetworkingAuthorizationUIError.cleanupFailed(
+                    "Dory networking state still exists but its privileged service is not available."
+                )
+            }
             return
         @unknown default:
             throw NetworkingAuthorizationUIError.daemonUnavailable
         }
+    }
+
+    nonisolated private static func removeOwnedNetworkingWithBundledHelper() async throws {
+        guard let helper = bundledHelper("dory-network-helper") else {
+            throw NetworkingAuthorizationUIError.helperMissing
+        }
+        let result = await Shell.runAsyncResult(helper, ["--remove-owned-networking"])
+        let output = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard result.exit == 0,
+              output == "network-authorization=removed"
+                || output == "network-authorization=absent" else {
+            throw NetworkingAuthorizationUIError.cleanupFailed(
+                output.isEmpty ? "The privileged helper returned exit \(result.exit)." : output
+            )
+        }
+        guard !privilegedNetworkingStateExists() else {
+            throw NetworkingAuthorizationUIError.cleanupFailed(
+                "The privileged helper returned success but Dory networking files still exist."
+            )
+        }
+    }
+
+    nonisolated private static func privilegedNetworkingStateExists() -> Bool {
+        let configuredSuffix = normalizedDomainSuffix(
+            UserDefaults.standard.string(forKey: domainSuffixKey)
+        ) ?? defaultDomainSuffix
+        return [
+            "/private/var/db/dev.dory/network-authorization.json",
+            "/private/var/db/dev.dory/local-ca.crt",
+            "/etc/pf.anchors/dev.dory",
+            "/etc/pf.anchors/dev.dory.lan",
+            "/etc/resolver/\(configuredSuffix)",
+            "/var/run/dev.dory/system-pf-enable-token",
+            "/var/run/dev.dory/pf-enable-token",
+            "/var/run/dev.dory/ipv4-forwarding-owner",
+        ].contains { FileManager.default.fileExists(atPath: $0) }
     }
 
     nonisolated private static func shellQuote(_ value: String) -> String {
@@ -1821,6 +1877,7 @@ final class AppStore {
         case daemonMissing
         case daemonApprovalRequired
         case daemonUnavailable
+        case cleanupFailed(String)
 
         var errorDescription: String? {
             switch self {
@@ -1832,6 +1889,8 @@ final class AppStore {
                 return "Approve Dory's networking service in System Settings > General > Login Items, then try again."
             case .daemonUnavailable:
                 return "Dory's privileged networking service is unavailable."
+            case .cleanupFailed(let detail):
+                return "Dory could not remove its owned networking state: \(detail)"
             }
         }
     }

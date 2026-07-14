@@ -48,6 +48,33 @@ public final class AuthorizedNetworkingClient: AuthorizedNetworkingApplying, @un
         }
         return completion.reconciled
     }
+
+    /// Removes the caller's exact root-owned authorization and any live source-preserving LAN
+    /// session. The root service verifies the signing identity and effective UID.
+    public func removeOwnedNetworking() throws -> Bool {
+        let connection = connectionFactory()
+        connection.remoteObjectInterface = NSXPCInterface(with: DoryPrivilegedNetworkControl.self)
+        connection.setCodeSigningRequirement(DoryPrivilegedNetworkXPC.productionHelperRequirement)
+        connection.resume()
+        defer { connection.invalidate() }
+
+        let completion = AuthorizedNetworkingReplyBox()
+        guard let proxy = connection.remoteObjectProxyWithErrorHandler({ error in
+            completion.finish(reconciled: false, error: "\(error)")
+        }) as? DoryPrivilegedNetworkControl else {
+            throw SourcePreservingLANClientError.invalidResponse
+        }
+        proxy.removeOwnedNetworking { removed, error in
+            completion.finish(reconciled: removed, error: error as String?)
+        }
+        guard completion.wait(timeout: timeout) else {
+            throw SourcePreservingLANClientError.timeout
+        }
+        if let error = completion.error {
+            throw SourcePreservingLANClientError.remote(error)
+        }
+        return completion.reconciled
+    }
 }
 
 /// Keeps the root-owned PF anchor aligned with live Docker publications after the user grants the
