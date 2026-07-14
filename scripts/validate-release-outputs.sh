@@ -82,8 +82,9 @@ for artifact in "${required_artifacts[@]}"; do
 done
 [ -s "$BUILD_DIR/release-manifest.json" ] || fail "release manifest is missing or empty"
 [ -d "$BUILD_DIR/export-arm64/Dory.app" ] || fail "arm64 notarized candidate app is missing"
-SBOM_SOURCE_COMMIT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sourceCommit"])' \
-  "$BUILD_DIR/release-manifest.json")"
+SBOM_SOURCE_COMMIT="$(python3 scripts/validate-release-metadata.py \
+  "$BUILD_DIR" "$VERSION" "$BUILD")" \
+  || fail "release manifest or appcast metadata is invalid"
 scripts/verify-release-sbom.py \
   --sbom "$BUILD_DIR/Dory-$VERSION.cdx.json" \
   --app "$BUILD_DIR/export-arm64/Dory.app" \
@@ -186,136 +187,6 @@ LITE_INFO="$LITE_APP/Contents/Info.plist"
   || fail "lite app marketing version does not match $VERSION"
 [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$LITE_INFO")" = "$BUILD" ] \
   || fail "lite app build does not match $BUILD"
-
-python3 - "$BUILD_DIR" "$VERSION" "$BUILD" <<'PY'
-import base64
-import email.utils
-import hashlib
-import json
-import os
-import re
-import sys
-import urllib.parse
-import xml.etree.ElementTree as ET
-
-build_dir, version, build = sys.argv[1:4]
-
-def sha256_file(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-manifest_path = os.path.join(build_dir, "release-manifest.json")
-with open(manifest_path, encoding="utf-8") as handle:
-    manifest = json.load(handle)
-
-assert manifest.get("schemaVersion") == 2, "unexpected release manifest schema"
-assert manifest.get("version") == version, "manifest version mismatch"
-assert str(manifest.get("build")) == build, "manifest build mismatch"
-source_commit = manifest.get("sourceCommit")
-assert isinstance(source_commit, str) and len(source_commit) == 40 \
-    and all(character in "0123456789abcdef" for character in source_commit), \
-    "manifest sourceCommit is not a full lowercase Git SHA"
-assert manifest.get("publicRelease") is True, "manifest is not marked as a public release"
-assert manifest.get("bundleEngine") is True, "manifest describes an app-only release"
-assert manifest.get("notarized") is True, "manifest describes an unnotarized release"
-assert manifest.get("variants") == "arm64", "manifest is not Apple-Silicon-only"
-
-required = {
-    f"Dory-{version}-arm64.zip",
-    f"Dory-{version}.zip",
-    f"Dory-{version}-arm64.dmg",
-    f"Dory-{version}.dmg",
-    f"Dory-{version}-lite.zip",
-    f"Dory-{version}-app-update.zip",
-    f"dory-engine-{version}-arm64.tar.gz",
-    f"Dory-{version}.cdx.json",
-    "appcast.xml",
-}
-records = manifest.get("artifacts")
-assert isinstance(records, list) and records, "manifest has no artifacts"
-by_name = {record.get("name"): record for record in records}
-assert len(by_name) == len(records), "manifest contains duplicate artifact names"
-missing = required - set(by_name)
-assert not missing, f"manifest omits required artifacts: {sorted(missing)}"
-unexpected = set(by_name) - required
-assert not unexpected, f"manifest contains unexpected public artifacts: {sorted(unexpected)}"
-for name, record in by_name.items():
-    recorded_path = record.get("path")
-    assert recorded_path == name, f"manifest path must be a portable artifact filename: {name}: {recorded_path}"
-    path = os.path.join(build_dir, name)
-    assert os.path.isfile(path), f"manifest artifact is missing: {name}: {path}"
-    size = os.path.getsize(path)
-    assert record.get("bytes") == size, f"manifest byte count mismatch: {name}"
-    digest = sha256_file(path)
-    assert record.get("sha256") == digest, f"manifest SHA-256 mismatch: {name}"
-
-sbom_record = by_name[f"Dory-{version}.cdx.json"]
-assert sbom_record.get("kind") == "cyclonedx-json", "SBOM artifact kind mismatch"
-
-sparkle = "http://www.andymatuschak.org/xml-namespaces/sparkle"
-root = ET.parse(os.path.join(build_dir, "appcast.xml")).getroot()
-assert root.tag == "rss" and root.attrib.get("version") == "2.0", "appcast root is invalid"
-channel = root.find("channel")
-assert channel is not None, "appcast has no channel"
-assert channel.findtext("title") == "Dory", "appcast channel identity mismatch"
-assert channel.findtext("link") == "https://augani.github.io/dory/appcast.xml", "appcast link mismatch"
-items = channel.findall("item")
-assert items, "appcast has no current item"
-item = items[0]
-assert item.findtext(f"{{{sparkle}}}version") == build, "appcast build mismatch"
-assert item.findtext(f"{{{sparkle}}}shortVersionString") == version, "appcast version mismatch"
-expected_name = f"Dory-{version}-app-update.zip"
-artifact_path = os.path.join(build_dir, expected_name)
-seen_builds = set()
-seen_versions = set()
-for index, release_item in enumerate(items):
-    release_build = release_item.findtext(f"{{{sparkle}}}version", "")
-    release_version = release_item.findtext(f"{{{sparkle}}}shortVersionString", "")
-    assert release_build.isdigit() and int(release_build) > 0, "appcast item build is invalid"
-    assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?", release_version), \
-        "appcast item version is invalid"
-    assert release_build not in seen_builds, f"duplicate appcast build: {release_build}"
-    assert release_version not in seen_versions, f"duplicate appcast version: {release_version}"
-    seen_builds.add(release_build)
-    seen_versions.add(release_version)
-    assert release_item.findtext(f"{{{sparkle}}}minimumSystemVersion") == "14.0", \
-        f"appcast {release_version} macOS floor mismatch"
-    publication_date = release_item.findtext("pubDate", "")
-    assert email.utils.parsedate_to_datetime(publication_date).tzinfo is not None, \
-        f"appcast {release_version} publication date is invalid"
-    enclosure = release_item.find("enclosure")
-    assert enclosure is not None, f"appcast {release_version} item has no enclosure"
-    parsed_url = urllib.parse.urlparse(enclosure.attrib.get("url", ""))
-    actual_name = os.path.basename(parsed_url.path)
-    expected_prefix = f"/Augani/dory/releases/download/v{release_version}/"
-    assert parsed_url.scheme == "https" and parsed_url.netloc == "github.com", \
-        f"appcast {release_version} enclosure is not on GitHub"
-    assert parsed_url.path.startswith(expected_prefix), \
-        f"appcast {release_version} enclosure is outside its versioned Dory release"
-    assert actual_name.startswith(f"Dory-{release_version}") and actual_name.endswith(".zip"), \
-        f"appcast {release_version} enclosure filename is invalid"
-    assert enclosure.attrib.get("type") == "application/octet-stream", \
-        f"appcast {release_version} enclosure type is invalid"
-    length = enclosure.attrib.get("length", "")
-    assert length.isdigit() and int(length) > 0, f"appcast {release_version} length is invalid"
-    signature = enclosure.attrib.get(f"{{{sparkle}}}edSignature", "")
-    try:
-        decoded = base64.b64decode(signature, validate=True)
-    except Exception as error:
-        raise AssertionError(f"appcast {release_version} EdDSA signature is invalid: {error}") from error
-    assert len(decoded) == 64, \
-        f"appcast {release_version} EdDSA signature decoded to {len(decoded)} bytes, expected 64"
-    if index == 0:
-        assert actual_name == expected_name, \
-            f"appcast points at {actual_name!r}, expected {expected_name!r}"
-        assert length == str(os.path.getsize(artifact_path)), "appcast length mismatch"
-    else:
-        assert int(release_build) < int(build), \
-            f"historical appcast build {release_build} is not older than {build}"
-PY
 
 APP="$BUILD_DIR/export-arm64/Dory.app"
 INFO="$APP/Contents/Info.plist"

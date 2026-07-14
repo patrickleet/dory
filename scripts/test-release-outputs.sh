@@ -166,7 +166,10 @@ appcast = f'''<?xml version="1.0"?>
 <channel>
 <title>Dory</title>
 <link>https://augani.github.io/dory/appcast.xml</link>
+<description>Updates for Dory - native Docker and Linux containers for macOS.</description>
+<language>en</language>
 <item>
+<title>{version}</title>
 <pubDate>Tue, 14 Jul 2026 12:00:00 +0000</pubDate>
 <sparkle:version>{build}</sparkle:version>
 <sparkle:shortVersionString>{version}</sparkle:shortVersionString>

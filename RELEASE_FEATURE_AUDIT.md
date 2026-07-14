@@ -31,6 +31,8 @@ of scope so each fix remains reviewable.
 
 - [x] Build 23 is classified as diagnostic evidence, not a release candidate, after the repeated
   Linux-machine resize exposed an invalid storage attachment following forced shutdown.
+- [x] Build 23 is also rejected because its re-signed Sparkle app differs from the direct-app SBOM;
+  current release code preserves one exact signed app tree across both delivery paths.
 - [x] The build 23 installation and all clean-test Dory user state were removed; OrbStack and Colima
   are stopped.
 - [x] Superseded build 21 and build 22 directories were removed (6.9 GB reclaimed).
@@ -233,4 +235,3 @@ exists and the final candidate passes:
 - [ ] Eight-hour resource/file/API endurance and 90,000-second same-connection/network campaign on
   the exact final candidate while continuously on AC power.
 - [ ] Dedicated GitHub runner labels/secrets/variables and final publication workflow dry run.
-
