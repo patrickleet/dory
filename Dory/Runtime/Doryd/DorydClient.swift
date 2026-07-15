@@ -167,6 +167,7 @@ nonisolated struct DorydMachineSnapshot: Sendable, Equatable {
     var rootfsPath: String
     var sizeBytes: Int64
     var kernelPath: String
+    var architecture: String
     var memoryMB: UInt64
     var cpuCount: Int
 }
@@ -1157,6 +1158,7 @@ nonisolated final class DorydClient: @unchecked Sendable {
               let rootfsPath = dictionary["rootfsPath"] as? String,
               let sizeBytes = int64(dictionary["sizeBytes"]),
               let kernelPath = dictionary["kernelPath"] as? String,
+              let architecture = dictionary["architecture"] as? String,
               let memoryMB = uint64(dictionary["memoryMB"]),
               let cpuCount = int(dictionary["cpuCount"]) else {
             return nil
@@ -1169,6 +1171,7 @@ nonisolated final class DorydClient: @unchecked Sendable {
             rootfsPath: rootfsPath,
             sizeBytes: sizeBytes,
             kernelPath: kernelPath,
+            architecture: architecture,
             memoryMB: memoryMB,
             cpuCount: cpuCount
         )

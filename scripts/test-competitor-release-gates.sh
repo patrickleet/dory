@@ -720,6 +720,15 @@ grep -F 'testImportSnapshotRejectsInvalidResourcesBeforeExtractingRootfs' \
 grep -F 'testImportSnapshotCollisionPreservesExistingSnapshotAndAllocatesUniqueID' \
   dory-core-swift/Tests/DorydKitTests/MachineManagerTests.swift >/dev/null \
   || fail "portable machine imports can overwrite an existing snapshot on an ID collision"
+grep -F 'testImportSnapshotRejectsIncompatibleArchitectureBeforeExtractingArtifacts' \
+  dory-core-swift/Tests/DorydKitTests/MachineManagerTests.swift >/dev/null \
+  || fail "portable machine imports can extract an incompatible guest before rejection"
+grep -F 'snapshot.architecture == configuration.guestArchitecture' \
+  dory-core-swift/Sources/DorydKit/MachineManager.swift >/dev/null \
+  || fail "persisted machine snapshots are not bound to the active guest architecture"
+grep -F 'let architecture = dictionary["architecture"] as? String' \
+  Dory/Runtime/Doryd/DorydClient.swift >/dev/null \
+  || fail "the app drops portable machine architecture metadata"
 grep -F 'link(temporaryRootfsURL.path, rootfsURL.path)' \
   dory-core-swift/Sources/DorydKit/MachineManager.swift >/dev/null \
   || fail "portable machine import publication can replace an existing rootfs"

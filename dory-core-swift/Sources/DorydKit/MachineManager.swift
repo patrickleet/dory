@@ -10,6 +10,7 @@ public struct MachineManagerConfiguration: Sendable, Equatable {
     public var passMachineArguments: Bool
     public var logDirectory: String
     public var requiresReadyHandoff: Bool
+    public var guestArchitecture: String
 
     public init(
         vmmExecutablePath: String,
@@ -18,7 +19,8 @@ public struct MachineManagerConfiguration: Sendable, Equatable {
         baseArguments: [String] = [],
         passMachineArguments: Bool = true,
         logDirectory: String? = nil,
-        requiresReadyHandoff: Bool = true
+        requiresReadyHandoff: Bool = true,
+        guestArchitecture: String? = nil
     ) {
         self.vmmExecutablePath = vmmExecutablePath
         self.stateDirectory = stateDirectory
@@ -27,6 +29,17 @@ public struct MachineManagerConfiguration: Sendable, Equatable {
         self.passMachineArguments = passMachineArguments
         self.logDirectory = logDirectory ?? "\(stateDirectory)/logs"
         self.requiresReadyHandoff = requiresReadyHandoff
+        self.guestArchitecture = guestArchitecture ?? Self.currentGuestArchitecture
+    }
+
+    private static var currentGuestArchitecture: String {
+        #if arch(arm64)
+        "arm64"
+        #elseif arch(x86_64)
+        "amd64"
+        #else
+        "unsupported"
+        #endif
     }
 }
 
@@ -279,6 +292,7 @@ public struct DoryMachineSnapshot: Sendable, Equatable, Hashable, Codable {
     public var rootfsPath: String
     public var sizeBytes: Int64
     public var kernelPath: String
+    public var architecture: String
     public var memoryMB: UInt64
     public var cpuCount: Int
     public var address: String?
@@ -293,6 +307,7 @@ public struct DoryMachineSnapshot: Sendable, Equatable, Hashable, Codable {
         rootfsPath: String,
         sizeBytes: Int64,
         kernelPath: String,
+        architecture: String,
         memoryMB: UInt64,
         cpuCount: Int,
         address: String? = nil,
@@ -306,6 +321,7 @@ public struct DoryMachineSnapshot: Sendable, Equatable, Hashable, Codable {
         self.rootfsPath = rootfsPath
         self.sizeBytes = sizeBytes
         self.kernelPath = kernelPath
+        self.architecture = architecture
         self.memoryMB = memoryMB
         self.cpuCount = cpuCount
         self.address = address
@@ -811,6 +827,7 @@ public final class MachineManager: @unchecked Sendable {
                 rootfsPath: rootfsPath,
                 sizeBytes: Self.fileSize(path: rootfsPath),
                 kernelPath: kernelPath,
+                architecture: configuration.guestArchitecture,
                 memoryMB: machine.memoryMB,
                 cpuCount: machine.cpuCount,
                 address: machine.address,
@@ -1040,6 +1057,11 @@ public final class MachineManager: @unchecked Sendable {
             var snapshot = bundle.snapshot
             guard Self.isValidID(snapshot.machineID), Self.isValidID(snapshot.id) else {
                 throw MachineManagerError.persistence("invalid snapshot metadata")
+            }
+            guard snapshot.architecture == configuration.guestArchitecture else {
+                throw MachineManagerError.persistence(
+                    "machine snapshot architecture \(snapshot.architecture) is incompatible with \(configuration.guestArchitecture)"
+                )
             }
             try Self.validateResources(memoryMB: snapshot.memoryMB, cpuCount: snapshot.cpuCount)
             snapshot.address = nil
@@ -1593,6 +1615,7 @@ public final class MachineManager: @unchecked Sendable {
               snapshot.id == snapshotID,
               snapshot.rootfsPath == expectedRootfsPath,
               snapshot.kernelPath == expectedKernelPath,
+              snapshot.architecture == configuration.guestArchitecture,
               (try? Self.validateResources(memoryMB: snapshot.memoryMB, cpuCount: snapshot.cpuCount)) != nil,
               Self.isPrivateRegularFile(path: expectedRootfsPath),
               Self.isPrivateRegularFile(path: expectedKernelPath) else {

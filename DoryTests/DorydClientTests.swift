@@ -2300,6 +2300,7 @@ private final class FakeDorydService: NSObject, DorydControlXPC {
             "rootfsPath": "/tmp/\(machineID)-\(id).ext4",
             "sizeBytes": 1024,
             "kernelPath": "/tmp/kernel",
+            "architecture": "arm64",
             "memoryMB": 2048,
             "cpuCount": 2,
         ] as NSDictionary

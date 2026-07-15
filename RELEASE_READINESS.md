@@ -537,6 +537,10 @@ to the final release tag rather than representing this candidate as built from c
   operations retry only the daemon's exact duplicate-name response, while unrelated failures still
   return immediately; both creation screens and the store also enforce the daemon's 63-character
   limit before any machine work begins.
+- Machine snapshots and `.dorymachine` bundles now bind the guest architecture covered by their
+  rootfs and kernel digests. The Apple-Silicon manager rejects an `amd64` bundle before creating a
+  machine namespace or extracting either artifact, and the architecture is carried through XPC to
+  the app instead of being displayed as unknown.
 - Required Linux-machine provisioning no longer has a silent-success path. Nonzero and timed-out
   install/verify stages fail, unsupported recipes are rejected before creation, the app removes a
   newly created VM when setup fails, and the legacy container-machine path removes an incomplete

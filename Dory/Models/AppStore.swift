@@ -4302,7 +4302,7 @@ final class AppStore {
             sizeBytes: snapshot.sizeBytes,
             distro: "Dory VM",
             version: "disk",
-            arch: "",
+            arch: snapshot.architecture,
             boot: "vz",
             recipe: "doryd"
         )

@@ -139,6 +139,8 @@
 - Running machines show real guest CPU and used/total memory on the two-second UI refresh. The
   versioned `dorydctl machine stats <name>` JSON contract also reports network RX/TX, block I/O,
   process count, and uptime; stopped or unreadable machines show `—`, never fabricated zeroes.
+- Snapshots and exported `.dorymachine` files include their guest architecture. The Apple Silicon
+  release rejects incompatible bundles before extracting a disk or kernel into the selected drive.
 - Your home directory is shared into the engine, so `docker run -v ~/project:/app` just works.
   Host shares intentionally use plain virtio-fs: DAX host-share options are rejected until Dory can
   quiesce guest CPUs across a failed reverse invalidation without risking stale reads or late writes.

@@ -571,7 +571,8 @@ final class MachineManagerTests: XCTestCase {
                 createdISO: "2026-07-07T00:00:00Z",
                 rootfsPath: "/ignored",
                 sizeBytes: 0,
-            kernelPath: doryTestKernelPath,
+                kernelPath: doryTestKernelPath,
+                architecture: "arm64",
                 memoryMB: 2048,
                 cpuCount: 2
             ),
@@ -605,7 +606,8 @@ final class MachineManagerTests: XCTestCase {
                 createdISO: "2026-07-07T00:00:00Z",
                 rootfsPath: "/ignored",
                 sizeBytes: 0,
-            kernelPath: doryTestKernelPath,
+                kernelPath: doryTestKernelPath,
+                architecture: "arm64",
                 memoryMB: 2048,
                 cpuCount: 0
             ),
@@ -615,6 +617,46 @@ final class MachineManagerTests: XCTestCase {
         XCTAssertThrowsError(try manager.importSnapshot(fromPath: bundlePath))
         XCTAssertFalse(FileManager.default.fileExists(atPath: "\(base)/machines/dev/snapshots/s1.ext4"))
         XCTAssertFalse(FileManager.default.fileExists(atPath: "\(base)/machines/dev/snapshots/s1.json"))
+    }
+
+    func testImportSnapshotRejectsIncompatibleArchitectureBeforeExtractingArtifacts() throws {
+        let base = "/tmp/dory-machine-import-architecture-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: base) }
+        let manager = MachineManager(configuration: MachineManagerConfiguration(
+            vmmExecutablePath: "/bin/sleep",
+            stateDirectory: "\(base)/machines",
+            baseArguments: ["30"],
+            passMachineArguments: false,
+            requiresReadyHandoff: false,
+            guestArchitecture: "arm64"
+        ))
+        let bundlePath = "\(base)/amd64.dorymachine"
+        try writeMachineBundle(
+            toPath: bundlePath,
+            snapshot: DoryMachineSnapshot(
+                id: "s1",
+                machineID: "dev",
+                note: "wrong architecture",
+                createdISO: "2026-07-15T00:00:00Z",
+                rootfsPath: "/ignored",
+                sizeBytes: 0,
+                kernelPath: "/ignored",
+                architecture: "amd64",
+                memoryMB: 2048,
+                cpuCount: 2
+            ),
+            rootfs: Data("amd64-rootfs".utf8),
+            kernel: Data("amd64-kernel".utf8)
+        )
+
+        XCTAssertThrowsError(try manager.importSnapshot(fromPath: bundlePath)) { error in
+            XCTAssertEqual(
+                error as? MachineManagerError,
+                .persistence("machine snapshot architecture amd64 is incompatible with arm64")
+            )
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: "\(base)/machines/dev"))
     }
 
     func testImportSnapshotRejectsCorruptTruncatedTrailingAndLegacyBundles() throws {
@@ -638,7 +680,8 @@ final class MachineManagerTests: XCTestCase {
                 createdISO: "2026-07-07T00:00:00Z",
                 rootfsPath: "/ignored",
                 sizeBytes: 0,
-            kernelPath: doryTestKernelPath,
+                kernelPath: doryTestKernelPath,
+                architecture: "arm64",
                 memoryMB: 2048,
                 cpuCount: 2
             ),
@@ -729,6 +772,7 @@ final class MachineManagerTests: XCTestCase {
                 rootfsPath: "/ignored",
                 sizeBytes: 0,
                 kernelPath: "/ignored",
+                architecture: "arm64",
                 memoryMB: 2048,
                 cpuCount: 2
             ),
@@ -763,6 +807,7 @@ final class MachineManagerTests: XCTestCase {
                 rootfsPath: "/ignored",
                 sizeBytes: 0,
                 kernelPath: doryTestKernelPath,
+                architecture: "arm64",
                 memoryMB: 2048,
                 cpuCount: 2
             ),
@@ -1644,6 +1689,7 @@ final class MachineManagerTests: XCTestCase {
         XCTAssertEqual(snapshot.id, "s1")
         XCTAssertEqual(snapshot.machineID, "dev")
         XCTAssertEqual(snapshot.note, "before upgrade")
+        XCTAssertEqual(snapshot.architecture, "arm64")
         XCTAssertEqual(snapshot.memoryMB, 4096)
         XCTAssertEqual(snapshot.cpuCount, 4)
         XCTAssertEqual(snapshot.address, "192.168.215.55")

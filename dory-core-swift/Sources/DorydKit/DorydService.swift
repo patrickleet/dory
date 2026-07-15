@@ -1432,6 +1432,7 @@ private extension DoryMachineSnapshot {
             "rootfsPath": rootfsPath,
             "sizeBytes": sizeBytes,
             "kernelPath": kernelPath,
+            "architecture": architecture,
             "memoryMB": memoryMB,
             "cpuCount": cpuCount,
         ]
