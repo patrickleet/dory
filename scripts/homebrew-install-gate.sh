@@ -155,6 +155,54 @@ public = [{key: value for key, value in row.items() if key not in {"target", "ba
 pathlib.Path(evidence).write_text(json.dumps(public, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
 
+PLUGIN_BASELINE="$EVIDENCE/docker-plugin-baseline.json"
+python3 - "$HOME" "$PLUGIN_BASELINE" docker-compose docker-buildx <<'PY'
+import hashlib, json, os, pathlib, stat, sys
+
+home, output, *names = sys.argv[1:]
+rows = []
+for name in names:
+    path = pathlib.Path(home, ".docker", "cli-plugins", name)
+    if path.is_symlink():
+        rows.append({"name": name, "kind": "symlink", "target": os.readlink(path)})
+    elif path.is_file():
+        rows.append({
+            "name": name,
+            "kind": "file",
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "mode": stat.S_IMODE(path.stat().st_mode),
+        })
+    elif path.is_dir():
+        rows.append({"name": name, "kind": "directory", "mode": stat.S_IMODE(path.stat().st_mode)})
+    elif path.exists():
+        raise SystemExit(f"unsupported Docker plugin path: {path}")
+    else:
+        rows.append({"name": name, "kind": "missing"})
+pathlib.Path(output).write_text(json.dumps(rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+
+verify_plugin_baseline() {
+  python3 - "$HOME" "$PLUGIN_BASELINE" <<'PY'
+import hashlib, json, os, pathlib, stat, sys
+
+home = pathlib.Path(sys.argv[1])
+for row in json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")):
+    path = home / ".docker" / "cli-plugins" / row["name"]
+    kind = row["kind"]
+    if kind == "missing":
+        assert not path.exists() and not path.is_symlink(), f"created Docker plugin remains: {path}"
+    elif kind == "symlink":
+        assert path.is_symlink() and os.readlink(path) == row["target"], f"Docker plugin symlink changed: {path}"
+    elif kind == "file":
+        assert path.is_file() and not path.is_symlink(), f"Docker plugin type changed: {path}"
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == row["sha256"], f"Docker plugin bytes changed: {path}"
+        assert stat.S_IMODE(path.stat().st_mode) == row["mode"], f"Docker plugin mode changed: {path}"
+    elif kind == "directory":
+        assert path.is_dir() and not path.is_symlink(), f"Docker plugin directory changed: {path}"
+        assert stat.S_IMODE(path.stat().st_mode) == row["mode"], f"Docker plugin directory mode changed: {path}"
+PY
+}
+
 SERVER_PID=""
 MUTATION_STARTED=0
 TRASH_MARKER=""
@@ -337,12 +385,7 @@ for helper in docker docker-compose docker-buildx kubectl dory; do
   [ ! -e "$HOME/.dory/bin/$helper" ] && [ ! -L "$HOME/.dory/bin/$helper" ] \
     || die "Homebrew uninstall left the $helper integration"
 done
-[ ! -e "$HOME/.docker/cli-plugins/docker-compose" ] \
-  && [ ! -L "$HOME/.docker/cli-plugins/docker-compose" ] \
-  || die "Homebrew uninstall left the owned Compose plugin"
-[ ! -e "$HOME/.docker/cli-plugins/docker-buildx" ] \
-  && [ ! -L "$HOME/.docker/cli-plugins/docker-buildx" ] \
-  || die "Homebrew uninstall left the owned Buildx plugin"
+verify_plugin_baseline || die "Homebrew uninstall changed the user's Docker plugins"
 [ -f "$PRESERVATION_SENTINEL" ] || die "Homebrew uninstall removed the durable Dory drive"
 [ "$(shasum -a 256 "$SELECTION" | awk '{print $1}')" = "$SELECTION_SHA" ] \
   || die "Homebrew uninstall changed the selected-drive authority"
@@ -384,6 +427,7 @@ brew uninstall --cask --zap "$CASK" >"$EVIDENCE/brew-zap.log" 2>&1
   || die "Homebrew zap changed the selected-drive authority"
 HOME="$HOME" "$WORKROOT/candidate-docker" context inspect dory >/dev/null 2>&1 \
   && die "Homebrew zap left the Dory Docker context"
+verify_plugin_baseline || die "Homebrew zap changed the user's Docker plugins"
 python3 - "$HOME" "$WORKROOT/private-profiles/profiles.json" <<'PY'
 import hashlib, json, os, pathlib, stat, sys
 
@@ -419,6 +463,7 @@ sw_vers > "$EVIDENCE/macos-version.txt"
   printf 'data_drive_preserved=PASS\n'
   printf 'zap_preserved_data=PASS\n'
   printf 'zap_removed_transient_state=PASS\n'
+  printf 'docker_plugin_restoration=PASS\n'
   printf 'profile_restoration=PASS\n'
   printf 'status=PASS\n'
 } > "$EVIDENCE/manifest.txt"

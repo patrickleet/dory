@@ -1827,10 +1827,14 @@ for required in (
     'open -n "$APP"',
     'curl -fsS --max-time 2 --unix-socket "$STATE/dory.sock"',
     'brew uninstall --cask "$CASK"',
+    'docker-plugin-baseline.json',
+    'verify_plugin_baseline || die "Homebrew uninstall changed the user\'s Docker plugins"',
     'data_drive_preserved=PASS',
     'brew uninstall --cask --zap "$CASK"',
+    'verify_plugin_baseline || die "Homebrew zap changed the user\'s Docker plugins"',
     'zap_preserved_data=PASS',
     'zap_removed_transient_state=PASS',
+    'docker_plugin_restoration=PASS',
     'profile_restoration=PASS',
 ):
     assert required in homebrew_gate, f"Homebrew install certification omits: {required}"
