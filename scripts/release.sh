@@ -655,16 +655,14 @@ finish_app_artifact() {
 
 finish_zip_update_artifact() {
   local app="$1" zip="$2"
-  zip_app "$app" "$zip"
-  if [ "${DORY_SKIP_NOTARIZE:-0}" = "1" ]; then
-    echo "==> Skipping notarization for $zip (DORY_SKIP_NOTARIZE=1)"
-  else
-    echo "==> Notarizing $zip..."
-    notarize "$zip"
-    xcrun stapler staple "$app"
+  # The update app is copied from the already notarized and stapled direct-release app. Submitting
+  # that copy again creates a different stapling ticket in Contents/CodeResources, so Sparkle would
+  # install bytes that no longer match the direct ZIP, DMG, or exact-tree SBOM. Sparkle authenticates
+  # the ZIP with its EdDSA signature; Gatekeeper authenticates the unchanged signed/stapled app.
+  if [ "${DORY_SKIP_NOTARIZE:-0}" != "1" ]; then
     validate_stapled_app "$app"
-    zip_app "$app" "$zip"
   fi
+  zip_app "$app" "$zip"
 }
 
 json_escape() {

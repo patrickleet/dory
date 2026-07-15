@@ -1712,6 +1712,10 @@ assert "release-build/Dory-${{ needs.release_candidate.outputs.version }}.cdx.js
 release_script = open("scripts/release.sh", encoding="utf-8").read()
 for required in ("scripts/generate-release-sbom.py", "scripts/verify-release-sbom.py", '"cyclonedx-json"'):
     assert required in release_script, f"release SBOM pipeline omits: {required}"
+update_finish = release_script.split("finish_zip_update_artifact() {", 1)[1].split("\n}", 1)[0]
+assert "validate_stapled_app" in update_finish, "app-update does not validate the inherited ticket"
+assert "notarize " not in update_finish and "stapler staple" not in update_finish, \
+    "app-update replaces the direct app's SBOM-bound stapling ticket"
 assert "publish-pages:" in release, "release has no live Pages publication job"
 publish = release.split("  publish-pages:", 1)[1].split("\n  # Keeps the Homebrew", 1)[0]
 assert "needs: publish_release" in publish, "live feed can deploy before GitHub Release assets exist"
