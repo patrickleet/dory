@@ -21,9 +21,8 @@ cask "dory" do
     system_command "#{appdir}/Dory.app/Contents/Helpers/dory", args: ["install"]
   end
 
-  uninstall launchctl: "dev.dory.doryd",
-            quit:      "com.pythonxi.Dory",
-            script:    {
+  uninstall quit:   "com.pythonxi.Dory",
+            script: {
               executable: "#{appdir}/Dory.app/Contents/Helpers/dory",
               args:       ["uninstall"],
             }

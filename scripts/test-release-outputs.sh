@@ -1839,12 +1839,13 @@ for required in (
     "auto_updates true",
     'binary "#{appdir}/Dory.app/Contents/Helpers/dory"',
     'system_command "#{appdir}/Dory.app/Contents/Helpers/dory", args: ["install"]',
-    'uninstall launchctl: "dev.dory.doryd"',
-    'quit:      "com.pythonxi.Dory"',
+    'quit:   "com.pythonxi.Dory"',
     'executable: "#{appdir}/Dory.app/Contents/Helpers/dory"',
     'args:       ["uninstall"]',
 ):
     assert required in cask, f"Homebrew cask omits lifecycle cleanup: {required}"
+assert 'launchctl: "dev.dory.doryd"' not in cask, \
+    "Homebrew must not elevate cleanup for Dory's per-user LaunchAgent"
 assert 'Application Support/com.pythonxi.Dory' not in cask, \
     "Homebrew cask retains an obsolete pre-release Application Support path"
 sparkle_step = "scripts/sparkle-install-relaunch-gate.sh"
