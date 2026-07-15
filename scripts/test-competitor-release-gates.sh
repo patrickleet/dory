@@ -717,6 +717,12 @@ grep -F 'testPersistedInvalidResourcesCannotReachTheVMM' \
 grep -F 'testImportSnapshotRejectsInvalidResourcesBeforeExtractingRootfs' \
   dory-core-swift/Tests/DorydKitTests/MachineManagerTests.swift >/dev/null \
   || fail "invalid machine snapshot resources can allocate hidden data-drive storage"
+grep -F 'testImportSnapshotCollisionPreservesExistingSnapshotAndAllocatesUniqueID' \
+  dory-core-swift/Tests/DorydKitTests/MachineManagerTests.swift >/dev/null \
+  || fail "portable machine imports can overwrite an existing snapshot on an ID collision"
+grep -F 'link(temporaryRootfsURL.path, rootfsURL.path)' \
+  dory-core-swift/Sources/DorydKit/MachineManager.swift >/dev/null \
+  || fail "portable machine import publication can replace an existing rootfs"
 grep -F 'testVMMResourcesAreNeverSilentlyClamped' \
   dory-core-swift/Tests/DorydKitTests/DoryVMMKitTests.swift >/dev/null \
   || fail "the VMM no longer proves invalid resource values are rejected without mutation"

@@ -697,6 +697,57 @@ final class MachineManagerTests: XCTestCase {
         XCTAssertThrowsError(try manager.importSnapshot(fromPath: fifoPath))
     }
 
+    func testImportSnapshotCollisionPreservesExistingSnapshotAndAllocatesUniqueID() throws {
+        let base = "/tmp/dory-machine-import-collision-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        let sourceRootfs = "\(base)/source.ext4"
+        let bundlePath = "\(base)/collision.dorymachine"
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
+        try Data("existing-live-rootfs".utf8).write(to: URL(fileURLWithPath: sourceRootfs))
+        defer { try? FileManager.default.removeItem(atPath: base) }
+        let manager = MachineManager(configuration: MachineManagerConfiguration(
+            vmmExecutablePath: "/bin/sleep",
+            stateDirectory: "\(base)/machines",
+            baseArguments: ["30"],
+            passMachineArguments: false,
+            requiresReadyHandoff: false
+        ))
+        _ = try manager.create(DoryMachineConfiguration(
+            id: "dev",
+            kernelPath: doryTestKernelPath,
+            rootfsPath: sourceRootfs
+        ))
+        let existing = try manager.snapshot(id: "dev", snapshotID: "s1")
+        let existingRootfs = try Data(contentsOf: URL(fileURLWithPath: existing.rootfsPath))
+        let existingKernel = try Data(contentsOf: URL(fileURLWithPath: existing.kernelPath))
+        try writeMachineBundle(
+            toPath: bundlePath,
+            snapshot: DoryMachineSnapshot(
+                id: "s1",
+                machineID: "dev",
+                note: "portable collision",
+                createdISO: "2026-07-15T00:00:00Z",
+                rootfsPath: "/ignored",
+                sizeBytes: 0,
+                kernelPath: "/ignored",
+                memoryMB: 2048,
+                cpuCount: 2
+            ),
+            rootfs: Data("portable-rootfs".utf8),
+            kernel: Data("portable-kernel".utf8)
+        )
+
+        let imported = try manager.importSnapshot(fromPath: bundlePath)
+
+        XCTAssertNotEqual(imported.id, "s1")
+        XCTAssertTrue(imported.id.hasPrefix("import"))
+        XCTAssertLessThanOrEqual(imported.id.utf8.count, 63)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: existing.rootfsPath)), existingRootfs)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: existing.kernelPath)), existingKernel)
+        XCTAssertEqual(try String(contentsOfFile: imported.rootfsPath, encoding: .utf8), "portable-rootfs")
+        XCTAssertEqual(try String(contentsOfFile: imported.kernelPath, encoding: .utf8), "portable-kernel")
+        XCTAssertEqual(Set(try manager.listSnapshots(machineID: "dev").map(\.id)), ["s1", imported.id])
+    }
+
     func testDeletingLastImportedSnapshotRemovesOrphanedNamespace() throws {
         let base = "/tmp/dory-machine-import-cleanup-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
         try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)

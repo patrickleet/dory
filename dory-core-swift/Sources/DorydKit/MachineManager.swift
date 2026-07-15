@@ -786,9 +786,9 @@ public final class MachineManager: @unchecked Sendable {
         try ensurePrivateSnapshotDirectory(machineID: id)
         let rootfsPath = snapshotRootfsPath(machineID: id, snapshotID: snapshotID)
         let kernelPath = snapshotKernelPath(machineID: id, snapshotID: snapshotID)
-        guard !FileManager.default.fileExists(atPath: snapshotMetadataPath(machineID: id, snapshotID: snapshotID)),
-              !FileManager.default.fileExists(atPath: rootfsPath),
-              !FileManager.default.fileExists(atPath: kernelPath) else {
+        guard !Self.pathEntryExists(snapshotMetadataPath(machineID: id, snapshotID: snapshotID)),
+              !Self.pathEntryExists(rootfsPath),
+              !Self.pathEntryExists(kernelPath) else {
             throw MachineManagerError.duplicateSnapshot(snapshotID)
         }
 
@@ -796,9 +796,13 @@ public final class MachineManager: @unchecked Sendable {
             _ = try stop(id: id)
         }
         let snapshot: DoryMachineSnapshot
+        var publishedRootfs = false
+        var publishedKernel = false
         do {
             try Self.cloneOrCopyFile(source: machine.rootfsPath, destination: rootfsPath)
+            publishedRootfs = true
             try Self.cloneOrCopyFile(source: machine.kernelPath, destination: kernelPath)
+            publishedKernel = true
             snapshot = DoryMachineSnapshot(
                 id: snapshotID,
                 machineID: id,
@@ -815,8 +819,12 @@ public final class MachineManager: @unchecked Sendable {
             )
             try persistSnapshot(snapshot)
         } catch {
-            try? FileManager.default.removeItem(atPath: rootfsPath)
-            try? FileManager.default.removeItem(atPath: kernelPath)
+            if publishedRootfs {
+                try? FileManager.default.removeItem(atPath: rootfsPath)
+            }
+            if publishedKernel {
+                try? FileManager.default.removeItem(atPath: kernelPath)
+            }
             if wasRunning {
                 _ = try? start(id: id)
             }
@@ -1039,21 +1047,20 @@ public final class MachineManager: @unchecked Sendable {
             snapshot.environment = [:]
             importedMachineID = snapshot.machineID
             try ensurePrivateSnapshotDirectory(machineID: snapshot.machineID)
-            if FileManager.default.fileExists(atPath: snapshotMetadataPath(machineID: snapshot.machineID, snapshotID: snapshot.id)) ||
-                FileManager.default.fileExists(atPath: snapshotRootfsPath(machineID: snapshot.machineID, snapshotID: snapshot.id)) ||
-                FileManager.default.fileExists(atPath: snapshotKernelPath(machineID: snapshot.machineID, snapshotID: snapshot.id)) {
-                snapshot.id = Self.generatedSnapshotID(prefix: "import")
-            }
+            snapshot.id = try availableImportedSnapshotID(
+                machineID: snapshot.machineID,
+                preferredID: snapshot.id
+            )
             snapshot.rootfsPath = snapshotRootfsPath(machineID: snapshot.machineID, snapshotID: snapshot.id)
             snapshot.kernelPath = snapshotKernelPath(machineID: snapshot.machineID, snapshotID: snapshot.id)
-            extractedRootfsPath = snapshot.rootfsPath
-            extractedKernelPath = snapshot.kernelPath
             try MachineSnapshotBundle.extractArtifacts(
                 fromPath: path,
                 expectedContentID: bundle.contentID,
                 rootfsPath: snapshot.rootfsPath,
                 kernelPath: snapshot.kernelPath
             )
+            extractedRootfsPath = snapshot.rootfsPath
+            extractedKernelPath = snapshot.kernelPath
             snapshot.sizeBytes = Self.fileSize(path: snapshot.rootfsPath)
             try persistSnapshot(snapshot)
             return snapshot
@@ -1326,6 +1333,25 @@ public final class MachineManager: @unchecked Sendable {
         "\(snapshotDirectory(machineID: machineID))/\(snapshotID).kernel"
     }
 
+    private func availableImportedSnapshotID(machineID: String, preferredID: String) throws -> String {
+        if !snapshotArtifactsExist(machineID: machineID, snapshotID: preferredID) {
+            return preferredID
+        }
+        for _ in 0..<64 {
+            let candidate = Self.generatedSnapshotID(prefix: "import")
+            if !snapshotArtifactsExist(machineID: machineID, snapshotID: candidate) {
+                return candidate
+            }
+        }
+        throw MachineManagerError.persistence("could not allocate a unique imported snapshot id")
+    }
+
+    private func snapshotArtifactsExist(machineID: String, snapshotID: String) -> Bool {
+        Self.pathEntryExists(snapshotMetadataPath(machineID: machineID, snapshotID: snapshotID))
+            || Self.pathEntryExists(snapshotRootfsPath(machineID: machineID, snapshotID: snapshotID))
+            || Self.pathEntryExists(snapshotKernelPath(machineID: machineID, snapshotID: snapshotID))
+    }
+
     private func configurationAndRunningState(id: String) throws -> (DoryMachineConfiguration, Bool) {
         lock.lock()
         defer { lock.unlock() }
@@ -1401,18 +1427,34 @@ public final class MachineManager: @unchecked Sendable {
             throw MachineManagerError.persistence("could not preserve live kernel before restore: \(error)")
         }
         do {
-            try Self.cloneOrCopyFile(source: snapshot.rootfsPath, destination: machine.rootfsPath)
-            try Self.cloneOrCopyFile(source: snapshot.kernelPath, destination: machine.kernelPath)
+            try Self.cloneOrCopyFile(
+                source: snapshot.rootfsPath,
+                destination: machine.rootfsPath,
+                replaceExisting: true
+            )
+            try Self.cloneOrCopyFile(
+                source: snapshot.kernelPath,
+                destination: machine.kernelPath,
+                replaceExisting: true
+            )
             try commit()
         } catch {
             var rollbackFailures: [String] = []
             do {
-                try Self.cloneOrCopyFile(source: rootfsBackup, destination: machine.rootfsPath)
+                try Self.cloneOrCopyFile(
+                    source: rootfsBackup,
+                    destination: machine.rootfsPath,
+                    replaceExisting: true
+                )
             } catch {
                 rollbackFailures.append("rootfs rollback failed: \(error)")
             }
             do {
-                try Self.cloneOrCopyFile(source: kernelBackup, destination: machine.kernelPath)
+                try Self.cloneOrCopyFile(
+                    source: kernelBackup,
+                    destination: machine.kernelPath,
+                    replaceExisting: true
+                )
             } catch {
                 rollbackFailures.append("kernel rollback failed: \(error)")
             }
@@ -1745,10 +1787,15 @@ public final class MachineManager: @unchecked Sendable {
             .replacingOccurrences(of: "-", with: "")
             .replacingOccurrences(of: ".", with: "")
             .replacingOccurrences(of: "Z", with: "z")
-        return "\(prefix)\(stamp)-\(UUID().uuidString.prefix(8).lowercased())"
+        let token = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        return "\(prefix)\(stamp)-\(token)"
     }
 
-    private static func cloneOrCopyFile(source: String, destination: String) throws {
+    private static func cloneOrCopyFile(
+        source: String,
+        destination: String,
+        replaceExisting: Bool = false
+    ) throws {
         let destinationURL = URL(fileURLWithPath: destination)
         let parent = destinationURL.deletingLastPathComponent()
         let parentDescriptor = open(parent.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
@@ -1817,10 +1864,24 @@ public final class MachineManager: @unchecked Sendable {
                     )
                 }
             }
-            guard renameat(parentDescriptor, temporaryName, parentDescriptor, destinationName) == 0 else {
-                throw MachineManagerError.persistence(
-                    "could not replace \(destination): \(String(cString: strerror(errno)))"
-                )
+            if replaceExisting {
+                guard renameat(parentDescriptor, temporaryName, parentDescriptor, destinationName) == 0 else {
+                    throw MachineManagerError.persistence(
+                        "could not replace \(destination): \(String(cString: strerror(errno)))"
+                    )
+                }
+            } else {
+                guard linkat(parentDescriptor, temporaryName, parentDescriptor, destinationName, 0) == 0 else {
+                    throw MachineManagerError.persistence(
+                        "could not publish \(destination): \(String(cString: strerror(errno)))"
+                    )
+                }
+                guard unlinkat(parentDescriptor, temporaryName, 0) == 0 else {
+                    _ = unlinkat(parentDescriptor, destinationName, 0)
+                    throw MachineManagerError.persistence(
+                        "could not finalize \(destination): \(String(cString: strerror(errno)))"
+                    )
+                }
             }
         } catch {
             _ = unlinkat(parentDescriptor, temporaryName, 0)
@@ -1834,6 +1895,11 @@ public final class MachineManager: @unchecked Sendable {
             return number.int64Value
         }
         return 0
+    }
+
+    private static func pathEntryExists(_ path: String) -> Bool {
+        var info = stat()
+        return lstat(path, &info) == 0
     }
 
     private static func isPrivateRegularFile(path: String) -> Bool {
@@ -2234,16 +2300,32 @@ private enum MachineSnapshotBundle {
                 [.posixPermissions: 0o600],
                 ofItemAtPath: temporaryKernelURL.path
             )
-            guard rename(temporaryRootfsURL.path, rootfsURL.path) == 0 else {
+            var publishedRootfs = false
+            var publishedKernel = false
+            defer {
+                if publishedRootfs {
+                    try? FileManager.default.removeItem(at: rootfsURL)
+                }
+                if publishedKernel {
+                    try? FileManager.default.removeItem(at: kernelURL)
+                }
+            }
+            guard link(temporaryRootfsURL.path, rootfsURL.path) == 0 else {
                 throw MachineManagerError.persistence(
                     "could not publish machine snapshot rootfs: \(String(cString: strerror(errno)))"
                 )
             }
-            guard rename(temporaryKernelURL.path, kernelURL.path) == 0 else {
+            publishedRootfs = true
+            guard link(temporaryKernelURL.path, kernelURL.path) == 0 else {
                 throw MachineManagerError.persistence(
                     "could not publish machine snapshot kernel: \(String(cString: strerror(errno)))"
                 )
             }
+            publishedKernel = true
+            try FileManager.default.removeItem(at: temporaryRootfsURL)
+            try FileManager.default.removeItem(at: temporaryKernelURL)
+            publishedRootfs = false
+            publishedKernel = false
         } catch {
             try? FileManager.default.removeItem(at: temporaryRootfsURL)
             try? FileManager.default.removeItem(at: temporaryKernelURL)

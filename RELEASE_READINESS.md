@@ -529,6 +529,10 @@ to the final release tag rather than representing this candidate as built from c
   accepted only when it is a private, owner-controlled, nonempty regular file with one link. This
   closes symlink-swap, hard-link, public-permission, and unbounded-read paths before decoding; the
   regression matrix proves both machine reload and every snapshot operation fail closed.
+- Portable snapshot imports now allocate a full-entropy fallback ID across metadata, rootfs, and
+  kernel artifacts, and publish both payloads with exclusive links. An ID collision cannot replace
+  or clean up an existing snapshot; the regression keeps the original bytes intact while importing
+  the colliding bundle under a new valid ID.
 - Required Linux-machine provisioning no longer has a silent-success path. Nonzero and timed-out
   install/verify stages fail, unsupported recipes are rejected before creation, the app removes a
   newly created VM when setup fails, and the legacy container-machine path removes an incomplete
