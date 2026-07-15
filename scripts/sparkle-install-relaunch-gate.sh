@@ -313,6 +313,7 @@ PY
 STATE="$HOME/.dory"
 APP_SUPPORT="$HOME/Library/Application Support/Dory"
 PREF_DOMAIN="com.pythonxi.Dory"
+PREF_PLIST="$HOME/Library/Preferences/$PREF_DOMAIN.plist"
 SERVICE="gui/$(id -u)/dev.dory.doryd"
 PLIST="$HOME/Library/LaunchAgents/dev.dory.doryd.plist"
 for process in Dory doryd dory-hv dory-vmm; do
@@ -385,6 +386,9 @@ clean_release_user_state() {
   rm -f "$PLIST"
   rm -rf "$STATE" "$APP_SUPPORT"
   defaults delete "$PREF_DOMAIN" >/dev/null 2>&1 || true
+  rm -f "$PREF_PLIST"
+  /usr/bin/killall -u "$(/usr/bin/id -un)" cfprefsd >/dev/null 2>&1 || true
+  rm -f "$PREF_PLIST"
 }
 
 cleanup() {

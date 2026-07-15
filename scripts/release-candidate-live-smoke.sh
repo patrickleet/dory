@@ -70,6 +70,8 @@ cleanup() {
   rm -rf "$STATE" "$APP_SUPPORT"
   defaults delete "$PREF_DOMAIN" >/dev/null 2>&1 || true
   rm -f "$PREF_PLIST"
+  /usr/bin/killall -u "$(/usr/bin/id -un)" cfprefsd >/dev/null 2>&1 || true
+  rm -f "$PREF_PLIST"
   for index in "${!PROFILE_PATHS[@]}"; do
     profile="${PROFILE_PATHS[$index]}"
     if [ "${PROFILE_EXISTED[$index]}" = "0" ] && [ -f "$profile" ] \

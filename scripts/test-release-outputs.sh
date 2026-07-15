@@ -1724,6 +1724,8 @@ for gate in ("scripts/release-candidate-live-smoke.sh", "scripts/homebrew-instal
     clean_user_gate = open(gate, encoding="utf-8").read()
     assert 'defaults read "$PREF_DOMAIN"' in clean_user_gate, \
         f"{gate} does not detect an existing preference domain"
+    assert '/usr/bin/killall -u "$(/usr/bin/id -un)" cfprefsd' in clean_user_gate, \
+        f"{gate} can leave the clean user preference domain cached"
     assert 'defaults export "$PREF_DOMAIN" -' not in clean_user_gate, \
         f"{gate} mistakes macOS 27's empty export for an existing preference domain"
 assert "publish-pages:" in release, "release has no live Pages publication job"

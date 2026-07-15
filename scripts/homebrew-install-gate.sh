@@ -88,6 +88,7 @@ APP_SUPPORT="$HOME/Library/Application Support/Dory"
 DRIVE="$APP_SUPPORT/Dory.dorydrive"
 SELECTION="$APP_SUPPORT/data-drive-selection.json"
 PREF_DOMAIN="com.pythonxi.Dory"
+PREF_PLIST="$HOME/Library/Preferences/$PREF_DOMAIN.plist"
 BREW_BIN="$(brew --prefix)/bin/dory"
 TAP="doryci/release-install"
 CASK="$TAP/dory"
@@ -221,6 +222,9 @@ cleanup() {
     rm -f "$PLIST"
     rm -rf "$STATE" "$APP_SUPPORT"
     defaults delete "$PREF_DOMAIN" >/dev/null 2>&1 || true
+    rm -f "$PREF_PLIST"
+    /usr/bin/killall -u "$(/usr/bin/id -un)" cfprefsd >/dev/null 2>&1 || true
+    rm -f "$PREF_PLIST"
   fi
   brew untap --force "$TAP" >/dev/null 2>&1 || true
   [ -z "$SERVER_PID" ] || kill "$SERVER_PID" >/dev/null 2>&1 || true
