@@ -162,16 +162,24 @@ owned_dataplane_pids() {
 }
 
 # dory-hv normally owns and reaps gvproxy. If dory-hv itself must be SIGKILLed, gvproxy is
-# reparented and no pidfile exists for it. Match the gvproxy command plus this HOME's two exact
-# private socket paths before touching a process, so forced cleanup cannot affect another engine.
-# The executable path itself may retain redundant `//` components after launch while `$HERE` is
-# canonicalized by `pwd`, so the socket pair is the stable ownership identity.
+# reparented and no pidfile exists for it. The executable path may retain redundant path components
+# after launch, so match its basename plus both private sockets in one per-launch n<PID> directory.
+# That stable identity prevents cleanup from affecting another engine or a newer gvproxy instance
+# that reused the same state root.
 owned_gvproxy_pids() {
   ps -axo pid=,command= 2>/dev/null | awk \
-    -v net="$STATE/hv/net.sock" \
-    -v api="$STATE/hv/gvproxy-api.sock" '
-      index($0, "/awk ") == 0 && index($0, "/gvproxy") && index($0, net) && index($0, api) {
-        print $1
+    -v root="$STATE/hv/" '
+      index($0, "/awk ") == 0 && index($0, "/gvproxy ") {
+        vfkit = "-listen-vfkit unixgram://" root
+        start = index($0, vfkit)
+        if (!start) next
+        remainder = substr($0, start + length(vfkit))
+        finish = index(remainder, "/d.sock ")
+        if (!finish) next
+        scope = substr(remainder, 1, finish - 1)
+        if (scope !~ /^n[0-9]+$/) next
+        api = "-listen unix://" root scope "/a.sock "
+        if (index($0, api)) print $1
       }
     '
 }

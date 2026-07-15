@@ -1732,8 +1732,8 @@ kill "$unrelated_hv_pid" 2>/dev/null || true
 wait "$unrelated_hv_pid" 2>/dev/null || true
 
 # If dory-hv is force-killed, its gvproxy child can be reparented and outlive the VM. The
-# standalone supervisor must match the exact bundled binary plus both private state sockets and
-# reap that orphan even though gvproxy has no pidfile.
+# standalone supervisor must match both private per-launch sockets and reap that orphan even though
+# gvproxy has no pidfile or its executable path retains redundant components.
 cat > "$runtime/bin/gvproxy" <<'EOF'
 #!/bin/sh
 trap 'exit 0' TERM INT
@@ -1745,8 +1745,8 @@ mkdir -p "$runtime_home/.dory/hv" "$runtime_home/.dory/standalone/hv"
 # doryd and the standalone archive can coexist in one account, but only doryd owns ~/.dory/hv.
 # Stopping the standalone supervisor must not signal an app-owned gvproxy carrying those paths.
 "$runtime/bin/gvproxy" \
-  -listen-vfkit "unixgram://$runtime_home/.dory/hv/net.sock" \
-  -listen "unix://$runtime_home/.dory/hv/gvproxy-api.sock" &
+  -listen-vfkit "unixgram://$runtime_home/.dory/hv/n410/d.sock" \
+  -listen "unix://$runtime_home/.dory/hv/n410/a.sock" -config app.yaml &
 app_gvproxy_pid=$!
 test_pids="$test_pids $app_gvproxy_pid"
 sleep 0.2
@@ -1756,9 +1756,22 @@ kill -0 "$app_gvproxy_pid" 2>/dev/null \
 kill "$app_gvproxy_pid" 2>/dev/null || true
 wait "$app_gvproxy_pid" 2>/dev/null || true
 
+# Two sockets from different launch scopes are not one VM and must not be combined into ownership.
 "$runtime/bin/gvproxy" \
-  -listen-vfkit "unixgram://$runtime_home/.dory/standalone/hv/net.sock" \
-  -listen "unix://$runtime_home/.dory/standalone/hv/gvproxy-api.sock" &
+  -listen-vfkit "unixgram://$runtime_home/.dory/standalone/hv/n412/d.sock" \
+  -listen "unix://$runtime_home/.dory/standalone/hv/n413/a.sock" -config mixed.yaml &
+mixed_gvproxy_pid=$!
+test_pids="$test_pids $mixed_gvproxy_pid"
+sleep 0.2
+HOME="$runtime_home" "$runtime/dory-engine" stop > "$TMP/runtime-unowned-gvproxy-stop.out" 2>&1
+kill -0 "$mixed_gvproxy_pid" 2>/dev/null \
+  || fail "standalone runtime combined sockets from different launch scopes"
+kill "$mixed_gvproxy_pid" 2>/dev/null || true
+wait "$mixed_gvproxy_pid" 2>/dev/null || true
+
+"$runtime/bin/gvproxy" \
+  -listen-vfkit "unixgram://$runtime_home/.dory/standalone/hv/n411/d.sock" \
+  -listen "unix://$runtime_home/.dory/standalone/hv/n411/a.sock" -config standalone.yaml &
 orphan_pid=$!
 test_pids="$test_pids $orphan_pid"
 sleep 0.2
