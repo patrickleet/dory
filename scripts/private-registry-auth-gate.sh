@@ -169,8 +169,10 @@ docker_e image rm "$SOURCE_REF" >/dev/null
 docker_e rm -f "$NAME" >/dev/null
 
 htpasswd -Bbn "$USER_NAME" "$PASSWORD" > "$AUTH/htpasswd"
+# Distribution 2.8 opens the existing htpasswd file with write-capable flags. This directory is
+# run-scoped, mode 0700 via umask, and deleted after the gate, so keep this bind writable.
 docker_e run -d --name "$NAME" --network host \
-  -v "$VOLUME:/var/lib/registry" -v "$AUTH:/auth:ro" \
+  -v "$VOLUME:/var/lib/registry" -v "$AUTH:/auth" \
   -e "REGISTRY_HTTP_ADDR=127.0.0.1:$PORT" \
   -e REGISTRY_AUTH=htpasswd -e 'REGISTRY_AUTH_HTPASSWD_REALM=Dory candidate gate' \
   -e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd "$REGISTRY_IMAGE" >/dev/null

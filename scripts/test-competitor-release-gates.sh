@@ -209,6 +209,12 @@ done
 grep -F 'registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373' \
   scripts/private-registry-auth-gate.sh scripts/qualify-release-candidate.sh >/dev/null \
   || fail "private-registry qualification lost its digest-pinned registry fixture"
+grep -F -- '-v "$VOLUME:/var/lib/registry" -v "$AUTH:/auth"' \
+  scripts/private-registry-auth-gate.sh >/dev/null \
+  || fail "private-registry qualification does not provide Distribution's writable htpasswd bind"
+if grep -Fq '$AUTH:/auth:ro' scripts/private-registry-auth-gate.sh; then
+  fail "private-registry qualification mounts Distribution's write-opened htpasswd read-only"
+fi
 grep -F 'scripts/private-registry-auth-gate.sh' scripts/qualify-release-candidate.sh >/dev/null \
   || fail "exact candidate qualification does not run private-registry auth"
 grep -F 'private_registry_workroot="$ENGINE_HOME/gate-evidence/private-registry-auth"' \
