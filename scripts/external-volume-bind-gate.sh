@@ -74,12 +74,15 @@ done
 [ ! -L "$EXTERNAL_ROOT" ] || die "external test root must not be a symlink"
 EXTERNAL_ROOT="$(cd "$EXTERNAL_ROOT" && pwd -P)"
 case "$EXTERNAL_ROOT/" in /Volumes/*/*/) ;; *) die "test root must be below /Volumes/<external-name>: $EXTERNAL_ROOT" ;; esac
-diskutil info -plist "$EXTERNAL_ROOT" > "${TMPDIR:-/tmp}/dory-external-disk-$$.plist"
+volume_device="$(df -P "$EXTERNAL_ROOT" | awk 'NR == 2 { print $1 }')"
+[ -n "$volume_device" ] \
+  || die "could not resolve the backing device for external test root: $EXTERNAL_ROOT"
+diskutil info -plist "$volume_device" > "${TMPDIR:-/tmp}/dory-external-disk-$$.plist"
 disk_json="$(plutil -convert json -o - "${TMPDIR:-/tmp}/dory-external-disk-$$.plist")"
 rm -f "${TMPDIR:-/tmp}/dory-external-disk-$$.plist"
 mount_point="$(printf '%s' "$disk_json" | jq -r '.MountPoint // empty')"
 device_identifier="$(printf '%s' "$disk_json" | jq -r '.DeviceIdentifier // empty')"
-internal="$(printf '%s' "$disk_json" | jq -r '.Internal // true')"
+internal="$(printf '%s' "$disk_json" | jq -r 'if has("Internal") then .Internal else true end')"
 filesystem="$(printf '%s' "$disk_json" | jq -r '.FilesystemType // .FilesystemName // empty' | tr '[:upper:]' '[:lower:]')"
 [ -n "$mount_point" ] && [ -n "$device_identifier" ] \
   || die "external APFS device identity is incomplete"

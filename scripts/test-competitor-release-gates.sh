@@ -505,9 +505,18 @@ grep -F 'ISOLATED-EXTERNAL-APFS-BIND' scripts/external-volume-bind-gate.sh >/dev
   || fail "external APFS gate is not fail-closed to an isolated physical volume"
 grep -F 'test path is not on an external physical volume' scripts/external-volume-bind-gate.sh >/dev/null \
   || fail "external bind gate can qualify an internal/System volume"
+grep -F 'volume_device="$(df -P "$EXTERNAL_ROOT"' scripts/external-volume-bind-gate.sh >/dev/null \
+  || fail "external bind gate does not resolve a nested test directory to its backing device"
+grep -F 'diskutil info -plist "$volume_device"' scripts/external-volume-bind-gate.sh >/dev/null \
+  || fail "external bind gate queries diskutil with a path it cannot resolve"
+grep -F 'if has("Internal") then .Internal else true end' \
+  scripts/external-volume-bind-gate.sh >/dev/null \
+  || fail "external bind gate mistakes an explicit false Internal value for a missing value"
 grep -F 'DISCONNECT-RECONNECT-DEDICATED-APFS' scripts/external-volume-bind-gate.sh \
   scripts/release-candidate-live-smoke.sh >/dev/null \
   || fail "external APFS gate can skip physical disconnect/reconnect authorization"
+grep -F 'rm -f "$PREF_PLIST"' scripts/release-candidate-live-smoke.sh >/dev/null \
+  || fail "live release cleanup leaves an empty Dory preferences domain behind"
 grep -F 'DORY-DEDICATED-RELEASE-APFS-V1' scripts/external-volume-bind-gate.sh >/dev/null \
   || fail "external APFS gate can unmount an operator-unmarked volume"
 grep -F 'diskutil unmount "$device_identifier"' scripts/external-volume-bind-gate.sh >/dev/null \

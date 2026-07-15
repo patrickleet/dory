@@ -20,6 +20,7 @@ PLIST="$HOME/Library/LaunchAgents/dev.dory.doryd.plist"
 STATE="$HOME/.dory"
 APP_SUPPORT="$HOME/Library/Application Support/Dory"
 PREF_DOMAIN="com.pythonxi.Dory"
+PREF_PLIST="$HOME/Library/Preferences/$PREF_DOMAIN.plist"
 LOG_ROOT="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/dory-release-live-${GITHUB_RUN_ID:-$$}"
 REQUIRED_ARCH="${DORY_RELEASE_LIVE_REQUIRED_ARCH:-arm64}"
 REQUIRE_NOTARIZED="${DORY_RELEASE_LIVE_REQUIRE_NOTARIZED:-1}"
@@ -68,6 +69,7 @@ cleanup() {
   rm -f "$PLIST"
   rm -rf "$STATE" "$APP_SUPPORT"
   defaults delete "$PREF_DOMAIN" >/dev/null 2>&1 || true
+  rm -f "$PREF_PLIST"
   for index in "${!PROFILE_PATHS[@]}"; do
     profile="${PROFILE_PATHS[$index]}"
     if [ "${PROFILE_EXISTED[$index]}" = "0" ] && [ -f "$profile" ] \
