@@ -78,10 +78,10 @@ export function Features() {
           <li>Full Ubuntu, Debian, Fedora, Alpine, or Arch VMs, with systemd, SSH, terminal, and snapshots.</li>
           <li>Live CPU and memory per machine, right in the grid.</li>
           <li>
-            Each machine gets a <code>name.dory.local</code> address, and the UI shows the copyable{' '}
+            Each running machine gets a <code>name.dory.local</code> address, and the UI shows the copyable{' '}
             <code>dory ssh name</code> command for any terminal.
           </li>
-          <li>Assign custom addresses, mounts, ports, CPU, memory, and recipes before creation.</li>
+          <li>Automatic name.dory.local routing, plus mounts, ports, CPU, memory, and recipes.</li>
         </FeatureRow>
 
         <FeatureRow

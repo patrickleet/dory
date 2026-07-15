@@ -170,14 +170,14 @@ struct MachineComposerView: View {
                 Spacer(minLength: 0)
             }
             VStack(alignment: .leading, spacing: 6) {
-                fieldLabel("ADDRESS")
+                fieldLabel("DNS TARGET OVERRIDE")
                 TextField("192.168.215.42", text: $address)
                     .textFieldStyle(.plain).font(.mono(12.5)).foregroundStyle(p.text)
                     .padding(.horizontal, 10).padding(.vertical, 7)
                     .frame(width: 260)
                     .background(p.bgInput, in: RoundedRectangle(cornerRadius: 8))
                     .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(p.border))
-                Text("Optional IPv4 address published as \(dnsName).")
+                Text("Advanced: route \(dnsName) to this IPv4 instead of the address reported by the guest.")
                     .font(.system(size: 11)).foregroundStyle(p.text3)
             }
             if nameInvalid {

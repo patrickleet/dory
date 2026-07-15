@@ -154,8 +154,8 @@ func usage(exitCode: Int32 = 2) -> Never {
           dorydctl [global] machine list
           dorydctl [global] machine status NAME
           dorydctl [global] machine stats NAME
-          dorydctl [global] machine create NAME --kernel PATH --rootfs PATH [--memory-mb N] [--cpus N] [--address IPv4] [--share TAG=HOST:GUEST[:ro|rw] | JSON] [--env KEY=VALUE]
-          dorydctl [global] machine update NAME [--memory-mb N] [--cpus N] [--address IPv4 | --clear-address] [--share TAG=HOST:GUEST[:ro|rw] | JSON ... | --clear-shares] [--env KEY=VALUE ... | --clear-env]
+          dorydctl [global] machine create NAME --kernel PATH --rootfs PATH [--memory-mb N] [--cpus N] [--dns-target IPv4] [--share TAG=HOST:GUEST[:ro|rw] | JSON] [--env KEY=VALUE]
+          dorydctl [global] machine update NAME [--memory-mb N] [--cpus N] [--dns-target IPv4 | --clear-dns-target] [--share TAG=HOST:GUEST[:ro|rw] | JSON ... | --clear-shares] [--env KEY=VALUE ... | --clear-env]
           dorydctl [global] machine start|stop|delete NAME
           dorydctl [global] machine exec NAME [--json] [--cwd PATH] [--env KEY=VALUE] [--timeout-ms N] [--output-limit-bytes N] -- COMMAND [ARG...]
           dorydctl [global] machine shell NAME
@@ -677,7 +677,7 @@ func runMachine(cursor: inout ArgumentCursor, client: DorydCtlClient) throws {
             "memoryMB": memoryMB,
             "cpuCount": cpuCount,
         ]
-        if let address = try cursor.optionValue("--address") {
+        if let address = try cursor.optionValue("--dns-target") {
             config["address"] = address
         }
         if !shares.isEmpty {
@@ -780,7 +780,7 @@ func runMachine(cursor: inout ArgumentCursor, client: DorydCtlClient) throws {
 }
 
 func runMachineUpdate(cursor: inout ArgumentCursor, client: DorydCtlClient) throws {
-    let usage = "usage: dorydctl machine update NAME [--memory-mb N] [--cpus N] [--address IPv4 | --clear-address] [--share TAG=HOST:GUEST[:ro|rw] | JSON ... | --clear-shares] [--env KEY=VALUE ... | --clear-env]"
+    let usage = "usage: dorydctl machine update NAME [--memory-mb N] [--cpus N] [--dns-target IPv4 | --clear-dns-target] [--share TAG=HOST:GUEST[:ro|rw] | JSON ... | --clear-shares] [--env KEY=VALUE ... | --clear-env]"
     let name = try cursor.take(usage)
     var config: [String: Any] = [:]
     if let memory = try cursor.optionValue("--memory-mb") {
@@ -789,17 +789,17 @@ func runMachineUpdate(cursor: inout ArgumentCursor, client: DorydCtlClient) thro
     if let cpus = try cursor.optionValue("--cpus") {
         config["cpuCount"] = try positiveInt(cpus, option: "--cpus")
     }
-    if let address = try cursor.optionValue("--address") {
+    if let address = try cursor.optionValue("--dns-target") {
         guard !address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw DorydCtlError.usage("missing value for --address")
+            throw DorydCtlError.usage("missing value for --dns-target")
         }
         config["address"] = address
     }
-    if cursor.values.contains("--clear-address") {
+    if cursor.values.contains("--clear-dns-target") {
         guard config["address"] == nil else {
-            throw DorydCtlError.usage("use either --address or --clear-address, not both")
+            throw DorydCtlError.usage("use either --dns-target or --clear-dns-target, not both")
         }
-        cursor.values.removeAll { $0 == "--clear-address" }
+        cursor.values.removeAll { $0 == "--clear-dns-target" }
         config["address"] = ""
     }
     let shareValues = try cursor.optionValues("--share")

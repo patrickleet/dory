@@ -406,9 +406,9 @@ private struct MachineEditSheet: View {
 
     private var addressBlock: some View {
         VStack(alignment: .leading, spacing: 8) {
-            sectionLabel("ADDRESS")
+            sectionLabel("DNS TARGET OVERRIDE")
             fieldInput("192.168.215.42", text: $address, width: 260)
-            Text("IPv4 address published as \(machine.name).dory.local. Leave blank to clear.")
+            Text("Advanced: override the address reported by the guest for \(machine.name).dory.local. Leave blank to clear.")
                 .font(.system(size: 11)).foregroundStyle(p.text3)
         }
     }

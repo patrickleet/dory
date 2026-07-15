@@ -122,6 +122,8 @@ nonisolated struct DorydMachineStatus: Sendable, Equatable {
     var shellSocketPath: String?
     var controlSocketPath: String? = nil
     var address: String? = nil
+    var configuredAddress: String? = nil
+    var runtimeAddress: String? = nil
     var handoffFDCount: Int
     var memoryMB: UInt64?
     var currentBalloonTargetMB: UInt64? = nil
@@ -1025,6 +1027,8 @@ nonisolated final class DorydClient: @unchecked Sendable {
             shellSocketPath: nonEmptyString(dictionary["shellSocketPath"]),
             controlSocketPath: nonEmptyString(dictionary["controlSocketPath"]),
             address: nonEmptyString(dictionary["address"]),
+            configuredAddress: nonEmptyString(dictionary["configuredAddress"]),
+            runtimeAddress: nonEmptyString(dictionary["runtimeAddress"]),
             handoffFDCount: int(dictionary["handoffFDCount"]) ?? 0,
             memoryMB: uint64(dictionary["memoryMB"]),
             currentBalloonTargetMB: uint64(dictionary["currentBalloonTargetMB"]),

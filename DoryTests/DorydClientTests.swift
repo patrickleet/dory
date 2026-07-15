@@ -207,6 +207,7 @@ struct DorydClientTests {
         #expect(startedMachine.agentBuild == "agent-test")
         #expect(startedMachine.agentSocketPath == "/tmp/agent.sock")
         #expect(startedMachine.address == "192.168.215.40")
+        #expect(startedMachine.configuredAddress == "192.168.215.40")
         #expect(startedMachine.shares == [
             DorydMachineShareConfiguration(tag: "src", hostPath: "/Users/me/src", guestPath: "/workspace/src", readOnly: true),
         ])
@@ -465,6 +466,22 @@ struct DorydClientTests {
         let updateEnv = try #require(service.latestMachineUpdateConfig?["env"] as? [NSDictionary])
         #expect(updateEnv.first?["key"] as? String == "ANTHROPIC_API_KEY")
         #expect(updateEnv.first?["value"] as? String == "test-token")
+
+        machine = try #require(store.machines.first { $0.name == "dev" })
+        let clearAddressResult = await store.editMachine(
+            machine,
+            settings: MachineSettings(
+                cpus: 4,
+                memoryMB: 4096,
+                mounts: [MountPair(host: "/Users/me/app", guest: "/workspace/app")],
+                address: ""
+            )
+        )
+        #expect(clearAddressResult == nil)
+        #expect(service.machineUpdateCount == 2)
+        #expect(service.latestMachineUpdateConfig?["address"] as? String == "")
+        let clearedSettings = await store.machineSettings("dev")
+        #expect(clearedSettings.address == nil)
 
         machine = try #require(store.machines.first { $0.name == "dev" })
         service.setMachineDeleteResult(ok: false, message: "fixture disk is busy")
@@ -2207,6 +2224,7 @@ private final class FakeDorydService: NSObject, DorydControlXPC {
         }
         if let address {
             row["address"] = address
+            row["configuredAddress"] = address
         }
         row["shares"] = shares
         row["env"] = environment

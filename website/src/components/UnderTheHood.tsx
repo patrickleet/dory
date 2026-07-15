@@ -63,7 +63,7 @@ export function UnderTheHood() {
               <span className="b">(your files, no sharing dialogs)</span>
               {'\n'}
               <span className="p">$</span> docker run --platform linux/amd64 postgres{'\n'}
-              <span className="g">✓ native on Intel, emulated on Apple silicon</span>
+              <span className="g">✓ FEX-translated amd64 on Apple silicon</span>
             </div>
           </Reveal>
         </div>

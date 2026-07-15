@@ -216,7 +216,11 @@ public struct DoryMachineStatus: Sendable, Equatable {
     public var dockerdSocketPath: String?
     public var shellSocketPath: String?
     public var controlSocketPath: String?
+    /// Address used by host-side DNS and HTTP routing. A configured override wins over the
+    /// address reported by the running guest.
     public var address: String?
+    public var configuredAddress: String?
+    public var runtimeAddress: String?
     public var handoffFDCount: Int
     public var memoryMB: UInt64
     public var currentBalloonTargetMB: UInt64
@@ -236,6 +240,8 @@ public struct DoryMachineStatus: Sendable, Equatable {
         shellSocketPath: String? = nil,
         controlSocketPath: String? = nil,
         address: String? = nil,
+        configuredAddress: String? = nil,
+        runtimeAddress: String? = nil,
         handoffFDCount: Int = 0,
         memoryMB: UInt64 = 0,
         currentBalloonTargetMB: UInt64? = nil,
@@ -254,6 +260,8 @@ public struct DoryMachineStatus: Sendable, Equatable {
         self.shellSocketPath = shellSocketPath
         self.controlSocketPath = controlSocketPath
         self.address = address
+        self.configuredAddress = configuredAddress
+        self.runtimeAddress = runtimeAddress
         self.handoffFDCount = handoffFDCount
         self.memoryMB = memoryMB
         self.currentBalloonTargetMB = currentBalloonTargetMB ?? memoryMB
@@ -459,6 +467,7 @@ public final class MachineManager: @unchecked Sendable {
             id: preparedMachine.id,
             state: .created,
             address: preparedMachine.address,
+            configuredAddress: preparedMachine.address,
             memoryMB: preparedMachine.memoryMB,
             cpuCount: preparedMachine.cpuCount,
             shares: preparedMachine.shares,
@@ -487,11 +496,12 @@ public final class MachineManager: @unchecked Sendable {
             throw MachineManagerError.alreadyRunning(id)
         }
         let handoffPath = configuration.requiresReadyHandoff ? handoffSocketPath(id: id) : nil
+        let launchID = UUID()
         let handoffServer: VmmHandoffServer?
         do {
             handoffServer = try handoffPath.map { path in
                 let server = VmmHandoffServer(path: path) { [weak self] result in
-                    self?.handleHandoff(machineID: id, result: result)
+                    self?.handleHandoff(machineID: id, launchID: launchID, result: result)
                 }
                 try server.start()
                 return server
@@ -504,6 +514,8 @@ public final class MachineManager: @unchecked Sendable {
         entry.process = process
         entry.handoffServer = handoffServer
         entry.handoff = nil
+        entry.launchID = launchID
+        entry.runtimeAddress = nil
         entry.currentBalloonTargetMB = nil
         entry.state = configuration.requiresReadyHandoff ? .starting : .running
         entry.lastError = nil
@@ -516,6 +528,8 @@ public final class MachineManager: @unchecked Sendable {
             lock.lock()
             machines[id]?.handoffServer?.stop()
             machines[id]?.handoffServer = nil
+            machines[id]?.launchID = nil
+            machines[id]?.runtimeAddress = nil
             machines[id]?.state = .failed
             machines[id]?.lastError = "\(error)"
             lock.unlock()
@@ -543,6 +557,8 @@ public final class MachineManager: @unchecked Sendable {
             entry.handoffServer?.stop()
             entry.handoffServer = nil
             entry.handoff = nil
+            entry.launchID = nil
+            entry.runtimeAddress = nil
             entry.currentBalloonTargetMB = nil
             entry.state = .failed
             entry.lastError = "vmm ready handoff timed out after \(Int(Self.handoffReadyTimeoutSeconds))s"
@@ -565,6 +581,8 @@ public final class MachineManager: @unchecked Sendable {
         entry.process = nil
         entry.handoffServer = nil
         entry.handoff = nil
+        entry.launchID = nil
+        entry.runtimeAddress = nil
         entry.currentBalloonTargetMB = nil
         entry.state = .stopped
         machines[id] = entry
@@ -586,6 +604,8 @@ public final class MachineManager: @unchecked Sendable {
             machines[id]?.process = nil
             machines[id]?.handoffServer = nil
             machines[id]?.handoff = nil
+            machines[id]?.launchID = nil
+            machines[id]?.runtimeAddress = nil
             machines[id]?.currentBalloonTargetMB = nil
             machines[id]?.state = .stopped
         }
@@ -684,6 +704,20 @@ public final class MachineManager: @unchecked Sendable {
         }
         try Self.validateLaunchConfiguration(updated)
         guard updated != current else {
+            return status(id: id) ?? DoryMachineStatus(id: id, state: .stopped)
+        }
+        let requiresRestart = updated.memoryMB != current.memoryMB
+            || updated.cpuCount != current.cpuCount
+            || updated.shares != current.shares
+            || updated.environment != current.environment
+        if !requiresRestart {
+            do {
+                try persist(updated)
+                try publishConfiguration(updated)
+            } catch {
+                if let error = error as? MachineManagerError { throw error }
+                throw MachineManagerError.persistence("could not update \(id): \(error)")
+            }
             return status(id: id) ?? DoryMachineStatus(id: id, state: .stopped)
         }
         if wasRunning {
@@ -1070,6 +1104,7 @@ public final class MachineManager: @unchecked Sendable {
                 state: .failed,
                 lastError: entry.lastError ?? "dory-vmm process exited",
                 address: entry.configuration.address,
+                configuredAddress: entry.configuration.address,
                 memoryMB: entry.configuration.memoryMB,
                 cpuCount: entry.configuration.cpuCount,
                 shares: entry.configuration.shares,
@@ -1087,7 +1122,9 @@ public final class MachineManager: @unchecked Sendable {
             dockerdSocketPath: entry.handoff?.ready.dockerdSocketPath,
             shellSocketPath: entry.handoff?.ready.shellSocketPath,
             controlSocketPath: entry.handoff?.ready.controlSocketPath,
-            address: entry.configuration.address,
+            address: entry.configuration.address ?? entry.runtimeAddress,
+            configuredAddress: entry.configuration.address,
+            runtimeAddress: entry.runtimeAddress,
             handoffFDCount: entry.handoff?.fileDescriptors.count ?? 0,
             memoryMB: entry.configuration.memoryMB,
             currentBalloonTargetMB: entry.currentBalloonTargetMB ?? entry.configuration.memoryMB,
@@ -1523,29 +1560,115 @@ public final class MachineManager: @unchecked Sendable {
         return validated
     }
 
-    private func handleHandoff(machineID: String, result: Result<VmmHandoff, Error>) {
+    private func handleHandoff(
+        machineID: String,
+        launchID: UUID,
+        result: Result<VmmHandoff, Error>
+    ) {
+        var handoffServer: VmmHandoffServer?
+        var processToStop: HvProcess?
+        var agentSocketPath: String?
         lock.lock()
-        defer { lock.unlock() }
-        guard var entry = machines[machineID] else { return }
-        entry.handoffServer?.stop()
+        guard var entry = machines[machineID], entry.launchID == launchID else {
+            lock.unlock()
+            return
+        }
+        handoffServer = entry.handoffServer
         entry.handoffServer = nil
         switch result {
         case let .success(handoff):
             guard handoff.ready.machineID == machineID else {
                 entry.state = .failed
                 entry.lastError = "handoff machine id mismatch: \(handoff.ready.machineID)"
-                entry.process?.stop()
+                entry.launchID = nil
+                entry.runtimeAddress = nil
+                processToStop = entry.process
                 break
             }
             entry.handoff = handoff
             entry.state = .running
             entry.lastError = nil
+            agentSocketPath = handoff.ready.agentSocketPath
         case let .failure(error):
             entry.state = .failed
             entry.lastError = "\(error)"
-            entry.process?.stop()
+            entry.launchID = nil
+            entry.runtimeAddress = nil
+            processToStop = entry.process
         }
         machines[machineID] = entry
+        lock.unlock()
+
+        handoffServer?.stop()
+        processToStop?.stop()
+        if let agentSocketPath {
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                self?.discoverRuntimeAddress(
+                    machineID: machineID,
+                    launchID: launchID,
+                    agentSocketPath: agentSocketPath
+                )
+            }
+        }
+    }
+
+    private func discoverRuntimeAddress(
+        machineID: String,
+        launchID: UUID,
+        agentSocketPath: String
+    ) {
+        let address: String
+        do {
+            let client = try agentConnector(agentSocketPath)
+            defer { client.close() }
+            let result = try client.exec(
+                argv: ["/sbin/ip", "-4", "addr", "show", "dev", "eth0"],
+                cwd: "",
+                env: [],
+                timeoutMs: 5_000,
+                outputLimitBytes: 16 * 1024
+            )
+            guard let discovered = Self.runtimeIPv4Address(from: result) else { return }
+            address = discovered
+        } catch {
+            return
+        }
+
+        lock.lock()
+        if var entry = machines[machineID],
+           entry.launchID == launchID,
+           entry.state == .running,
+           entry.handoff?.ready.agentSocketPath == agentSocketPath,
+           entry.process?.isRunning == true {
+            entry.runtimeAddress = address
+            machines[machineID] = entry
+        }
+        lock.unlock()
+    }
+
+    static func runtimeIPv4Address(from result: DoryExecResult) -> String? {
+        guard result.exitCode == 0,
+              !result.timedOut,
+              !result.stdoutTruncated,
+              let output = String(data: result.stdout, encoding: .utf8) else {
+            return nil
+        }
+        let tokens = output.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        for index in tokens.indices where tokens[index] == "inet" {
+            let candidateIndex = tokens.index(after: index)
+            guard candidateIndex < tokens.endIndex else { continue }
+            let candidate = String(tokens[candidateIndex].split(separator: "/", maxSplits: 1)[0])
+            guard let parsed = IPv4Address(candidate), parsed.bytes.count == 4 else { continue }
+            let first = parsed.bytes[0]
+            guard first != 0,
+                  first != 127,
+                  first < 224,
+                  !(first == 169 && parsed.bytes[1] == 254) else {
+                continue
+            }
+            return candidate
+        }
+        return nil
     }
 
     private static func isValidID(_ id: String) -> Bool {
@@ -2218,6 +2341,8 @@ private struct MachineEntry {
     var process: HvProcess?
     var handoffServer: VmmHandoffServer?
     var handoff: VmmHandoff?
+    var launchID: UUID?
+    var runtimeAddress: String?
     var currentBalloonTargetMB: UInt64?
     var lastError: String?
 }

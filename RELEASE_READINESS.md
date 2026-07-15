@@ -520,6 +520,11 @@ to the final release tag rather than representing this candidate as built from c
   runtime-support suite pass. A new isolated exact-artifact gate cycles 1→8→2 CPUs and
   1→16→4 GiB while verifying guest resources and persistent disk state; it still needs a signed
   candidate with its daemon and machine assets running.
+- Linux-machine DNS now uses the IPv4 address reported by the ready guest instead of presenting an
+  unassigned configuration value as a static guest address. Runtime discovery is bounded, rejects
+  unusable output, and is tied to one launch generation so a late response cannot publish after a
+  stop or restart. The optional advanced DNS target is reported separately, edits do not reboot the
+  guest, and the app can clear it without losing the observed runtime address.
 - Required Linux-machine provisioning no longer has a silent-success path. Nonzero and timed-out
   install/verify stages fail, unsupported recipes are rejected before creation, the app removes a
   newly created VM when setup fails, and the legacy container-machine path removes an incomplete

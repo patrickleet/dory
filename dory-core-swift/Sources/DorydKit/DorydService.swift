@@ -1325,6 +1325,12 @@ private extension DoryMachineStatus {
         if let address {
             dictionary["address"] = address
         }
+        if let configuredAddress {
+            dictionary["configuredAddress"] = configuredAddress
+        }
+        if let runtimeAddress {
+            dictionary["runtimeAddress"] = runtimeAddress
+        }
         dictionary["shares"] = shares.map(\.xpcDictionary)
         dictionary["env"] = environment.sorted(by: { $0.key < $1.key }).map { key, value in
             [

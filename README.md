@@ -133,9 +133,9 @@
 - The full app includes a supported baseline kernel/rootfs pair. Custom machine images use the
   fail-closed [signed machine-image contract](MACHINE_IMAGE_CONTRACT.md); arbitrary DKMS or
   kernel replacement inside the immutable Docker engine guest is intentionally unsupported.
-- Every machine has a `name.dory.local` address. The UI shows the copyable terminal command
-  (`dory ssh <name>` or `dory machine shell <name>`), and custom addresses can be assigned during
-  creation.
+- Every running machine publishes its guest-reported DHCP address as `name.dory.local`. The UI shows
+  the copyable terminal command (`dory ssh <name>` or `dory machine shell <name>`). An advanced DNS
+  target override is available for guests whose network address is configured outside Dory.
 - Running machines show real guest CPU and used/total memory on the two-second UI refresh. The
   versioned `dorydctl machine stats <name>` JSON contract also reports network RX/TX, block I/O,
   process count, and uptime; stopped or unreadable machines show `—`, never fabricated zeroes.

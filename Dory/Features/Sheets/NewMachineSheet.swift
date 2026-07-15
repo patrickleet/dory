@@ -366,9 +366,9 @@ struct NewMachineSheet: View {
                 }
             }
             VStack(alignment: .leading, spacing: 9) {
-                sectionLabel("ADDRESS")
+                sectionLabel("DNS TARGET OVERRIDE")
                 fieldInput("192.168.215.42", text: $address, width: 260)
-                Text("Optional IPv4 address published as \(dnsName).")
+                Text("Advanced: route \(dnsName) to this IPv4 instead of the address reported by the guest.")
                     .font(.system(size: 11)).foregroundStyle(p.text3)
             }
         }

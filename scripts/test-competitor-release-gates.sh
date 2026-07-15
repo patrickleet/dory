@@ -728,9 +728,27 @@ grep -F 'testCreateNeverOverwritesAnAbandonedMachineStateDirectory' \
 grep -F 'testUpdatePersistenceFailurePreservesThePublishedDefinition' \
   dory-core-swift/Tests/DorydKitTests/MachineManagerTests.swift >/dev/null \
   || fail "failed machine updates can partially publish a definition that differs after restart"
-grep -F 'testAddressOnlyUpdateRestartsRunningMachineAndNoOpDoesNot' \
+grep -F 'testAddressOnlyUpdateChangesDNSOverrideWithoutRestartAndNoOpDoesNot' \
   dory-core-swift/Tests/DorydKitTests/MachineManagerTests.swift >/dev/null \
-  || fail "running machine address changes can remain unapplied until an unrelated restart"
+  || fail "DNS target-only machine updates can still cause a needless guest restart"
+grep -F 'testRequiredHandoffPublishesGuestReportedRuntimeAddress' \
+  dory-core-swift/Tests/DorydKitTests/MachineManagerTests.swift >/dev/null \
+  || fail "running machines no longer publish the IPv4 address reported by the guest"
+grep -F 'testConfiguredDNSOverrideWinsWithoutHidingRuntimeAddress' \
+  dory-core-swift/Tests/DorydKitTests/MachineManagerTests.swift >/dev/null \
+  || fail "configured DNS targets can overwrite the observed guest address"
+grep -F 'testLateAddressProbeCannotPublishAfterMachineStops' \
+  dory-core-swift/Tests/DorydKitTests/MachineManagerTests.swift >/dev/null \
+  || fail "a stale machine launch can publish its address after stop or restart"
+grep -F 'configuredAddress: nonEmptyString(dictionary["configuredAddress"])' \
+  Dory/Runtime/Doryd/DorydClient.swift >/dev/null \
+  || fail "the app cannot distinguish an explicit DNS target from the guest runtime address"
+grep -F 'service.latestMachineUpdateConfig?["address"] as? String == ""' \
+  DoryTests/DorydClientTests.swift >/dev/null \
+  || fail "the app can no longer clear an existing machine DNS target override"
+grep -F -- '--dns-target IPv4 | --clear-dns-target' \
+  dory-core-swift/Sources/dorydctl/main.swift >/dev/null \
+  || fail "the machine CLI still presents its DNS route override as guest IP assignment"
 grep -F 'testFailedUpdatedLaunchRestoresDefinitionAndRunningMachine' \
   dory-core-swift/Tests/DorydKitTests/MachineManagerTests.swift >/dev/null \
   || fail "failed machine reconfiguration can replace the last working definition"

@@ -3689,7 +3689,7 @@ final class AppStore {
                 memoryMB: status.memoryMB.flatMap { Int(exactly: $0) },
                 mounts: status.shares.map(Self.mountPair(fromDoryd:)),
                 env: status.environment,
-                address: status.address
+                address: status.configuredAddress
             )
         } catch {
             actionError = "Could not load doryd machine settings: \(error)"
@@ -4178,13 +4178,12 @@ final class AppStore {
                 memoryMB: current?.memoryMB.flatMap { Int(exactly: $0) },
                 mounts: current?.shares.map(Self.mountPair(fromDoryd:)) ?? [],
                 env: current?.environment ?? [:],
-                address: current?.address
+                address: current?.configuredAddress
             )
             let effectiveSettings = Self.preservingHiddenMachineSettings(settings, existing: currentSettings)
             let memory = effectiveSettings.memoryMB.flatMap { UInt64(exactly: $0) } ?? current?.memoryMB
             let cpus = effectiveSettings.cpus ?? current?.cpuCount
             let address = Self.trimmedNonEmpty(effectiveSettings.address)
-                ?? current?.address
             _ = try await dorydClient.machineUpdate(
                 machine.name,
                 memoryMB: memory,

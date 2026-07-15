@@ -1218,7 +1218,7 @@ final class MachineManagerTests: XCTestCase {
         XCTAssertEqual(stored.environment, ["NODE_ENV": "production"])
     }
 
-    func testAddressOnlyUpdateRestartsRunningMachineAndNoOpDoesNot() throws {
+    func testAddressOnlyUpdateChangesDNSOverrideWithoutRestartAndNoOpDoesNot() throws {
         let base = "/tmp/dory-machine-address-restart-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
         defer { try? FileManager.default.removeItem(atPath: base) }
         let starter = RecordingProcessStarter()
@@ -1250,7 +1250,8 @@ final class MachineManagerTests: XCTestCase {
         )
         XCTAssertEqual(changed.state, .running)
         XCTAssertEqual(changed.address, "192.168.215.41")
-        XCTAssertEqual(starter.attemptCount, 2)
+        XCTAssertEqual(changed.configuredAddress, "192.168.215.41")
+        XCTAssertEqual(starter.attemptCount, 1)
 
         let unchanged = try manager.update(
             id: "dev",
@@ -1258,7 +1259,7 @@ final class MachineManagerTests: XCTestCase {
             updatesAddress: true
         )
         XCTAssertEqual(unchanged.state, .running)
-        XCTAssertEqual(starter.attemptCount, 2)
+        XCTAssertEqual(starter.attemptCount, 1)
     }
 
     func testFailedUpdatedLaunchRestoresDefinitionAndRunningMachine() throws {
@@ -1699,6 +1700,167 @@ final class MachineManagerTests: XCTestCase {
         XCTAssertEqual(running.handoffFDCount, 0)
     }
 
+    func testRequiredHandoffPublishesGuestReportedRuntimeAddress() throws {
+        let base = "/tmp/dory-machine-runtime-address-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        let connector = RecordingMachineAgentConnector(execResult: DoryExecResult(
+            exitCode: 0,
+            stdout: Data("2: eth0: <UP> mtu 1500\n    inet 192.168.64.19/24 brd 192.168.64.255 scope global eth0\n".utf8),
+            stderr: Data(),
+            timedOut: false,
+            stdoutTruncated: false,
+            stderrTruncated: false
+        ))
+        let manager = MachineManager(
+            configuration: MachineManagerConfiguration(
+                vmmExecutablePath: "/bin/sleep",
+                stateDirectory: base,
+                baseArguments: ["30"],
+                passMachineArguments: false,
+                requiresReadyHandoff: true
+            ),
+            agentConnector: connector.connect(socketPath:)
+        )
+        defer {
+            try? manager.delete(id: "dev")
+            try? FileManager.default.removeItem(atPath: base)
+        }
+
+        _ = try manager.create(DoryMachineConfiguration(
+            id: "dev",
+            kernelPath: doryTestKernelPath,
+            rootfsPath: doryTestRootfsPath
+        ))
+        let starting = try manager.start(id: "dev")
+        try sendVmmHandoff(
+            path: try XCTUnwrap(starting.handoffSocketPath),
+            ready: VmmReadyMessage(machineID: "dev", agentSocketPath: "/run/agent.sock"),
+            fileDescriptors: []
+        )
+
+        let running = try waitForMachineAddress(manager, id: "dev", address: "192.168.64.19")
+        XCTAssertEqual(running.state, .running)
+        XCTAssertEqual(running.runtimeAddress, "192.168.64.19")
+        XCTAssertNil(running.configuredAddress)
+        XCTAssertEqual(connector.execs.first?.argv, ["/sbin/ip", "-4", "addr", "show", "dev", "eth0"])
+    }
+
+    func testConfiguredDNSOverrideWinsWithoutHidingRuntimeAddress() throws {
+        let base = "/tmp/dory-machine-address-override-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        let connector = RecordingMachineAgentConnector(execResult: DoryExecResult(
+            exitCode: 0,
+            stdout: Data("inet 192.168.64.20/24 scope global eth0\n".utf8),
+            stderr: Data(),
+            timedOut: false,
+            stdoutTruncated: false,
+            stderrTruncated: false
+        ))
+        let manager = MachineManager(
+            configuration: MachineManagerConfiguration(
+                vmmExecutablePath: "/bin/sleep",
+                stateDirectory: base,
+                baseArguments: ["30"],
+                passMachineArguments: false,
+                requiresReadyHandoff: true
+            ),
+            agentConnector: connector.connect(socketPath:)
+        )
+        defer {
+            try? manager.delete(id: "dev")
+            try? FileManager.default.removeItem(atPath: base)
+        }
+
+        _ = try manager.create(DoryMachineConfiguration(
+            id: "dev",
+            kernelPath: doryTestKernelPath,
+            rootfsPath: doryTestRootfsPath,
+            address: "10.0.0.50"
+        ))
+        let starting = try manager.start(id: "dev")
+        try sendVmmHandoff(
+            path: try XCTUnwrap(starting.handoffSocketPath),
+            ready: VmmReadyMessage(machineID: "dev", agentSocketPath: "/run/agent.sock"),
+            fileDescriptors: []
+        )
+
+        let running = try waitForMachineRuntimeAddress(manager, id: "dev", address: "192.168.64.20")
+        XCTAssertEqual(running.address, "10.0.0.50")
+        XCTAssertEqual(running.configuredAddress, "10.0.0.50")
+        XCTAssertEqual(running.runtimeAddress, "192.168.64.20")
+    }
+
+    func testLateAddressProbeCannotPublishAfterMachineStops() throws {
+        let base = "/tmp/dory-machine-stale-address-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))"
+        let connector = RecordingMachineAgentConnector(
+            execResult: DoryExecResult(
+                exitCode: 0,
+                stdout: Data("inet 192.168.64.21/24 scope global eth0\n".utf8),
+                stderr: Data(),
+                timedOut: false,
+                stdoutTruncated: false,
+                stderrTruncated: false
+            ),
+            execDelay: 0.2
+        )
+        let manager = MachineManager(
+            configuration: MachineManagerConfiguration(
+                vmmExecutablePath: "/bin/sleep",
+                stateDirectory: base,
+                baseArguments: ["30"],
+                passMachineArguments: false,
+                requiresReadyHandoff: true
+            ),
+            agentConnector: connector.connect(socketPath:)
+        )
+        defer {
+            try? manager.delete(id: "dev")
+            try? FileManager.default.removeItem(atPath: base)
+        }
+
+        _ = try manager.create(DoryMachineConfiguration(
+            id: "dev",
+            kernelPath: doryTestKernelPath,
+            rootfsPath: doryTestRootfsPath
+        ))
+        let starting = try manager.start(id: "dev")
+        try sendVmmHandoff(
+            path: try XCTUnwrap(starting.handoffSocketPath),
+            ready: VmmReadyMessage(machineID: "dev", agentSocketPath: "/run/agent.sock"),
+            fileDescriptors: []
+        )
+        _ = try waitForRecordedExecs(connector, count: 1)
+        _ = try manager.stop(id: "dev")
+        Thread.sleep(forTimeInterval: 0.3)
+
+        let stopped = try XCTUnwrap(manager.status(id: "dev"))
+        XCTAssertEqual(stopped.state, .stopped)
+        XCTAssertNil(stopped.address)
+        XCTAssertNil(stopped.runtimeAddress)
+    }
+
+    func testRuntimeAddressParserRejectsUnusableAndIncompleteResults() {
+        func result(_ stdout: String, exitCode: Int32 = 0, timedOut: Bool = false) -> DoryExecResult {
+            DoryExecResult(
+                exitCode: exitCode,
+                stdout: Data(stdout.utf8),
+                stderr: Data(),
+                timedOut: timedOut,
+                stdoutTruncated: false,
+                stderrTruncated: false
+            )
+        }
+
+        XCTAssertEqual(
+            MachineManager.runtimeIPv4Address(from: result(
+                "inet 127.0.0.1/8 scope host lo\ninet 192.168.64.22/24 scope global eth0\n"
+            )),
+            "192.168.64.22"
+        )
+        XCTAssertNil(MachineManager.runtimeIPv4Address(from: result("inet 169.254.1.2/16 scope link eth0\n")))
+        XCTAssertNil(MachineManager.runtimeIPv4Address(from: result("inet not-an-address/24\n")))
+        XCTAssertNil(MachineManager.runtimeIPv4Address(from: result("inet 192.168.64.22/24\n", exitCode: 1)))
+        XCTAssertNil(MachineManager.runtimeIPv4Address(from: result("inet 192.168.64.22/24\n", timedOut: true)))
+    }
+
     func testMaximumLengthMachineIDUsesBoundedTransientSocketPath() throws {
         let durable = "/tmp/dory-machine-durable-\(getpid())-\(String(repeating: "x", count: 70))"
         let runtime = "/tmp/dory-machine-runtime-\(getpid())"
@@ -1841,11 +2003,12 @@ final class MachineManagerTests: XCTestCase {
             fileDescriptors: []
         )
         _ = try waitForMachineState(manager, id: "dev", state: .running)
+        _ = try waitForRecordedExecs(connector, count: 1)
 
         let result = manager.syncAgentClock(now: Date(timeIntervalSince1970: 1_234.5))
 
         XCTAssertEqual(result, AgentClockSyncResult(name: "machines", attempted: true, synced: true))
-        XCTAssertEqual(connector.connectedPaths, ["/run/agent.sock"])
+        XCTAssertEqual(connector.connectedPaths, ["/run/agent.sock", "/run/agent.sock"])
         XCTAssertEqual(connector.clockSyncs, [1_234_500_000_000])
     }
 
@@ -1886,6 +2049,7 @@ final class MachineManagerTests: XCTestCase {
             fileDescriptors: []
         )
         _ = try waitForMachineState(manager, id: "dev", state: .running)
+        _ = try waitForRecordedExecs(connector, count: 1)
 
         let result = try manager.exec(
             id: "dev",
@@ -1899,6 +2063,13 @@ final class MachineManagerTests: XCTestCase {
         XCTAssertEqual(result.exitCode, 0)
         XCTAssertEqual(String(data: result.stdout, encoding: .utf8), "machine-exec-ok\n")
         XCTAssertEqual(connector.execs, [
+            RecordingMachineAgentConnector.Exec(
+                argv: ["/sbin/ip", "-4", "addr", "show", "dev", "eth0"],
+                cwd: "",
+                env: [],
+                timeoutMs: 5_000,
+                outputLimitBytes: 16 * 1024
+            ),
             RecordingMachineAgentConnector.Exec(
                 argv: ["/bin/sh", "-lc", "echo hi"],
                 cwd: "/work",
@@ -1952,6 +2123,7 @@ final class MachineManagerTests: XCTestCase {
             fileDescriptors: []
         )
         _ = try waitForMachineState(manager, id: "dev", state: .running)
+        _ = try waitForRecordedExecs(connector, count: 1)
 
         let snapshots = manager.memorySnapshots()
 
@@ -1961,7 +2133,7 @@ final class MachineManagerTests: XCTestCase {
         XCTAssertEqual(snapshots.first?.maximumTargetMB, 3072)
         XCTAssertEqual(snapshots.first?.telemetry.memTotalKB, 3072 * 1024)
         XCTAssertEqual(snapshots.first?.canBalloon, true)
-        XCTAssertEqual(connector.connectedPaths, ["/run/agent.sock"])
+        XCTAssertEqual(connector.connectedPaths, ["/run/agent.sock", "/run/agent.sock"])
     }
 
     func testMemorySnapshotsMarkMachinesWithoutControlSocketAsNotBalloonable() throws {
@@ -2112,9 +2284,24 @@ private final class RecordingMachineAgentConnector: @unchecked Sendable {
     private var syncs: [Int64] = []
     private var recordedExecs: [Exec] = []
     private let telemetry: DoryTelemetry
+    private let execResult: DoryExecResult
+    private let execDelay: TimeInterval
 
-    init(telemetry: DoryTelemetry = DoryTelemetry(memTotalKB: 1, memAvailableKB: 1, psiSomeAvg10: 0, psiFullAvg10: 0)) {
+    init(
+        telemetry: DoryTelemetry = DoryTelemetry(memTotalKB: 1, memAvailableKB: 1, psiSomeAvg10: 0, psiFullAvg10: 0),
+        execResult: DoryExecResult = DoryExecResult(
+            exitCode: 0,
+            stdout: Data("machine-exec-ok\n".utf8),
+            stderr: Data(),
+            timedOut: false,
+            stdoutTruncated: false,
+            stderrTruncated: false
+        ),
+        execDelay: TimeInterval = 0
+    ) {
         self.telemetry = telemetry
+        self.execResult = execResult
+        self.execDelay = execDelay
     }
 
     struct Exec: Equatable {
@@ -2147,7 +2334,12 @@ private final class RecordingMachineAgentConnector: @unchecked Sendable {
         lock.lock()
         paths.append(socketPath)
         lock.unlock()
-        return RecordingMachineAgentClient(recorder: self, telemetry: telemetry)
+        return RecordingMachineAgentClient(
+            recorder: self,
+            telemetry: telemetry,
+            execResult: execResult,
+            execDelay: execDelay
+        )
     }
 
     func recordClockSync(_ hostEpochNs: Int64) {
@@ -2166,10 +2358,26 @@ private final class RecordingMachineAgentConnector: @unchecked Sendable {
 private final class RecordingMachineAgentClient: AgentControlClient, @unchecked Sendable {
     private let recorder: RecordingMachineAgentConnector
     private let telemetryValue: DoryTelemetry
+    private let execResult: DoryExecResult
+    private let execDelay: TimeInterval
 
-    init(recorder: RecordingMachineAgentConnector, telemetry: DoryTelemetry) {
+    init(
+        recorder: RecordingMachineAgentConnector,
+        telemetry: DoryTelemetry,
+        execResult: DoryExecResult = DoryExecResult(
+            exitCode: 0,
+            stdout: Data("machine-exec-ok\n".utf8),
+            stderr: Data(),
+            timedOut: false,
+            stdoutTruncated: false,
+            stderrTruncated: false
+        ),
+        execDelay: TimeInterval = 0
+    ) {
         self.recorder = recorder
         self.telemetryValue = telemetry
+        self.execResult = execResult
+        self.execDelay = execDelay
     }
 
     func info() throws -> DoryAgentInfo {
@@ -2203,14 +2411,10 @@ private final class RecordingMachineAgentClient: AgentControlClient, @unchecked 
             timeoutMs: timeoutMs,
             outputLimitBytes: outputLimitBytes
         ))
-        return DoryExecResult(
-            exitCode: 0,
-            stdout: Data("machine-exec-ok\n".utf8),
-            stderr: Data(),
-            timedOut: false,
-            stdoutTruncated: false,
-            stderrTruncated: false
-        )
+        if execDelay > 0 {
+            Thread.sleep(forTimeInterval: execDelay)
+        }
+        return execResult
     }
 
     func close() {}
@@ -2335,6 +2539,57 @@ private func waitForMachineState(
         Thread.sleep(forTimeInterval: 0.02)
     }
     return try XCTUnwrap(manager.status(id: id))
+}
+
+private func waitForMachineAddress(
+    _ manager: MachineManager,
+    id: String,
+    address: String,
+    timeout: TimeInterval = 2
+) throws -> DoryMachineStatus {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if let status = manager.status(id: id), status.address == address {
+            return status
+        }
+        Thread.sleep(forTimeInterval: 0.02)
+    }
+    return try XCTUnwrap(manager.status(id: id))
+}
+
+private func waitForMachineRuntimeAddress(
+    _ manager: MachineManager,
+    id: String,
+    address: String,
+    timeout: TimeInterval = 2
+) throws -> DoryMachineStatus {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if let status = manager.status(id: id), status.runtimeAddress == address {
+            return status
+        }
+        Thread.sleep(forTimeInterval: 0.02)
+    }
+    return try XCTUnwrap(manager.status(id: id))
+}
+
+@discardableResult
+private func waitForRecordedExecs(
+    _ connector: RecordingMachineAgentConnector,
+    count: Int,
+    timeout: TimeInterval = 2
+) throws -> [RecordingMachineAgentConnector.Exec] {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        let execs = connector.execs
+        if execs.count >= count {
+            return execs
+        }
+        Thread.sleep(forTimeInterval: 0.02)
+    }
+    let execs = connector.execs
+    XCTAssertGreaterThanOrEqual(execs.count, count)
+    return execs
 }
 
 private func waitForFileContent(_ path: String, timeout: TimeInterval = 2) throws -> String {
