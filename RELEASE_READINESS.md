@@ -158,12 +158,13 @@ metadata, evidence, and gate-harness commits do not change the shipped app tree.
 - SSH-agent qualification now covers the separate BuildKit session path required by
   `RUN --mount=type=ssh`: a network-disabled build must receive the same sorted public identity
   digest as the host and ordinary Dory guest socket, while retaining neither key text nor private
-  material. The disposable current-source raw-HV execution passed one ordinary client, eight
-  concurrent clients, and the required BuildKit mount with the same digest; the throwaway agent
-  identity and isolated 128 GiB sparse state were removed afterward. Retained evidence contains no
-  key text:
-  `~/.dory-new-gate-evidence/20260713T-buildkit-ssh-agent/20260713T022720Z-8891/manifest.txt`.
-  Publication semantically rejects a missing required mount or divergent digest.
+  material. Exact notarized build 37 passed one ordinary client, eight concurrent clients, and the
+  required BuildKit mount with the same digest. Its throwaway Ed25519 identity, agent, isolated
+  runtime, Docker configuration, and sparse drive were removed afterward. Retained evidence
+  contains hashes but no key text:
+  `~/.dory-build37-exact-runtime/evidence/ssh-agent-build37/20260715T154554Z-70258/manifest.txt`.
+  Publication semantically rejects a missing required mount, divergent digest, or mismatched
+  shipped Docker/Buildx helper.
 - The competitor runtime gate now additionally reproduces three live Apple-container gaps through
   Dory's real Docker API: Rails-style nested `.dockerignore` unignores, network-scoped aliases with
   stable stop/start IPs, and bounded byte-exact `docker cp` in both directions through a mounted
@@ -661,10 +662,10 @@ metadata, evidence, and gate-harness commits do not change the shipped app tree.
   two-second deadline. The rebuilt arm64 guest agent/rootfs passed provenance verification, and an
   isolated raw-HV live run passed one plus eight concurrent clients with only identity hashes
   retained at `~/.dory-new-gate-evidence/20260713T012556Z-ssh-agent-capped`.
-- [ ] Repeat the SSH-agent gate through both exact notarized app paths and long qualification, and
-  require fresh-boot plus restart proof on the physical macOS 14 VZ runner. The exact standalone
-  candidate passed ordinary and eight-client concurrency plus the required BuildKit SSH mount with
-  no retained key text. Publication now binds
+- [ ] Repeat the SSH-agent gate through both installed notarized app paths and long qualification,
+  and require fresh-boot plus restart proof on the physical macOS 14 VZ runner. Exact build 37's
+  shipped runtime and Docker/Buildx helpers passed ordinary and eight-client concurrency plus the
+  required BuildKit SSH mount with no retained key text. Publication now binds
   that evidence to `DORY_RELEASE_SSH_CLIENT_IMAGE` and rejects missing or mismatched identity/image
   digests.
 - [x] Re-enable macOS UI automation for the rebuilt DoryUITests runner and pass the new machine
@@ -853,13 +854,14 @@ metadata, evidence, and gate-harness commits do not change the shipped app tree.
   module files, both thin-slice hashes, and universal hash. Exact notarized-artifact replay remains
   mandatory.
 - [x] Certify authenticated manifest PUT and interrupted large-layer upload recovery against real
-  ECR on the exact notarized candidate. The first campaign exposed that the isolated credential
+  ECR on exact notarized build 37. The first campaign exposed that the isolated credential
   directory also hid Dory's bundled Buildx plugin; the gate now binds and hashes the candidate's
-  sibling plugin without retaining credentials. The rerun observed active upload progress, forced a
+  sibling plugin without retaining credentials. The build 37 rerun observed active upload progress, forced a
   nonzero interruption, resumed the 96 MiB layer, repeated the manifest PUT, repulled and ran the
   exact checksum, and proved local image, remote tag, isolated credentials, temporary repository,
   and runtime cleanup. Retained evidence is at
-  `/tmp/dory-ecr-exact-evidence-20260714T062401Z/20260714T062417Z-27505/manifest.txt`. A persistent
+  `~/.dory-build37-exact-runtime/evidence/ecr-registry-build37/20260715T154318Z-65403/manifest.txt`.
+  A persistent
   empty `dory-release-qualification` repository now has a one-day orphan lifecycle backstop, and
   GitHub uses a main/`v*`-restricted OIDC role scoped only to that repository; no long-lived AWS
   access keys are stored. IAM simulation proves exact-repository allow, other-repository deny, and

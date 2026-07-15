@@ -133,6 +133,9 @@ of scope so each fix remains reviewable.
   manifests with source, fixture, Docker, Buildx, and archive hashes. Existing mandatory gates add
   unqualified arm64 multi-platform selection and storage reconciliation, strict stdout save-tar EOF,
   missing-parent hard-link import/export, and real ECR interrupted-upload resume/repeated PUT/repull.
+  Exact notarized build 37 passed the ECR interruption/retry contract and the separate SSH-agent
+  forwarding contract with its shipped Docker/Buildx helpers; only digests are retained for the
+  disposable SSH identity.
 - [x] Volumes: create/copy/inspect/list/remove/prune, labels/options, ownership, restart persistence,
   collision handling, and in-use safety are sound.
   Shipping doryd preserves native dockerd volume requests. The Docker-backed fallback now proxies
