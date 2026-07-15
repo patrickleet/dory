@@ -1,6 +1,6 @@
 # Dory Apple Silicon release feature audit
 
-Last updated: 2026-07-14
+Last updated: 2026-07-15
 
 This is the single implementation-review ledger for Dory's first public release. It covers the
 Apple Silicon product only. Intel hosts are a later roadmap item and must not be implied by the v1
@@ -49,12 +49,13 @@ of scope so each fix remains reviewable.
   stapling, Gatekeeper, SBOM, DMG, ZIP, and update-archive validation fail closed.
 - [x] Direct DMG installation and Homebrew Cask installation work from a clean account with normal
   quarantine and install only Apple Silicon payloads.
-  Build 34 evidence: `~/.dory-dmg-build34-install-gate/evidence/install-manifest.txt` and
-  `~/.dory-homebrew-build34-gate/evidence/manifest.txt`.
+  Final-source build 35 evidence: `~/.dory-dmg-build35-install-gate/evidence/install-manifest.txt`
+  and `~/.dory-homebrew-build35-gate/evidence/manifest.txt`.
 - [x] Sparkle replaces and relaunches the prior app, preserves user data/settings, validates the
   complete installed tree, and uses a same-team atomic replacement with a verified fallback
   restoration path.
-  Build 34 evidence: `~/.dory-sparkle-build34-gate/20260715T121641Z-58675/evidence/manifest.txt`.
+  Final-source build 35 evidence:
+  `~/.dory-sparkle-build35-gate/20260715T125358Z-16534/evidence/manifest.txt`.
 - [x] Ordinary uninstall removes the app/runtime integration but preserves the selected Dory drive;
   explicit zap/reset behavior is unambiguous and tested.
 - [x] Packaging scripts, workflows, Homebrew tap, README, appcast, and release notes agree.
