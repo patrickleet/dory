@@ -1478,13 +1478,15 @@ doryd_machine_cmd() {
       shift
       name="${1:?usage: dory machine run <name> -- <command...>}"
       shift
+      args=("$name")
       while [ "$#" -gt 0 ] && [ "${1:-}" != "--" ]; do
         args+=("$1")
         shift
       done
       [ "${1:-}" != "--" ] || shift
       [ "$#" -gt 0 ] || { echo "usage: dory machine run <name> -- <command...>" >&2; exit 2; }
-      exec "$ctl" machine exec "$name" "${args[@]}" -- "$@"
+      args+=(--)
+      exec "$ctl" machine exec "${args[@]}" "$@"
       ;;
     ssh|shell)
       shift
