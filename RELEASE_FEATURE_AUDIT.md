@@ -38,7 +38,8 @@ of scope so each fix remains reviewable.
 - [x] Superseded build 21 and build 22 directories were removed (6.9 GB reclaimed).
 - [x] Build 23 evidence and `guest/out` are retained for the machine-lifecycle investigation.
 - [ ] All feature sections below are complete.
-- [ ] One new final-source Apple Silicon candidate is built, signed, notarized, and qualified.
+- [x] Final-source 0.3.0 build 37 is built, signed, notarized, and software-qualified; the external
+  physical gates remain listed separately below.
 - [ ] No P0/P1 defects remain open and every public claim is backed by exact evidence.
 
 ## 1. Distribution, install, update, and removal
@@ -50,12 +51,14 @@ of scope so each fix remains reviewable.
 - [x] Direct DMG installation and Homebrew Cask installation work from a clean account with normal
   quarantine and install only Apple Silicon payloads.
   Final-source build 35 evidence: `~/.dory-dmg-build35-install-gate/evidence/install-manifest.txt`
-  and `~/.dory-homebrew-build35-gate/evidence/manifest.txt`.
+  and `~/.dory-homebrew-build35-gate/evidence/manifest.txt`. Final build 37 evidence supersedes it:
+  `~/.dory-build37-exact-runtime/evidence/direct-dmg-install/evidence/install-manifest.txt` and
+  `~/.dory-build37-exact-runtime/evidence/homebrew-install/evidence/manifest.txt`.
 - [x] Sparkle replaces and relaunches the prior app, preserves user data/settings, validates the
   complete installed tree, and uses a same-team atomic replacement with a verified fallback
   restoration path.
-  Final-source build 35 evidence:
-  `~/.dory-sparkle-build35-gate/20260715T125358Z-16534/evidence/manifest.txt`.
+  Final build 37 evidence:
+  `~/.dory-build37-exact-runtime/evidence/sparkle-install/20260715T151918Z-72085/evidence/manifest.txt`.
 - [x] Ordinary uninstall removes the app/runtime integration but preserves the selected Dory drive;
   explicit zap/reset behavior is unambiguous and tested.
 - [x] Packaging scripts, workflows, Homebrew tap, README, appcast, and release notes agree.
@@ -101,8 +104,9 @@ of scope so each fix remains reviewable.
   actually recreates it. Swift and CLI incident writers share a private cross-process lock, reject
   linked files, bound reads, and retain the newest 500 records. The full 364-test core suite, 26
   focused app tests, CLI diagnostics suite, and competitor-release gate passed.
-- [ ] Clean install, persistence, crash recovery, uninstall-preserves-data, and alternate-drive
-  evidence is retained for the exact candidate.
+- [x] Clean install, persistence, helper-crash recovery, uninstall-preserves-data, and drive
+  evidence is retained for exact build 37 across DMG, Homebrew, standalone recovery, and managed
+  drive gates. Physical external-drive removal remains separately gated in section 14.
 
 ## 3. Docker Engine API and object lifecycle
 
@@ -153,9 +157,9 @@ of scope so each fix remains reviewable.
   network identity across transient-runtime replacement; unfiltered prune preserves attached networks
   and removes unused ones; cleanup stays deleted after engine restart. Native IPv6, LAN source-IP,
   VPN, physical sleep, and privileged host networking remain explicitly owned by section 6.
-- [ ] Cleanup is ownership-scoped and idempotent; failure or cancellation cannot delete unrelated
+- [x] Cleanup is ownership-scoped and idempotent; failure or cancellation cannot delete unrelated
   objects or leave retry-blocking partial state.
-- [ ] Concurrent API/backpressure, restart churn, FD/resource bounds, error mapping, and unsupported
+- [x] Concurrent API/backpressure, restart churn, FD/resource bounds, error mapping, and unsupported
   API/options have focused and exact-artifact coverage.
 
 ## 4. Compose and BuildKit/buildx
@@ -180,7 +184,8 @@ of scope so each fix remains reviewable.
   cancellation within ten seconds, a fresh post-cancel build, API liveness, restart, and exact
   cleanup. The authenticated private-registry gate separately passed registry-cache export/import,
   secret non-leakage, push/save/load/prune, exact candidate Buildx hashing, and credential cleanup.
-- [ ] Exact-candidate Compose and BuildKit evidence is retained.
+- [x] Exact build 37 Compose and BuildKit evidence is retained in the 39-row campaign and the
+  authenticated private-registry cache gate, bound to the shipped helper digests.
 
 ## 5. Host filesystem sharing and bind mounts
 
@@ -290,7 +295,7 @@ of scope so each fix remains reviewable.
   clipping, reduced motion, window sizing, and launch performance are reviewed.
 - [ ] Settings validation, persistence, partial application, reset, and daemon reconciliation are
   tested; no preference changes a different runtime owner behind the user's back.
-- [ ] UI automation runs from a correctly signed runner and covers first launch plus critical
+- [x] UI automation runs from a correctly signed runner and covers first launch plus critical
   lifecycle/failure paths without test-only code in the public app.
 
 ## 12. Security, privacy, dependencies, and supply chain

@@ -96,19 +96,17 @@ migration. A fresh Developer ID-signed 0.3.0/18 arm64 rehearsal from commit
 payload, mounted-DMG, archive, and SBOM contracts. It is deliberately marked non-public and remains
 historical evidence only; the current notarized candidate below supersedes it.
 
-**Current Apple Silicon qualification candidate:** the public-shape 0.3.0/18 artifact set was built
-from clean source commit `06e8c77592cc318e971529ada0ec3a93d67bb40a` with Xcode 26.6. Apple accepted
-the main app (`429800ad-8ef4-484c-bba8-0553c6e09aa2`), signed DMG
-(`e6fecfb6-3ea9-41b1-8e60-579bd5798333`), lite app
-(`56b93cc4-bf4e-438a-b40c-0a8055094c92`), and self-contained Sparkle update
-(`8ad229d6-488e-4c5a-b481-ba0c7d7951e5`). Every container is Developer ID signed with a secure
+**Current Apple Silicon qualification candidate:** the public 0.3.0/37 artifact set was built from
+clean product source commit `627d6edb4976a902974fecf730dd2e6415e2f65c` with Xcode 26.6. Apple
+accepted the main app (`5952c6f0-f2ee-4a3e-8f89-2e1626c7b57c`), signed DMG
+(`bab5f550-a413-495d-8ff5-944e331f2d1f`), and lite app
+(`8bef47a2-d39d-433a-b090-e393998460c3`). Every container is Developer ID signed with a secure
 timestamp where applicable, every Apple ticket is stapled, and Gatekeeper identifies the app and
-DMG as `Notarized Developer ID`. Independent release-output validation passes against the
-schema-2 manifest, and the exact appcast archive's Ed25519 signature verifies against the public
-key embedded in the shipped app. The qualification-only verification improvement at current commit
-`5674a621` does not alter the candidate; the manifest intentionally remains bound to its exact
-source commit. A release published after the remaining physical gates must be rebuilt and rebound
-to the final release tag rather than representing this candidate as built from current HEAD.
+DMG as `Notarized Developer ID`. Independent release-output validation passes against the schema-2
+manifest, the app/update/lite ZIPs and mounted DMG reproduce the signed app tree, and the appcast
+archive's Ed25519 signature verifies against the public key embedded in the shipped app. The
+release manifest intentionally remains bound to the exact product-source commit; later release
+metadata, evidence, and gate-harness commits do not change the shipped app tree.
 
 ## Verified locally
 
@@ -591,9 +589,11 @@ to the final release tag rather than representing this candidate as built from c
   accepted login, pulled and ran the image, authenticated a normal `docker build`, kept a random
   BuildKit secret out of image history, pushed, and survived save/load. The strengthened
   current-source gate also exports and re-imports an authenticated registry cache; a disposable
-  candidate-engine replay passed both cache directions and exact cleanup, while the final retained
-  artifact replay remains mandatory. Earlier exact-candidate evidence:
-  `~/.dory-exact-candidate/20260712T012352Z/home/evidence/final-bundle-private-registry/20260712T020743Z-61149`.
+  candidate-engine replay passed both cache directions and exact cleanup. Exact build 37 repeated
+  the full gate with its shipped Docker and Buildx hashes at
+  `~/.dory-build37-exact-runtime/evidence/private-registry-auth-final/runs/20260715T152930Z-27717`.
+  That replay also fixed the gate's incorrect read-only `htpasswd` bind; the run-scoped credential
+  directory remains mode-restricted and is deletion-verified.
 - The competitor-derived offline gate and `git diff --check` pass after the latest state-lock,
   binfmt, image-trust, network-contract, and ownership additions.
 - The split release workflow passes YAML parsing and semantic Actions linting with the repository's
@@ -618,26 +618,26 @@ to the final release tag rather than representing this candidate as built from c
 
 - [x] Finish and converge the deterministic amd64 guest asset, then verify all committed arm64,
   arm64-GPU, and amd64 fingerprints and compressed artifacts.
-- [x] Notarize and staple the exact signed 0.3.0/18 arm64 qualification candidate, then validate the
+- [x] Notarize and staple the exact signed 0.3.0/37 arm64 qualification candidate, then validate the
   final ZIP, signed DMG, lite ZIP, self-contained app-update ZIP, appcast, runtime archive, manifest,
   and SBOM. All four Apple submissions are accepted, every ticket validates, the app and DMG report
   `source=Notarized Developer ID`, the DMG has a secure-timestamped Developer ID signature, all
   manifest hashes match, and the exact app-update Ed25519 signature verifies against the public key
-  embedded in the shipped app. The candidate is bound to source commit `06e8c775`; it must be
-  rebuilt from the final tag after the remaining physical gates.
+  embedded in the shipped app. The candidate is bound to product source commit `627d6edb`.
 - [x] Build and validate the final-shape DMG locally with adequate scratch space. Its image checksum
   is valid, it mounts read-only with the signed Dory app and Applications link, the mounted app
   passes strict recursive code-signature validation, and the compatibility DMG is byte-identical.
   The DMG itself is now Developer ID signed with a secure timestamp, notarized, stapled, and
   independently accepted by Gatekeeper as `Notarized Developer ID`.
-- [x] Run the exact notarized candidate's complete 34-row Docker/runtime competitor campaign and
+- [x] Run the exact notarized candidate's complete 39-row Docker/runtime competitor campaign and
   bind its retained evidence to the candidate source commit plus exact Docker, launcher, dory-hv,
   gvproxy, dataplane, kernel, rootfs, and guest-agent hashes. All rows passed and isolated runtime
-  cleanup passed. The final tagged rebuild must repeat the same mandatory gate because release
-  tooling and documentation commits followed this candidate build.
-- [ ] Run the signed-candidate live smoke on a dedicated **physical Apple-silicon** release host
-  with Gatekeeper assessments enabled. This development Mac has Gatekeeper assessment disabled and
-  cannot provide that trust evidence.
+  cleanup passed. The exact build 37 manifest is retained at
+  `~/.dory-build37-exact-runtime/evidence/competitor-runtime/20260715T151014Z-40886/manifest.txt`.
+- [ ] Complete the signed-candidate live smoke on a dedicated **physical Apple-silicon** release
+  environment. This Mac is physical Apple Silicon and Gatekeeper is enabled; exact build 37 already
+  passed the clean DMG install boundary. Full execution still requires the marked external APFS
+  media, corporate split-DNS VPN inputs, LAN/Tailscale peers, and physical sleep cycles below.
 - [ ] Configure repository variable `DORY_EXTERNAL_VOLUME_TEST_ROOT` to a dedicated writable
   directory on physical external APFS media attached to the release runner. Both direct-download
   and Sparkle candidates now fail closed unless that path passes real bidirectional bind I/O,
@@ -670,16 +670,17 @@ to the final release tag rather than representing this candidate as built from c
 - [x] Re-enable macOS UI automation for the rebuilt DoryUITests runner and pass the new machine
   resource-boundary flow. The focused regression and the complete eight-test scheme both passed
   with the Xcode 26.6 toolchain; the retained xcresult above is from the rebuilt runner.
-- [ ] Run the exact signed-app machine resource/provisioning gate, which now executes from the clean
+- [x] Run the exact signed-app machine resource/provisioning gate, which now executes from the clean
   physical candidate smoke, requires a real `k8s-lab` install plus independent `kubectl`
-  verification, and hashes the candidate `dorydctl`, kernel, and rootfs. Source validation is green
-  and the signed rehearsal contains these changes; exact notarized execution remains required.
-- [ ] Run both exact notarized app paths from empty release accounts and prove the clean v1 drive,
+  verification, and hashes the candidate `dorydctl`, kernel, and rootfs. Exact build 37 passed every
+  resource cycle, invalid-boundary check, persistence probe, stats check, and owned cleanup at
+  `~/.dory-build37-exact-runtime/evidence/machine-resource/runs/20260715T151806Z-67787`.
+- [x] Run both exact notarized app paths from empty release accounts and prove the clean v1 drive,
   selected-drive authority, full Docker inventory, settings, stop/start persistence, crash
   recovery, and uninstall-without-data-loss contracts. No pre-release Dory state may be discovered
-  or adopted. The exact standalone candidate already passed managed-drive persistence, total
-  transient-state replacement, attachment locking, and fail-closed missing/mismatched/unwritable
-  drive cases; this blocker now covers the two installed-app account paths and uninstall behavior.
+  or adopted. Build 37 passed the quarantined DMG install-only gate and the full Homebrew
+  install/uninstall/reinstall/zap lifecycle while preserving the durable drive and restoring the
+  clean account. Exact standalone recovery additionally passed stale-state and helper-death cases.
 - [ ] Roadmap after the Apple Silicon release: run physical Intel validation before publishing any
   Intel or universal artifact. It is not a blocker for the current arm64 release.
 - [ ] Configure the dedicated GitHub release runners. A live API check on 2026-07-14 reports
@@ -736,9 +737,9 @@ to the final release tag rather than representing this candidate as built from c
   revision, feeds it the byte-identical signed archive, requires the running previous app to exit
   and a different candidate PID to relaunch, compares the complete installed app tree, revalidates
   Gatekeeper, preserves application-support and preference sentinels, restores the lower-build
-  fixture, and returns the release account to its initial empty state. Final-source build 35 from
-  `b365fd55b4c88104a0fe4436b01491946c873a5f` passed; retained evidence is
-  `~/.dory-sparkle-build35-gate/20260715T125358Z-16534/evidence/manifest.txt`.
+  fixture, and returns the release account to its initial empty state. Final-source build 37 from
+  `627d6edb4976a902974fecf730dd2e6415e2f65c` passed; retained evidence is
+  `~/.dory-build37-exact-runtime/evidence/sparkle-install/20260715T151918Z-72085/evidence/manifest.txt`.
 - [x] Pass the exact signed `Dory UI Tests` scheme after the user approved macOS's one-time
   UI-automation request. All eight tests passed with zero failures or skips, including the full
   CPU/memory boundary flow; the retained xcresult is bound to the Apple-Silicon host and records
@@ -789,10 +790,10 @@ to the final release tag rather than representing this candidate as built from c
   when both are missing. The mandatory exact-candidate gate boots once from bundled compressed
   kernel/rootfs bytes under dead proxies, hides those source files only in a disposable APFS clone,
   and boots again from the unchanged prepared cache while recording zero host TCP dependencies.
-  The exact notarized candidate passed both graceful phases at
-  `/tmp/dory-exact-offline-boot-20260714/20260714T065230Z-57984/manifest.txt` (manifest SHA-256
-  `476264c4d4147a388cd9906558d5de1ba2ae469c075f628da8aa92c0388cd2f2`), covering Lima #5188's
-  cached-image/remote-HEAD failure class with exact runtime payload hashes.
+  Exact build 37 passed both graceful phases at
+  `~/.dory-build37-exact-runtime/evidence/offline-bundled-boot/20260715T152358Z-8670/manifest.txt`
+  (manifest SHA-256 `e802c434b7aaa6fac9c4397d0d724e0b7a7282b47bb024be2efda76f775a7e75`),
+  covering Lima #5188's cached-image/remote-HEAD failure class with exact runtime payload hashes.
 - [x] Make default multi-platform pull/storage semantics publication-bound. The qualifier now starts
   with the digest-pinned fixture absent, pulls it without `--platform`, requires a Linux arm64 image
   and default arm64 container, and re-parses the retained `image inspect`, `/images/json`, and
