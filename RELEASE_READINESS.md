@@ -731,14 +731,15 @@ to the final release tag rather than representing this candidate as built from c
   secret names are present. GitHub does not expose secret
   values, so the five-minute release preflight validates presence, image pinning, temporary AWS
   identity/repository access, and an authenticated dry-run tap push before any build starts.
-- [ ] Execute the real Sparkle updater install/relaunch gate on the exact notarized candidate. The
+- [x] Execute the real Sparkle updater install/relaunch gate on the exact notarized candidate. The
   release workflow now builds the updater CLI from the `Package.resolved`-pinned Sparkle 2.9.4
   revision, feeds it the byte-identical signed archive, requires the running previous app to exit
   and a different candidate PID to relaunch, compares the complete installed app tree, revalidates
   Gatekeeper, preserves application-support and preference sentinels, restores the lower-build
-  fixture, and returns the release account to its initial empty state. Its offline/fail-closed
-  tests and pinned-tool build pass locally; exact-candidate execution still requires the clean
-  release user with Gatekeeper enabled.
+  fixture, and returns the release account to its initial empty state. Exact build 34 from
+  `35ddb8cd63599c3367decd329115ba632f5029a0` passed; retained evidence is
+  `~/.dory-sparkle-build34-gate/20260715T121641Z-58675/evidence/manifest.txt`. Publication still
+  requires the same gate to pass after the final-source rebuild.
 - [x] Pass the exact signed `Dory UI Tests` scheme after the user approved macOS's one-time
   UI-automation request. All eight tests passed with zero failures or skips, including the full
   CPU/memory boundary flow; the retained xcresult is bound to the Apple-Silicon host and records

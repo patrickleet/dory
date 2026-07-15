@@ -47,15 +47,18 @@ of scope so each fix remains reviewable.
   architecture, or appcast data.
 - [x] Developer ID signing, hardened runtime, entitlements, nested-code inventory, notarization,
   stapling, Gatekeeper, SBOM, DMG, ZIP, and update-archive validation fail closed.
-- [ ] Direct DMG installation and Homebrew Cask installation work from a clean account with normal
+- [x] Direct DMG installation and Homebrew Cask installation work from a clean account with normal
   quarantine and install only Apple Silicon payloads.
-- [ ] Sparkle replaces and relaunches the prior app, preserves user data/settings, validates the
+  Build 34 evidence: `~/.dory-dmg-build34-install-gate/evidence/install-manifest.txt` and
+  `~/.dory-homebrew-build34-gate/evidence/manifest.txt`.
+- [x] Sparkle replaces and relaunches the prior app, preserves user data/settings, validates the
   complete installed tree, and uses a same-team atomic replacement with a verified fallback
   restoration path.
+  Build 34 evidence: `~/.dory-sparkle-build34-gate/20260715T121641Z-58675/evidence/manifest.txt`.
 - [x] Ordinary uninstall removes the app/runtime integration but preserves the selected Dory drive;
   explicit zap/reset behavior is unambiguous and tested.
 - [x] Packaging scripts, workflows, Homebrew tap, README, appcast, and release notes agree.
-- [ ] Exact-candidate evidence is retained for both install paths and the real Sparkle path.
+- [x] Exact-candidate evidence is retained for both install paths and the real Sparkle path.
 
 ## 2. App onboarding, daemon lifecycle, and durable drive
 
