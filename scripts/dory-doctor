@@ -61,10 +61,22 @@ URL_CREDENTIAL_RE = re.compile(r"([a-z][a-z0-9+.-]*://[^\s:/@]+:)[^\s:/@]+@", re
 DOCKER_CONTAINER_ID_RE = re.compile(r"\b[0-9a-f]{12,64}\b", re.I)
 DORY_DATA_DRIVE_SCHEMA_VERSION = 1
 DORY_DATA_DRIVE_SELECTION_SCHEMA_VERSION = 2
+DARWIN_SYSTEM_CA_FILE = Path("/etc/ssl/cert.pem")
 
 
 def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def default_tls_context() -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    # `#!/usr/bin/env python3` intentionally lets Dory work with Apple, Homebrew, pyenv, and
+    # Python.org interpreters. Some Python.org installations use a private OpenSSL CA bundle that
+    # can be missing roots available to macOS. Supplement that interpreter-specific store with the
+    # system bundle so the result does not depend on which python3 happens to be first on PATH.
+    if sys.platform == "darwin" and DARWIN_SYSTEM_CA_FILE.is_file():
+        context.load_verify_locations(cafile=str(DARWIN_SYSTEM_CA_FILE))
+    return context
 
 
 def socket_path() -> Path:
@@ -761,7 +773,7 @@ class Doctor:
             return
         self.add(dns_id, "pass", "network.registry_dns_ok", "Host resolves network probe", f"{host}:{port}", ips=ips[:8], probe=probe)
         try:
-            context = ssl.create_default_context()
+            context = default_tls_context()
             conn = http.client.HTTPSConnection(host, port, timeout=self.timeout, context=context)
             conn.request("GET", "/v2/", headers={"User-Agent": "dory-doctor"})
             response = conn.getresponse()
