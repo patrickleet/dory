@@ -152,6 +152,13 @@ grep -F 'offline Docker backend socket path is' \
 grep -F '"$WORKDIR/last-engine.log"' \
   scripts/offline-bundled-boot-gate.sh >/dev/null \
   || fail "offline boot gate discards the engine failure log during cleanup"
+grep -F 'RUNTIME_HOME="$RUNTIME_HOME_BASE/.dmd-$PPID-$$"' \
+  scripts/managed-data-drive-gate.sh >/dev/null \
+  || fail "managed data-drive gate derives its socket-owning HOME from the long macOS temp path"
+grep -F 'HOME_ROOT="$HOME_BASE/.dni6-$$"' scripts/native-ipv6-gate.sh >/dev/null \
+  || fail "native IPv6 gate derives its socket-owning HOME from the long macOS temp path"
+grep -F 'native IPv6 Unix socket path is' scripts/native-ipv6-gate.sh >/dev/null \
+  || fail "native IPv6 gate does not reject an overlong AF_UNIX path before launch"
 grep -F 'lima-vm/lima/issues/5188' COMPETITOR_ISSUE_COVERAGE.md >/dev/null \
   || fail "competitor coverage omits Lima's cached-image HEAD failure"
 grep -F 'docker/for-mac/issues/7825' COMPETITOR_ISSUE_COVERAGE.md >/dev/null \

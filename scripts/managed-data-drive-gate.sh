@@ -44,9 +44,15 @@ done
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 RUN_ROOT="$WORKROOT/$RUN_ID"
 EVIDENCE="$RUN_ROOT/evidence"
-RUNTIME_HOME="${DORY_MANAGED_DRIVE_RUNTIME_HOME:-${TMPDIR:-/tmp}}"
-if [ -z "${DORY_MANAGED_DRIVE_RUNTIME_HOME:-}" ]; then
-  RUNTIME_HOME="${RUNTIME_HOME%/}/dory-md-$PPID-$$"
+if [ -n "${DORY_MANAGED_DRIVE_RUNTIME_HOME:-}" ]; then
+  RUNTIME_HOME="$DORY_MANAGED_DRIVE_RUNTIME_HOME"
+else
+  RUNTIME_HOME_BASE="${DORY_MANAGED_DRIVE_RUNTIME_HOME_BASE:-$HOME}"
+  RUNTIME_HOME_BASE="$(cd "$RUNTIME_HOME_BASE" 2>/dev/null && pwd -P)" || {
+    echo "managed data-drive gate: runtime HOME base is unavailable: $RUNTIME_HOME_BASE" >&2
+    exit 66
+  }
+  RUNTIME_HOME="$RUNTIME_HOME_BASE/.dmd-$PPID-$$"
 fi
 DORY_ROOT="$RUNTIME_HOME/.dory"
 STATE="$DORY_ROOT/standalone"

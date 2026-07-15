@@ -69,13 +69,31 @@ fi
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 RUN_ROOT="$WORKROOT/$RUN_ID"
 EVIDENCE="$RUN_ROOT/evidence"
-HOME_ROOT="${TMPDIR:-/tmp}/dory-ni6-$$"
+HOME_BASE="${DORY_NATIVE_IPV6_HOME_BASE:-$HOME}"
+HOME_BASE="$(cd "$HOME_BASE" 2>/dev/null && pwd -P)" || {
+  echo "native IPv6 gate: runtime HOME base is unavailable: $HOME_BASE" >&2
+  exit 66
+}
+HOME_ROOT="$HOME_BASE/.dni6-$$"
 STATE="$HOME_ROOT/s"
 DRIVE="$HOME_ROOT/Library/Application Support/Dory/Dory.dorydrive"
 SOCKET="$HOME_ROOT/e.sock"
 PORT_FILE="$HOME_ROOT/host-port"
 ENGINE_PID=""
 HOST_PID=""
+[ ! -e "$HOME_ROOT" ] || {
+  echo "native IPv6 gate: isolated runtime HOME already exists: $HOME_ROOT" >&2
+  exit 73
+}
+python3 - "$SOCKET" "$STATE/docker-backend.sock" "$STATE/gvproxy-api.sock" <<'PY'
+import os
+import sys
+
+for path in sys.argv[1:]:
+    length = len(os.fsencode(path))
+    if length > 103:
+        raise SystemExit(f"native IPv6 Unix socket path is {length} bytes (limit 103): {path}")
+PY
 mkdir -p "$EVIDENCE" "$HOME_ROOT"
 
 prepare_asset() {
@@ -95,9 +113,23 @@ ROOTFS="$(prepare_asset "$ROOTFS" rootfs.ext4)"
 
 stop_engine() {
   [ -n "$ENGINE_PID" ] || return 0
+  cycle_pid="$ENGINE_PID"
+  ps -axo pid=,ppid=,command= | awk -v parent="$cycle_pid" '$2 == parent { print }' \
+    > "$EVIDENCE/engine-children-before-stop-$cycle_pid.txt"
+  gvproxy_pids="$(awk '/gvproxy/ { print $1 }' "$EVIDENCE/engine-children-before-stop-$cycle_pid.txt")"
   if kill -0 "$ENGINE_PID" 2>/dev/null; then kill -TERM "$ENGINE_PID" 2>/dev/null || true; fi
   for _ in $(seq 1 300); do
-    kill -0 "$ENGINE_PID" 2>/dev/null || { wait "$ENGINE_PID" 2>/dev/null || true; ENGINE_PID=""; return 0; }
+    kill -0 "$ENGINE_PID" 2>/dev/null || {
+      wait "$ENGINE_PID" 2>/dev/null || true
+      ENGINE_PID=""
+      for child_pid in $gvproxy_pids; do
+        if kill -0 "$child_pid" 2>/dev/null; then
+          echo "native IPv6 gate: gvproxy child $child_pid survived engine shutdown" >&2
+          return 1
+        fi
+      done
+      return 0
+    }
     sleep 0.1
   done
   kill -KILL "$ENGINE_PID" 2>/dev/null || true
@@ -162,6 +194,16 @@ start_engine() {
 
 verify_cycle() {
   cycle="$1"
+  kill -0 "$HOST_PID" 2>/dev/null || {
+    echo "native IPv6 gate: host IPv6 listener exited before $cycle verification" >&2
+    exit 1
+  }
+  host_response="$(curl -gfsS --connect-timeout 2 "http://[::1]:$HOST_PORT/")"
+  printf '%s\n' "$host_response" > "$EVIDENCE/host-listener-$cycle.txt"
+  [ "$host_response" = dory-ipv6-loop ] || {
+    echo "native IPv6 gate: host IPv6 listener failed before $cycle verification" >&2
+    exit 1
+  }
   export DOCKER_HOST="unix://$SOCKET"
   "$DOCKER" network inspect bridge > "$EVIDENCE/bridge-$cycle.json"
   "$DOCKER" run --rm alpine:3.20 sh -ec "
