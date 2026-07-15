@@ -19,12 +19,13 @@ nonisolated struct MigrationImageLayerFingerprint: Codable, Sendable, Equatable 
 }
 
 nonisolated struct MigrationImageArchiveFingerprint: Codable, Sendable, Equatable {
-    static let schemaVersion = 1
+    static let schemaVersion = 2
 
     let schemaVersion: Int
     let configArchivePath: String
     let configBytes: UInt64
     let configSha256: String
+    let validatedImageIDs: [String]
     let layers: [MigrationImageLayerFingerprint]
     let archiveBytes: UInt64
     let archiveEntryCount: Int
@@ -35,6 +36,7 @@ nonisolated struct MigrationImageArchiveFingerprint: Codable, Sendable, Equatabl
         configArchivePath: String,
         configBytes: UInt64,
         configSha256: String,
+        validatedImageIDs: [String] = [],
         layers: [MigrationImageLayerFingerprint],
         archiveBytes: UInt64,
         archiveEntryCount: Int,
@@ -44,6 +46,16 @@ nonisolated struct MigrationImageArchiveFingerprint: Codable, Sendable, Equatabl
         self.configArchivePath = configArchivePath
         self.configBytes = configBytes
         self.configSha256 = configSha256
+        let semanticIdentity = "sha256:\(configSha256)"
+        let identities = [semanticIdentity] + validatedImageIDs
+        guard identities.allSatisfy(Self.isCanonicalImageID) else {
+            throw MigrationImageArchiveError.invalid(
+                "image identity is not a lowercase sha256 digest"
+            )
+        }
+        self.validatedImageIDs = identities.reduce(into: []) { result, identity in
+            if !result.contains(identity) { result.append(identity) }
+        }
         self.layers = layers
         self.archiveBytes = archiveBytes
         self.archiveEntryCount = archiveEntryCount
@@ -64,6 +76,18 @@ nonisolated struct MigrationImageArchiveFingerprint: Codable, Sendable, Equatabl
     /// Docker's config digest binds platform, runtime configuration, history, and ordered rootfs
     /// diff IDs. A target re-save with this digest is the cross-engine semantic identity proof.
     var semanticIdentity: String { "sha256:\(configSha256)" }
+
+    func supportsImageID(_ imageID: String) -> Bool {
+        validatedImageIDs.contains(imageID)
+    }
+
+    private static func isCanonicalImageID(_ value: String) -> Bool {
+        guard value.hasPrefix("sha256:") else { return false }
+        let digest = value.dropFirst("sha256:".count)
+        return digest.utf8.count == 64 && digest.utf8.allSatisfy {
+            (48...57).contains($0) || (97...102).contains($0)
+        }
+    }
 }
 
 nonisolated struct MigrationImageArchiveReader {

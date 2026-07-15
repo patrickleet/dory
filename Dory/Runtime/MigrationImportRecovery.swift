@@ -448,7 +448,15 @@ private struct MigrationImportRecoveryPlan {
               imageManifest.targetInventoryEntryAfterLoad.id
                 == imageManifest.loadedTargetImageID,
               !imageManifest.targetImageWasPreexisting,
-              imageManifest.targetInventoryEntryAfterLoad.references.isEmpty else {
+              imageManifest.targetInventoryEntryAfterLoad.references.isEmpty,
+              MigrationImageTransferExecution.verifiesImageEvidence(
+                sourceImageID: imageManifest.sourceImageID,
+                loadedTargetImageID: imageManifest.loadedTargetImageID,
+                sourceBefore: imageManifest.sourceBeforeTransfer,
+                sourceDuring: imageManifest.sourceDuringTransfer,
+                sourceAfter: imageManifest.sourceAfterTransfer,
+                verifiedTarget: imageManifest.verifiedTarget
+              ) else {
             throw invalid(operationID, object.source)
         }
         return imageManifest.targetInventoryEntryAfterLoad

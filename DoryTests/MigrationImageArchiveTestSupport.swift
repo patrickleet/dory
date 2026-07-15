@@ -26,6 +26,8 @@ struct MigrationImageArchiveTestFixture {
     let entries: [MigrationImageTarTestEntry]
     let configDigest: String
     let layerDigests: [String]
+    let ociIndexDigest: String?
+    let ociManifestDigest: String?
 }
 
 enum MigrationImageArchiveTestSupport {
@@ -55,6 +57,13 @@ enum MigrationImageArchiveTestSupport {
         let base256LayerSize: Bool
         let paxLayerPath: Bool
         let contentAddressedLayout: Bool
+        let ociEntries: [MigrationImageTarTestEntry]
+    }
+
+    private struct OCIEntries {
+        let entries: [MigrationImageTarTestEntry]
+        let indexDigest: String
+        let manifestDigest: String
     }
 
     static func fixture(
@@ -129,6 +138,14 @@ enum MigrationImageArchiveTestSupport {
             "RepoTags": (options.repoTags as Any?) ?? NSNull(),
             "Layers": options.missingReferencedLayer ? ["missing/layer.tar"] : layerPaths
         ]])
+        let oci = options.contentAddressedLayout
+            ? ociEntries(
+                configDigest: configDigest,
+                configBytes: config.count,
+                layerDigests: layerDigests,
+                layerPayloads: layerPayloads
+            )
+            : nil
         let entries = imageEntries(ImageEntriesInput(
             configPath: configPath,
             config: config,
@@ -138,13 +155,16 @@ enum MigrationImageArchiveTestSupport {
             missingReferencedLayer: options.missingReferencedLayer,
             base256LayerSize: options.base256LayerSize,
             paxLayerPath: options.paxLayerPath,
-            contentAddressedLayout: options.contentAddressedLayout
+            contentAddressedLayout: options.contentAddressedLayout,
+            ociEntries: oci?.entries ?? []
         ))
         return MigrationImageArchiveTestFixture(
             archive: archive(entries),
             entries: entries,
             configDigest: configDigest,
-            layerDigests: layerDigests
+            layerDigests: layerDigests,
+            ociIndexDigest: oci?.indexDigest,
+            ociManifestDigest: oci?.manifestDigest
         )
     }
 
@@ -182,20 +202,86 @@ enum MigrationImageArchiveTestSupport {
             ))
         }
         if input.contentAddressedLayout {
-            entries.append(MigrationImageTarTestEntry(
-                path: "index.json",
-                payload: json(["schemaVersion": 2])
-            ))
-            entries.append(MigrationImageTarTestEntry(
-                path: "oci-layout",
-                payload: json(["imageLayoutVersion": "1.0.0"])
-            ))
+            entries.append(contentsOf: input.ociEntries)
         }
         entries.append(MigrationImageTarTestEntry(
             path: "manifest.json",
             payload: input.manifest
         ))
         return entries
+    }
+
+    private static func ociEntries(
+        configDigest: String,
+        configBytes: Int,
+        layerDigests: [String],
+        layerPayloads: [Data]
+    ) -> OCIEntries {
+        let imageManifest = json([
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": [
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": "sha256:\(configDigest)",
+                "size": configBytes
+            ],
+            "layers": zip(layerDigests, layerPayloads).map { digest, payload in
+                [
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": "sha256:\(digest)",
+                    "size": payload.count
+                ] as [String: Any]
+            }
+        ])
+        let manifestDigest = sha256(imageManifest)
+        let absentAMD64Digest = String(repeating: "e", count: 64)
+        let imageIndex = json([
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                [
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:\(manifestDigest)",
+                    "size": imageManifest.count,
+                    "platform": ["architecture": "arm64", "os": "linux", "variant": "v8"]
+                ],
+                [
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:\(absentAMD64Digest)",
+                    "size": 123,
+                    "platform": ["architecture": "amd64", "os": "linux"]
+                ]
+            ]
+        ])
+        let indexDigest = sha256(imageIndex)
+        let rootIndex = json([
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [[
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "digest": "sha256:\(indexDigest)",
+                "size": imageIndex.count
+            ]]
+        ])
+        return OCIEntries(
+            entries: [
+                MigrationImageTarTestEntry(
+                    path: "blobs/sha256/\(manifestDigest)",
+                    payload: imageManifest
+                ),
+                MigrationImageTarTestEntry(
+                    path: "blobs/sha256/\(indexDigest)",
+                    payload: imageIndex
+                ),
+                MigrationImageTarTestEntry(path: "index.json", payload: rootIndex),
+                MigrationImageTarTestEntry(
+                    path: "oci-layout",
+                    payload: json(["imageLayoutVersion": "1.0.0"])
+                )
+            ],
+            indexDigest: indexDigest,
+            manifestDigest: manifestDigest
+        )
     }
 
     static func archive(
@@ -250,6 +336,18 @@ enum MigrationImageArchiveTestSupport {
     ) -> Data {
         archive(fixture.entries.map { entry in
             entry.path == "manifest.json"
+                ? MigrationImageTarTestEntry(path: entry.path, payload: payload)
+                : entry
+        })
+    }
+
+    static func replacingEntry(
+        in fixture: MigrationImageArchiveTestFixture,
+        path: String,
+        payload: Data
+    ) -> Data {
+        archive(fixture.entries.map { entry in
+            entry.path == path
                 ? MigrationImageTarTestEntry(path: entry.path, payload: payload)
                 : entry
         })

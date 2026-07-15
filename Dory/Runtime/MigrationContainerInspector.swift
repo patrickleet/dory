@@ -15,6 +15,15 @@ enum MigrationContainerInspectionError: Error, Sendable, Equatable, CustomString
 }
 
 enum MigrationContainerInspector {
+    private static let bundledRuntimeNames: Set<String> = ["runc", "crun", "dory-runc"]
+
+    static func unsupportedRuntimeName(_ name: String?) -> String? {
+        guard let normalized = name?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !normalized.isEmpty,
+              !bundledRuntimeNames.contains(normalized) else { return nil }
+        return normalized
+    }
+
     static func inspect(
         _ container: Container,
         on runtime: any ContainerRuntime,
@@ -265,9 +274,7 @@ private extension MigrationContainerInspector {
                 "container \(containerName) uses host devices that are not portable into Dory's VM"
             )
         }
-        if let runtime = specification.runtimeName?.lowercased(),
-           !runtime.isEmpty,
-           !["runc", "crun"].contains(runtime) {
+        if let runtime = unsupportedRuntimeName(specification.runtimeName) {
             throw MigrationContainerInspectionError.unsupported(
                 "container \(containerName) requires unbundled runtime \(runtime)"
             )

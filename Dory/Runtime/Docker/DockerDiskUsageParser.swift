@@ -43,8 +43,17 @@ nonisolated enum DockerDiskUsageParser {
             throw DockerDiskUsageParserError.invalidJSON
         }
         let aggregateKeys = ["ImageUsage", "VolumeUsage", "ContainerUsage", "BuildCacheUsage"]
-        let aggregateValues = aggregateKeys.compactMap { key in
-            exactNonnegativeInteger((root[key] as? [String: Any])?["TotalSize"])
+        let aggregateValues = try aggregateKeys.compactMap { key -> Int64? in
+            guard let value = root[key] else { return nil }
+            guard let usage = value as? [String: Any] else {
+                throw DockerDiskUsageParserError.invalidTotalUsage("\(key) must be an object")
+            }
+            // Moby omits every zero-valued field, so an empty usage object is an exact zero.
+            if usage.isEmpty { return 0 }
+            guard let total = exactNonnegativeInteger(usage["TotalSize"]) else {
+                throw DockerDiskUsageParserError.invalidTotalUsage("\(key).TotalSize is invalid")
+            }
+            return total
         }
         if aggregateValues.count == aggregateKeys.count {
             return try sum(aggregateValues, field: "aggregate usage")
@@ -52,7 +61,9 @@ nonisolated enum DockerDiskUsageParser {
         if aggregateKeys.contains(where: { root[$0] != nil }) {
             throw DockerDiskUsageParserError.invalidTotalUsage("incomplete aggregate usage")
         }
-        guard let layers = exactNonnegativeInteger(root["LayersSize"]),
+        let layers = exactNonnegativeInteger(root["LayersSize"])
+            ?? (explicitlyEmptyItems(root["Images"]) ? 0 : nil)
+        guard let layers,
               let volumes = try usageItems(root["Volumes"], field: "Volumes", size: volumeSize),
               let containers = try usageItems(
                   root["Containers"],
@@ -125,6 +136,12 @@ nonisolated enum DockerDiskUsageParser {
             sizes.append(value)
         }
         return try sum(sizes, field: field)
+    }
+
+    private static func explicitlyEmptyItems(_ value: Any?) -> Bool {
+        guard let value else { return false }
+        if value is NSNull { return true }
+        return (value as? [Any])?.isEmpty == true
     }
 
     private static func volumeSize(_ object: [String: Any]) -> Int64? {

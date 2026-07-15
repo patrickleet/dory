@@ -63,10 +63,18 @@ nonisolated enum MigrationImageArchiveManifest {
             path: config,
             layers: layerFingerprints
         )
+        let validatedImageIDs = try MigrationImageOCIArchiveIdentity.validatedImageIDs(
+            archive: archive,
+            configPath: config,
+            configBytes: configEntry.logicalBytes,
+            configSha256: configSha256,
+            layers: layerFingerprints
+        )
         return try MigrationImageArchiveFingerprint(
             configArchivePath: config,
             configBytes: configEntry.logicalBytes,
             configSha256: configSha256,
+            validatedImageIDs: validatedImageIDs,
             layers: layerFingerprints,
             archiveBytes: archive.archiveBytes,
             archiveEntryCount: archive.entries.count,

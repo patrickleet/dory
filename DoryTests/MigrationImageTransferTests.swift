@@ -66,8 +66,8 @@ struct MigrationImageTransferTests {
     }
 
     @Test func acceptsContainerdManifestIDWhenTheResavedArchiveIsExactlyIdentical() async throws {
-        let fixture = ImageTransferFixture()
-        let manifestID = "sha256:" + String(repeating: "d", count: 64)
+        let fixture = ImageTransferFixture(contentAddressed: true)
+        let manifestID = "sha256:" + (try #require(fixture.sourceFixture.ociManifestDigest))
         let target = fixture.targetRuntime(loadedImageID: manifestID)
 
         let receipt = try await MigrationImageTransfer().transfer(
@@ -80,6 +80,25 @@ struct MigrationImageTransferTests {
         #expect(receipt.verifiedTarget.semanticIdentity == fixture.imageID)
         #expect(!receipt.targetImageWasPreexisting)
         #expect(target.savedReferences == [manifestID])
+    }
+
+    @Test func acceptsDocker29OCIIndexAsTheSourceAndTargetImageID() async throws {
+        let fixture = ImageTransferFixture(
+            contentAddressed: true,
+            useOCIIndexIdentity: true
+        )
+
+        let receipt = try await MigrationImageTransfer().transfer(
+            fixture.request,
+            from: fixture.sourceRuntime(),
+            to: fixture.targetRuntime()
+        )
+
+        #expect(receipt.loadedTargetImageID == fixture.imageID)
+        #expect(receipt.sourceBeforeTransfer.supportsImageID(fixture.imageID))
+        #expect(receipt.sourceDuringTransfer.supportsImageID(fixture.imageID))
+        #expect(receipt.sourceAfterTransfer.supportsImageID(fixture.imageID))
+        #expect(receipt.verifiedTarget.supportsImageID(fixture.imageID))
     }
 
     @Test func sourceDriftDuringTransferRollsBackTheNewTargetImage() async throws {
@@ -323,17 +342,21 @@ private struct ImageTransferFixture {
     let sourceFixture: MigrationImageArchiveTestFixture
     let request: MigrationImageTransferRequest
 
-    init(contentAddressed: Bool = false) {
-        sourceFixture = contentAddressed
+    init(contentAddressed: Bool = false, useOCIIndexIdentity: Bool = false) {
+        let fixture = contentAddressed
             ? MigrationImageArchiveTestSupport.contentAddressedFixture()
             : MigrationImageArchiveTestSupport.fixture()
+        sourceFixture = fixture
+        let requestedDigest = useOCIIndexIdentity
+            ? (fixture.ociIndexDigest ?? fixture.configDigest)
+            : fixture.configDigest
         request = MigrationImageTransferRequest(
             operationID: UUID(uuidString: "55555555-5555-5555-5555-555555555555")!,
-            sourceImageID: "sha256:\(sourceFixture.configDigest)"
+            sourceImageID: "sha256:\(requestedDigest)"
         )
     }
 
-    var imageID: String { "sha256:\(sourceFixture.configDigest)" }
+    var imageID: String { request.sourceImageID }
 
     func sourceRuntime(
         archives: [Data]? = nil,

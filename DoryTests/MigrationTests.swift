@@ -1104,10 +1104,14 @@ final class FilteredLiveMigrationSource: ContainerRuntime {
         let included = Set(inventory.images.map(\.imageID))
         let current = try await base.snapshot()
         filtered.images.append(contentsOf: current.images.filter {
-            !included.contains($0.imageID)
-                && $0.labels["dev.dory.object.kind"] == "writableLayer"
+            guard !included.contains($0.imageID) else { return false }
+            let isOwnedWritableLayer = $0.labels["dev.dory.object.kind"] == "writableLayer"
                 && $0.labels["dev.dory.operation.id"] != nil
                 && $0.labels["dory.test.owner"] == fixtureOwner
+            let isTransferHelper = $0.labels["dev.dory.component"] == "transfer-helper"
+                && $0.labels["dev.dory.helper.sha256"] != nil
+                && $0.labels["dev.dory.manifest.schema"] == "1"
+            return isOwnedWritableLayer || isTransferHelper
         })
         return filtered
     }

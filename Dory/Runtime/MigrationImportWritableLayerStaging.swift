@@ -71,10 +71,14 @@ extension MigrationImportAssetStagingExecution {
         if !receipt.targetImageWasPreexisting {
             created.append(.image(entry: receipt.targetInventoryEntryAfterLoad))
         }
-        guard MigrationImageTransferExecution.canonicalImageID(receipt.loadedTargetImageID) != nil,
-              MigrationImageTransferExecution.canonicalImageID(
-                receipt.verifiedTarget.semanticIdentity
-              ) == MigrationImageTransferExecution.canonicalImageID(committedID) else {
+        guard MigrationImageTransferExecution.verifiesImageEvidence(
+            sourceImageID: committedID,
+            loadedTargetImageID: receipt.loadedTargetImageID,
+            sourceBefore: receipt.sourceBeforeTransfer,
+            sourceDuring: receipt.sourceDuringTransfer,
+            sourceAfter: receipt.sourceAfterTransfer,
+            verifiedTarget: receipt.verifiedTarget
+        ) else {
             throw MigrationImportAssetStagingError.targetDrift(object.source)
         }
         let imageManifestDigest = try session.lease.publishManifest(receipt.verificationManifest)

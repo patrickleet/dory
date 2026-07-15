@@ -70,6 +70,25 @@ struct MigrationTransferHelperAssetTests {
         #expect(runtime.inspectedImageIDs == [manifestID])
     }
 
+    @Test func installationWaitsForNormalizedHelperInventoryToConverge() async throws {
+        let fixture = try makeFixture()
+        let receiptID = "sha256:" + String(repeating: "d", count: 64)
+        let inventoryID = "sha256:" + String(repeating: "e", count: 64)
+        let runtime = TransferHelperRuntime(
+            metadata: fixture.asset.metadata,
+            engineImageID: inventoryID,
+            receiptImageID: receiptID,
+            hiddenSnapshotsAfterLoad: 2
+        )
+
+        let installation = try await fixture.asset.install(on: runtime, operationID: UUID())
+
+        #expect(installation.imageID == inventoryID)
+        #expect(runtime.snapshotCallsAfterLoad == 3)
+        #expect(runtime.inspectedImageIDs == [inventoryID])
+        #expect(runtime.tags.map(\.source) == [inventoryID])
+    }
+
     @Test func installationRejectsEngineThatReportsDifferentImageBytes() async throws {
         let fixture = try makeFixture()
         let runtime = TransferHelperRuntime(metadata: fixture.asset.metadata)
@@ -202,6 +221,8 @@ private final class TransferHelperRuntime: ContainerRuntime {
 
     let metadata: MigrationTransferHelperMetadata
     let engineImageID: String
+    let receiptImageID: String
+    let hiddenSnapshotsAfterLoad: Int
     var loadedArchives: [Data] = []
     var inspectedImageIDs: [String] = []
     var tags: [ImageTag] = []
@@ -210,16 +231,21 @@ private final class TransferHelperRuntime: ContainerRuntime {
     var imagePresent = false
     var failTag = false
     var loadCompleted = false
+    var snapshotCallsAfterLoad = 0
     var activeReferences: [String: String] = [:]
     let concurrentImagesAfterLoad: [DockerImage]
 
     init(
         metadata: MigrationTransferHelperMetadata,
         engineImageID: String? = nil,
+        receiptImageID: String? = nil,
+        hiddenSnapshotsAfterLoad: Int = 0,
         concurrentImagesAfterLoad: [DockerImage] = []
     ) {
         self.metadata = metadata
         self.engineImageID = engineImageID ?? metadata.imageConfigDigest
+        self.receiptImageID = receiptImageID ?? self.engineImageID
+        self.hiddenSnapshotsAfterLoad = hiddenSnapshotsAfterLoad
         self.concurrentImagesAfterLoad = concurrentImagesAfterLoad
     }
 
@@ -235,7 +261,7 @@ private final class TransferHelperRuntime: ContainerRuntime {
         var bytes = Data()
         for try await chunk in stream { bytes.append(chunk) }
         try await loadImage(tar: bytes)
-        return Data((#"{"stream":"Loaded image ID: \#(engineImageID)\n"}"# + "\r\n").utf8)
+        return Data((#"{"stream":"Loaded image ID: \#(receiptImageID)\n"}"# + "\r\n").utf8)
     }
 
     func proxyRequest(
@@ -288,7 +314,11 @@ private final class TransferHelperRuntime: ContainerRuntime {
 
     func snapshot() async throws -> RuntimeSnapshot {
         var images = loadCompleted ? concurrentImagesAfterLoad : []
-        guard imagePresent else { return RuntimeSnapshot(images: images) }
+        if loadCompleted { snapshotCallsAfterLoad += 1 }
+        guard imagePresent,
+              !loadCompleted || snapshotCallsAfterLoad > hiddenSnapshotsAfterLoad else {
+            return RuntimeSnapshot(images: images)
+        }
         let references = activeReferences.compactMap {
             $0.value == engineImageID ? $0.key : nil
         }.sorted()
@@ -301,6 +331,11 @@ private final class TransferHelperRuntime: ContainerRuntime {
             created: "now",
             usedByCount: 0,
             sizeBytes: 1_024,
+            labels: [
+                "dev.dory.component": "transfer-helper",
+                "dev.dory.helper.sha256": metadata.helperSha256,
+                "dev.dory.manifest.schema": "1"
+            ],
             additionalReferences: Array(references.dropFirst())
         ), at: 0)
         return RuntimeSnapshot(images: images)

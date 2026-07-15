@@ -129,10 +129,14 @@ struct MigrationImportAssetStagingExecution {
         // archive fingerprint is the cross-engine identity proof. A planned reuse must remain a
         // reuse; a planned create may safely discover already-present, byte-verified content.
         guard (!expectedPreexisting || receipt.targetImageWasPreexisting),
-              MigrationImageTransferExecution.canonicalImageID(receipt.loadedTargetImageID) != nil,
-              MigrationImageTransferExecution.canonicalImageID(
-                receipt.verifiedTarget.semanticIdentity
-              ) == MigrationImageTransferExecution.canonicalImageID(object.source.sourceID) else {
+              MigrationImageTransferExecution.verifiesImageEvidence(
+                sourceImageID: object.source.sourceID,
+                loadedTargetImageID: receipt.loadedTargetImageID,
+                sourceBefore: receipt.sourceBeforeTransfer,
+                sourceDuring: receipt.sourceDuringTransfer,
+                sourceAfter: receipt.sourceAfterTransfer,
+                verifiedTarget: receipt.verifiedTarget
+              ) else {
             throw MigrationImportAssetStagingError.targetDrift(object.source)
         }
         let manifestDigest = try session.lease.publishManifest(receipt.verificationManifest)

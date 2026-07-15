@@ -1885,9 +1885,7 @@ enum MigrationAssistant {
                 "inspect \(containerName): host device mappings are not portable into Dory's Linux VM"
             )
         }
-        if let runtime = spec.runtimeName?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-           !runtime.isEmpty,
-           !["runc", "crun"].contains(runtime) {
+        if let runtime = MigrationContainerInspector.unsupportedRuntimeName(spec.runtimeName) {
             failures.append(
                 "inspect \(containerName): container runtime \(runtime) is not bundled by Dory"
             )

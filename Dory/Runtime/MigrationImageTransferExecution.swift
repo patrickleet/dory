@@ -82,27 +82,29 @@ nonisolated struct MigrationImageTransferExecution {
     mutating func execute() async throws -> MigrationImageTransferReceipt {
         let sourceReference = try sourceReference()
         let sourceBefore = try await fingerprint(source, reference: sourceReference)
-        let expectedImageID = sourceBefore.semanticIdentity
-        guard expectedImageID == sourceReference else {
+        guard sourceBefore.supportsImageID(sourceReference) else {
             throw MigrationImageTransferError.sourceDrift
         }
         try await prepareTarget()
         let loaded = try await loadSource(reference: sourceReference)
         let loadReceipt = loaded.receipt
         try await recordLoadedTarget(
-            expectedSemanticIdentity: expectedImageID,
+            expectedSemanticIdentity: sourceReference,
             actualID: loadReceipt.loadedImageID
         )
         let sourceDuring = loaded.sourceFingerprint
-        guard sameSourceContent(sourceBefore, sourceDuring) else {
+        guard sourceDuring.supportsImageID(sourceReference),
+              Self.sameImageContent(sourceBefore, sourceDuring) else {
             throw MigrationImageTransferError.sourceDrift
         }
         let sourceAfter = try await fingerprint(source, reference: sourceReference)
-        guard sameSourceContent(sourceBefore, sourceAfter) else {
+        guard sourceAfter.supportsImageID(sourceReference),
+              Self.sameImageContent(sourceBefore, sourceAfter) else {
             throw MigrationImageTransferError.sourceDrift
         }
         let verifiedTarget = try await fingerprint(target, reference: loadReceipt.loadedImageID)
-        guard sameSourceContent(sourceBefore, verifiedTarget) else {
+        guard verifiedTarget.supportsImageID(loadReceipt.loadedImageID),
+              Self.sameImageContent(sourceBefore, verifiedTarget) else {
             throw MigrationImageTransferError.targetMismatch
         }
         guard let loadedTargetEntry else {
@@ -154,6 +156,36 @@ nonisolated struct MigrationImageTransferExecution {
 }
 
 extension MigrationImageTransferExecution {
+    nonisolated static func verifiesImageEvidence(
+        sourceImageID: String,
+        loadedTargetImageID: String,
+        sourceBefore: MigrationImageArchiveFingerprint,
+        sourceDuring: MigrationImageArchiveFingerprint,
+        sourceAfter: MigrationImageArchiveFingerprint,
+        verifiedTarget: MigrationImageArchiveFingerprint
+    ) -> Bool {
+        guard let sourceID = canonicalImageID(sourceImageID),
+              let targetID = canonicalImageID(loadedTargetImageID),
+              [sourceBefore, sourceDuring, sourceAfter, verifiedTarget].allSatisfy({
+                  $0.schemaVersion == MigrationImageArchiveFingerprint.schemaVersion
+              }),
+              sourceBefore.supportsImageID(sourceID),
+              sourceDuring.supportsImageID(sourceID),
+              sourceAfter.supportsImageID(sourceID),
+              verifiedTarget.supportsImageID(targetID) else { return false }
+        return sameImageContent(sourceBefore, sourceDuring)
+            && sameImageContent(sourceBefore, sourceAfter)
+            && sameImageContent(sourceBefore, verifiedTarget)
+    }
+
+    nonisolated static func sameImageContent(
+        _ first: MigrationImageArchiveFingerprint,
+        _ second: MigrationImageArchiveFingerprint
+    ) -> Bool {
+        first.semanticIdentity == second.semanticIdentity
+            && first.archiveContractSha256 == second.archiveContractSha256
+    }
+
     nonisolated static func canonicalImageID(_ value: String) -> String? {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         let digest = trimmed.hasPrefix("sha256:")
@@ -300,14 +332,6 @@ private extension MigrationImageTransferExecution {
         try await MigrationImageArchiveReader.fingerprint(
             runtime.saveImageThrowing(reference: reference)
         )
-    }
-
-    nonisolated func sameSourceContent(
-        _ first: MigrationImageArchiveFingerprint,
-        _ second: MigrationImageArchiveFingerprint
-    ) -> Bool {
-        first.semanticIdentity == second.semanticIdentity
-            && first.archiveContractSha256 == second.archiveContractSha256
     }
 
     func targetInventory() async throws -> MigrationImageTargetInventory {

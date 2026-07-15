@@ -128,8 +128,14 @@ extension MigrationImportAssetStagingExecution {
               manifest.targetInventoryEntryAfterLoad.id == manifest.loadedTargetImageID,
               manifest.targetImageWasPreexisting == (staged.disposition == .reusedPreexisting),
               staged.verifiedTarget.fingerprint == manifest.verifiedTarget.archiveContractSha256,
-              sameImageContent(manifest.sourceBeforeTransfer, manifest.sourceDuringTransfer),
-              sameImageContent(manifest.sourceBeforeTransfer, manifest.sourceAfterTransfer) else {
+              MigrationImageTransferExecution.verifiesImageEvidence(
+                sourceImageID: manifest.sourceImageID,
+                loadedTargetImageID: manifest.loadedTargetImageID,
+                sourceBefore: manifest.sourceBeforeTransfer,
+                sourceDuring: manifest.sourceDuringTransfer,
+                sourceAfter: manifest.sourceAfterTransfer,
+                verifiedTarget: manifest.verifiedTarget
+              ) else {
             throw MigrationImportAssetStagingError.invalidSession(
                 "final image staging manifest changed for \(object.source)"
             )
@@ -148,9 +154,23 @@ extension MigrationImportAssetStagingExecution {
             from: environment.source,
             to: environment.target
         )
-        guard let source = readback.source,
-              sameImageContent(source, manifest.sourceAfterTransfer),
-              sameImageContent(readback.target, manifest.verifiedTarget) else {
+        guard let sourceID = MigrationImageTransferExecution.canonicalImageID(
+                object.source.sourceID
+              ),
+              let targetID = MigrationImageTransferExecution.canonicalImageID(
+                staged.verifiedTarget.id
+              ),
+              let source = readback.source,
+              source.supportsImageID(sourceID),
+              readback.target.supportsImageID(targetID),
+              MigrationImageTransferExecution.sameImageContent(
+                source,
+                manifest.sourceAfterTransfer
+              ),
+              MigrationImageTransferExecution.sameImageContent(
+                readback.target,
+                manifest.verifiedTarget
+              ) else {
             throw MigrationImportAssetStagingError.invalidSession(
                 "final image archive read-back changed for \(object.source)"
             )
@@ -203,7 +223,15 @@ extension MigrationImportAssetStagingExecution {
            imageManifest.sourceImageID == manifest.committedSourceImageID,
            imageManifest.loadedTargetImageID == manifest.loadedTargetImageID,
            imageManifest.targetInventoryEntryAfterLoad.id == manifest.loadedTargetImageID,
-           imageManifest.verifiedTarget.archiveContractSha256 == manifest.targetFingerprint else {
+           imageManifest.verifiedTarget.archiveContractSha256 == manifest.targetFingerprint,
+           MigrationImageTransferExecution.verifiesImageEvidence(
+               sourceImageID: imageManifest.sourceImageID,
+               loadedTargetImageID: imageManifest.loadedTargetImageID,
+               sourceBefore: imageManifest.sourceBeforeTransfer,
+               sourceDuring: imageManifest.sourceDuringTransfer,
+               sourceAfter: imageManifest.sourceAfterTransfer,
+               verifiedTarget: imageManifest.verifiedTarget
+           ) else {
             throw MigrationImportAssetStagingError.targetDrift(object.source)
         }
         try await requireExactSourceWritableLayer(
@@ -226,8 +254,15 @@ extension MigrationImportAssetStagingExecution {
             from: environment.source,
             to: environment.target
         )
-        guard readback.source == nil,
-              sameImageContent(readback.target, imageManifest.verifiedTarget) else {
+        guard let targetID = MigrationImageTransferExecution.canonicalImageID(
+                staged.verifiedTarget.id
+              ),
+              readback.source == nil,
+              readback.target.supportsImageID(targetID),
+              MigrationImageTransferExecution.sameImageContent(
+                readback.target,
+                imageManifest.verifiedTarget
+              ) else {
             throw MigrationImportAssetStagingError.targetDrift(object.source)
         }
         return DoryOperationTargetIdentity(
@@ -292,13 +327,5 @@ extension MigrationImportAssetStagingExecution {
               inventory.entries.first(where: { $0.id == imageID }) == expectedInventoryEntry else {
             throw MigrationImportAssetStagingError.targetDrift(object.source)
         }
-    }
-
-    func sameImageContent(
-        _ lhs: MigrationImageArchiveFingerprint,
-        _ rhs: MigrationImageArchiveFingerprint
-    ) -> Bool {
-        lhs.semanticIdentity == rhs.semanticIdentity
-            && lhs.archiveContractSha256 == rhs.archiveContractSha256
     }
 }

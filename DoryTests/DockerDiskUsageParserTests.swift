@@ -123,6 +123,41 @@ struct DockerDiskUsageParserTests {
         #expect(try DockerDiskUsageParser.totalDockerBytes(from: legacy) == 1_000)
     }
 
+    @Test func emptyDocker29AndVersionedLegacyResponsesAreExactZero() throws {
+        let docker29 = Data(#"{"Images":[],"Containers":[],"Volumes":[],"BuildCache":[],"ImageUsage":{},"ContainerUsage":{},"VolumeUsage":{},"BuildCacheUsage":{}}"#.utf8)
+        let versionedLegacy = Data(#"{"Images":[],"Containers":[],"Volumes":[],"BuildCache":[]}"#.utf8)
+
+        #expect(try DockerDiskUsageParser.totalDockerBytes(from: docker29) == 0)
+        #expect(try DockerDiskUsageParser.totalDockerBytes(from: versionedLegacy) == 0)
+    }
+
+    @Test func emptyUsageMustStillBeCompleteAndUnambiguous() throws {
+        let invalid: [[String: Any]] = [
+            [
+                "ImageUsage": [:],
+                "VolumeUsage": [:],
+                "ContainerUsage": [:]
+            ],
+            [
+                "ImageUsage": ["TotalCount": 0],
+                "VolumeUsage": [:],
+                "ContainerUsage": [:],
+                "BuildCacheUsage": [:]
+            ],
+            [
+                "Containers": [],
+                "Volumes": [],
+                "BuildCache": []
+            ]
+        ]
+
+        for object in invalid {
+            #expect(throws: DockerDiskUsageParserError.self) {
+                try DockerDiskUsageParser.totalDockerBytes(from: data(object))
+            }
+        }
+    }
+
     @Test func totalUsageFailsClosedOnIncompleteNegativeFractionalAndOverflowValues() throws {
         let invalid: [[String: Any]] = [
             ["ImageUsage": ["TotalSize": 1]],

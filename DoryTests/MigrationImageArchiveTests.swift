@@ -9,6 +9,7 @@ struct MigrationImageArchiveTests {
         let fingerprint = try MigrationImageArchiveTestSupport.fingerprint(fixture.archive)
 
         #expect(fingerprint.semanticIdentity == "sha256:\(fixture.configDigest)")
+        #expect(fingerprint.validatedImageIDs == ["sha256:\(fixture.configDigest)"])
         #expect(fingerprint.configSha256 == fixture.configDigest)
         #expect(fingerprint.layers.map(\.position) == [0, 1])
         #expect(fingerprint.layers.map(\.sha256) == fixture.layerDigests)
@@ -28,9 +29,51 @@ struct MigrationImageArchiveTests {
         let fingerprint = try reader.finish()
 
         #expect(fingerprint.semanticIdentity == "sha256:\(fixture.configDigest)")
+        #expect(fingerprint.validatedImageIDs == [
+            "sha256:\(fixture.configDigest)",
+            "sha256:\(try #require(fixture.ociIndexDigest))",
+            "sha256:\(try #require(fixture.ociManifestDigest))"
+        ])
         #expect(fingerprint.configArchivePath.hasPrefix("blobs/sha256/"))
         #expect(fingerprint.layers.map(\.sha256) == fixture.layerDigests)
         #expect(fingerprint.archiveSha256 == MigrationImageArchiveTestSupport.sha256(fixture.archive))
+    }
+
+    @Test func rejectsUnverifiableOCIIdentityChains() throws {
+        let fixture = MigrationImageArchiveTestSupport.contentAddressedFixture()
+        let nestedDigest = try #require(fixture.ociIndexDigest)
+        let nestedPath = "blobs/sha256/\(nestedDigest)"
+        let nested = try #require(fixture.entries.first { $0.path == nestedPath })
+        let malformedRoot = MigrationImageArchiveTestSupport.json(["schemaVersion": 2])
+        let wrongSizeRoot = MigrationImageArchiveTestSupport.json([
+            "schemaVersion": 2,
+            "manifests": [[
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "digest": "sha256:\(nestedDigest)",
+                "size": nested.payload.count + 1
+            ]]
+        ])
+        let invalid = [
+            MigrationImageArchiveTestSupport.replacingEntry(
+                in: fixture,
+                path: "index.json",
+                payload: malformedRoot
+            ),
+            MigrationImageArchiveTestSupport.replacingEntry(
+                in: fixture,
+                path: "index.json",
+                payload: wrongSizeRoot
+            ),
+            MigrationImageArchiveTestSupport.archive(
+                fixture.entries.filter { $0.path != nestedPath }
+            )
+        ]
+
+        for archive in invalid {
+            #expect(throws: MigrationImageArchiveError.self) {
+                try MigrationImageArchiveTestSupport.fingerprint(archive)
+            }
+        }
     }
 
     @Test func acceptsPAXPathsAndPositiveBase256Sizes() throws {

@@ -1,3 +1,4 @@
+import DoryOperations
 import Foundation
 import Testing
 @testable import Dory
@@ -87,6 +88,23 @@ struct MigrationStrictInventoryRejectionTests: StrictInventoryTestCase {
             }
         }
         await outsideHomeBindIsRejected()
+    }
+
+    @Test func doryRuntimeIsAcceptedAsBundledForDoryToDoryTransfers() async throws {
+        let fixture = makeFixture()
+        fixture.source.containerInspections["container-id"] = containerInspection(
+            mount: volumeMount,
+            runtime: " DORY-RUNC "
+        )
+
+        let prepared = try await collect(fixture)
+        let specification = try specification(
+            kind: .container,
+            in: prepared,
+            as: ContainerSpec.self
+        )
+
+        #expect(specification.runtimeName == " DORY-RUNC ")
     }
 
     @Test func capacityUnknownHostAndTransactionPeakFailuresAreRejected() async {
