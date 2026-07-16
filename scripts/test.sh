@@ -96,8 +96,8 @@ prepare_swift() {
 
 run_swift() {
   prepare_swift
-  swift test --package-path dory-core-swift
-  swift test --package-path Packages/ContainerizationEngine
+  swift test --no-parallel --package-path dory-core-swift
+  swift test --no-parallel --package-path Packages/ContainerizationEngine
 }
 
 run_app() {
