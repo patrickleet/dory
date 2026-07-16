@@ -27,10 +27,12 @@ jobs:
       - uses: actions/checkout@c915c33a16f01166c17c4e35fe1d4085a2d71adb # v4
       - name: Select Xcode
         run: |
-          newest="$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+          newest="$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)"
           echo "DEVELOPER_DIR=$newest/Contents/Developer" >> "$GITHUB_ENV"
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - name: Install Protocol Buffers compiler
+        run: brew install protobuf
       - name: Swift packages
         run: scripts/test.sh swift
       - name: App tests
